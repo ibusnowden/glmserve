@@ -1,0 +1,22 @@
+# build artifacts
+build/
+*.o
+*.obj
+
+# slurm job logs (scripts/*.%j.out)
+*.out
+
+# local model checkpoints / weights (never commit weights)
+*.safetensors
+models/
+checkpoints/
+
+# editor / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# python
+__pycache__/
+*.pyc

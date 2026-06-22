@@ -1,0 +1,116 @@
+// glmserve — public CUDA kernel launch API (host-callable wrappers).
+//
+// All buffers are device pointers. The GPU forward path keeps activations in
+// float32 (or half where noted); weights may be float32/half (fp16_gemm) or
+// quantized (int4/fp8 gemm). These wrappers launch the kernels in cuda/*.cu and
+// are declared here so the C++ control plane can call them without including
+// CUDA headers everywhere. Only compiled when GLMSERVE_CUDA is set.
+#pragma once
+
+#include <cstdint>
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>   // half (used by gemm_fp16)
+
+namespace glmserve {
+namespace cuda {
+
+// ---- normalization / position -------------------------------------------
+// out[n,d] = rmsnorm(x[n,d]) * w[d]
+void rmsnorm(const float* x, const float* w, float* out,
+             int64_t n, int64_t d, float eps, cudaStream_t s = 0);
+
+// Per-head RMSNorm over head_dim (qk-norm).
+void per_head_rmsnorm(float* x, const float* w, int64_t n, int64_t n_heads,
+                      int64_t head_dim, float eps, cudaStream_t s = 0);
+
+// Apply partial-rotary RoPE in place to x[n, n_heads, head_dim] at positions
+// pos[n] (rotates first `rot` dims of each head).
+void rope(float* x, const int64_t* pos, int64_t n, int64_t n_heads,
+          int64_t head_dim, int64_t rot, double theta, cudaStream_t s = 0);
+
+// ---- GEMM ----------------------------------------------------------------
+// y[n,out] = x[n,in] @ W[out,in]^T (+ bias). cuBLASLt under the hood.
+void gemm_fp32(const float* x, const float* W, const float* bias, float* y,
+               int64_t n, int64_t in, int64_t out, cudaStream_t s = 0);
+void gemm_fp16(const half* x, const half* W, const float* bias, half* y,
+               int64_t n, int64_t in, int64_t out, cudaStream_t s = 0);
+
+// W4A16: packed int4 weight (two nibbles/byte, symmetric, group scales) x fp16/fp32
+// activations -> fp32 output. scales[out * (in/group_size)].
+void gemm_w4a16(const float* x, const uint8_t* qW, const float* scales,
+                const float* bias, float* y, int64_t n, int64_t in, int64_t out,
+                int64_t group_size, cudaStream_t s = 0);
+
+// FP8 (e4m3) weight x fp32 activations -> fp32 output (per-tensor or per-row scale).
+void gemm_fp8(const float* x, const uint8_t* fp8W, const float* w_scale,
+              const float* bias, float* y, int64_t n, int64_t in, int64_t out,
+              cudaStream_t s = 0);
+
+// ---- attention -----------------------------------------------------------
+// Dense causal attention reading K/V from a paged cache. q[n,H,hd]; the cache
+// stores K/V for absolute positions [0, ctx). block_table maps logical->phys.
+void attention_dense_paged(const float* q, const float* k_cache, const float* v_cache,
+                           const int* block_table, int64_t n_query, int64_t start_pos,
+                           int64_t n_heads, int64_t n_kv_heads, int64_t head_dim,
+                           int64_t block_size, float scale, float* out,
+                           cudaStream_t s = 0);
+
+// Flash-decoding (split-K) for the single-query decode step. Parallelizes the
+// key range across `n_heads * S` blocks (S chosen from ctx) and merges the
+// partial softmaxes — far more parallelism than the dense kernel at n_query==1.
+// part_acc[n_heads, max_splits, head_dim], part_m/part_l[n_heads, max_splits]
+// are caller-provided device scratch. qpos is the query's absolute position.
+void attention_decode_paged(const float* q, const float* k_cache, const float* v_cache,
+                            const int* block_table, int64_t qpos, int64_t n_heads,
+                            int64_t n_kv_heads, int64_t head_dim, int64_t block_size,
+                            float scale, float* out, float* part_acc, float* part_m,
+                            float* part_l, int64_t max_splits, cudaStream_t s = 0);
+
+// DSA sparse attention: a lightning indexer scores keys, top-k are attended.
+// Degrades to dense when ctx <= index_topk.
+void attention_dsa_paged(const float* q, const float* k_cache, const float* v_cache,
+                         const int* block_table, int64_t n_query, int64_t start_pos,
+                         int64_t n_heads, int64_t n_kv_heads, int64_t head_dim,
+                         int64_t block_size, int64_t index_topk, float scale,
+                         float* out, cudaStream_t s = 0);
+
+// ---- MoE -----------------------------------------------------------------
+// Router: logits[n, E] -> per-token top-k expert ids and gate weights.
+// sigmoid scoring + optional score-correction bias + norm + routed scaling.
+void moe_router(const float* logits, const float* e_bias, int n, int E, int topk,
+                bool norm_topk, float routed_scale, int* topk_ids,
+                float* topk_weights, cudaStream_t s = 0);
+
+// Build a permutation that groups tokens by expert (for grouped GEMM):
+// fills expert_counts[E], and sorted_token/sorted_slot arrays of length n*topk.
+void moe_dispatch(const int* topk_ids, int n, int topk, int E, int* expert_offsets,
+                  int* sorted_token_ids, int* sorted_row, cudaStream_t s = 0);
+
+// Expert FFN over dispatched rows: out += weight * down(silu(gate(x))*up(x)),
+// accumulated into per-token output. Reference grouped implementation.
+void moe_expert_ffn(const float* x, const int* topk_ids, const float* topk_weights,
+                    const float* gate_w, const float* up_w, const float* down_w,
+                    int n, int topk, int hidden, int moe_inter, int E,
+                    float* out, cudaStream_t s = 0);
+
+// ---- sampling ------------------------------------------------------------
+void argmax(const float* logits, int vocab, int* out_id, cudaStream_t s = 0);
+void softmax_inplace(float* logits, int vocab, float temperature, cudaStream_t s = 0);
+
+// ---- glue (GPU forward path) ---------------------------------------------
+void add_inplace(float* y, const float* x, int64_t n, cudaStream_t s = 0);
+void silu_mul(const float* g, const float* u, float* out, int64_t n, cudaStream_t s = 0);
+void embed_gather(const float* table, const int* tokens, float* hidden, int64_t n,
+                  int64_t H, cudaStream_t s = 0);
+void slice_rows(const float* src, float* dst, int64_t n, int64_t src_stride, int64_t offset,
+                int64_t len, cudaStream_t s = 0);
+void rope_q(float* q, int64_t n, int64_t n_heads, int64_t qk, int64_t nope, int64_t rope,
+            int64_t start_pos, double theta, bool interleave, cudaStream_t s = 0);
+void rope_k(float* kpe, int64_t n, int64_t rope, int64_t start_pos, double theta,
+            bool interleave, cudaStream_t s = 0);
+void assemble_kv(const float* kvb, const float* kpe, float* K, float* V, int64_t n,
+                 int64_t n_heads, int64_t nope, int64_t rope, int64_t vd, int64_t hc,
+                 cudaStream_t s = 0);
+
+}  // namespace cuda
+}  // namespace glmserve
