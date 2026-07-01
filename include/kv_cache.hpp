@@ -10,6 +10,7 @@
 //   layout per (layer, physical block):
 //     K: [block_size, num_kv_heads, head_dim]   (row-major)
 //     V: [block_size, num_kv_heads, head_dim]
+//     I: [block_size, indexer_dim]              (optional DSA indexer keys)
 #pragma once
 
 #include <cstddef>
@@ -35,14 +36,16 @@ struct SequenceKV {
     // Pointers to the K/V slot for an absolute token position at a given layer.
     float* k_slot(int64_t layer, int64_t pos);
     float* v_slot(int64_t layer, int64_t pos);
+    float* index_slot(int64_t layer, int64_t pos);
     const float* k_slot(int64_t layer, int64_t pos) const;
     const float* v_slot(int64_t layer, int64_t pos) const;
+    const float* index_slot(int64_t layer, int64_t pos) const;
 };
 
 class KVCache {
 public:
     KVCache(int64_t num_layers, int64_t num_kv_heads, int64_t head_dim,
-            int64_t block_size, int64_t num_blocks);
+            int64_t block_size, int64_t num_blocks, int64_t indexer_dim = 0);
 
     int64_t block_size() const { return block_size_; }
     int64_t num_free()   const { return static_cast<int64_t>(free_list_.size()); }
@@ -50,6 +53,7 @@ public:
     int64_t kv_dim()     const { return num_kv_heads_ * head_dim_; }
     int64_t num_kv_heads() const { return num_kv_heads_; }
     int64_t head_dim()   const { return head_dim_; }
+    int64_t indexer_dim() const { return indexer_dim_; }
 
     // Allocate / return one physical block. allocate() returns -1 if exhausted.
     int allocate_block();
@@ -58,6 +62,7 @@ public:
     // Raw pointers into the per-layer K/V pools for a physical block.
     float* k_block(int64_t layer, int block_id);
     float* v_block(int64_t layer, int block_id);
+    float* index_block(int64_t layer, int block_id);
 
     // Total bytes the cache occupies (both K and V), for reporting.
     size_t bytes() const;
@@ -65,11 +70,14 @@ public:
     SequenceKV make_sequence(int64_t request_id);
 
 private:
-    int64_t num_layers_, num_kv_heads_, head_dim_, block_size_, num_blocks_;
+    int64_t num_layers_, num_kv_heads_, head_dim_, block_size_, num_blocks_, indexer_dim_;
     int64_t block_stride_;   // floats per (layer, block) = block_size*kv_dim
     int64_t layer_stride_;   // floats per layer = num_blocks*block_stride_
+    int64_t index_block_stride_ = 0;
+    int64_t index_layer_stride_ = 0;
     std::vector<float> k_;   // [num_layers, num_blocks, block_size, kv_dim]
     std::vector<float> v_;
+    std::vector<float> index_; // [num_layers, num_blocks, block_size, indexer_dim]
     std::vector<int> free_list_;
 };
 

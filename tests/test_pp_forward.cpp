@@ -1,4 +1,4 @@
-// glmserve test — pipeline-parallel forward correctness on the tiny checkpoint.
+// glmserve test - pipeline-parallel forward correctness on the tiny checkpoint.
 //
 // Runs the GLM-5.2 reference forward split across PP stages (TP=1, PP=2) using
 // the NCCL hidden-state handoff, then checks that the last stage's logits match
@@ -61,7 +61,8 @@ int main() {
 
     auto make_kv = [&](glmserve::GLM52Model& m) {
         return glmserve::KVCache(m.num_layers(), gcfg.num_attention_heads,
-                                 gcfg.kv_cache_head_dim(), /*block_size=*/16, /*num_blocks=*/64);
+                                 gcfg.kv_cache_head_dim(), /*block_size=*/16, /*num_blocks=*/64,
+                                 gcfg.use_dsa ? gcfg.index_head_dim : 0);
     };
 
     // --- pipeline-sharded forward: this rank runs only its stage's layers ---
@@ -69,25 +70,47 @@ int main() {
     pp_model.set_distributed(&comm);
     pp_model.load(st);
     glmserve::LayerRange owned = pp_model.owned_layers();
-    glmserve::KVCache pp_cache = make_kv(pp_model);
-    glmserve::SequenceKV pp_kv = pp_cache.make_sequence(0);
-    std::vector<float> pp_logits = pp_model.forward(prompt, 0, pp_kv);
+    const char* gpu_env = std::getenv("GLMSERVE_PP_GPU_FORWARD");
+    const bool gpu_forward = gpu_env && *gpu_env && gpu_env[0] != '0';
+    std::vector<float> pp_logits;
+    if (gpu_forward) {
+        if (!pp_model.upload_to_gpu(64)) {
+            std::printf("test_pp_forward: FAIL rank=%d (GPU upload returned false)\n", cfg.rank);
+            return 1;
+        }
+        pp_logits = pp_model.forward_gpu_prefill(prompt);
+    } else {
+        glmserve::KVCache pp_cache = make_kv(pp_model);
+        glmserve::SequenceKV pp_kv = pp_cache.make_sequence(0);
+        pp_logits = pp_model.forward(prompt, 0, pp_kv);
+    }
 
     if (cfg.is_first_stage()) {
         // Stage 0 produced no logits; it embedded + ran its layers + sent the
         // hidden state (the recv on stage 1 below confirms the bytes arrived).
         comm.barrier();
-        std::printf("test_pp_forward: PASS rank=%d (stage 0: layers [%lld,%lld), sent hidden)\n",
-                    cfg.rank, (long long)owned.begin, (long long)owned.end);
+        std::printf("test_pp_forward: PASS rank=%d (%s stage 0: layers [%lld,%lld), sent hidden)\n",
+                    cfg.rank, gpu_forward ? "GPU" : "CPU",
+                    (long long)owned.begin, (long long)owned.end);
         return 0;
     }
 
     // --- reference: full single-process forward of the same checkpoint ---
     glmserve::GLM52Model ref_model(gcfg);   // no communicator => single full stage
     ref_model.load(st);
-    glmserve::KVCache ref_cache = make_kv(ref_model);
-    glmserve::SequenceKV ref_kv = ref_cache.make_sequence(1);
-    std::vector<float> ref_logits = ref_model.forward(prompt, 0, ref_kv);
+    std::vector<float> ref_logits;
+    if (gpu_forward) {
+        if (!ref_model.upload_to_gpu(64)) {
+            std::printf("test_pp_forward: FAIL rank=%d (reference GPU upload returned false)\n",
+                        cfg.rank);
+            return 1;
+        }
+        ref_logits = ref_model.forward_gpu_prefill(prompt);
+    } else {
+        glmserve::KVCache ref_cache = make_kv(ref_model);
+        glmserve::SequenceKV ref_kv = ref_cache.make_sequence(1);
+        ref_logits = ref_model.forward(prompt, 0, ref_kv);
+    }
 
     comm.barrier();
 
@@ -103,7 +126,7 @@ int main() {
         if (pp_logits[i] > pp_logits[pp_argmax]) pp_argmax = static_cast<int>(i);
         if (ref_logits[i] > ref_logits[ref_argmax]) ref_argmax = static_cast<int>(i);
     }
-    const float tol = 1e-4f;
+    const float tol = gpu_forward ? 1e-3f : 1e-4f;
     if (pp_argmax != ref_argmax || max_diff > tol) {
         std::printf("test_pp_forward: FAIL rank=%d (stage %d: layers [%lld,%lld)) "
                     "pp_argmax=%d ref_argmax=%d max_diff=%.6g tol=%.1g\n",
@@ -111,10 +134,10 @@ int main() {
                     pp_argmax, ref_argmax, max_diff, tol);
         return 1;
     }
-    std::printf("test_pp_forward: PASS rank=%d (stage %d: layers [%lld,%lld), recv'd hidden) "
+    std::printf("test_pp_forward: PASS rank=%d (%s stage %d: layers [%lld,%lld), recv'd hidden) "
                 "argmax=%d max_diff=%.6g\n",
-                cfg.rank, cfg.pp_stage(), (long long)owned.begin, (long long)owned.end,
-                pp_argmax, max_diff);
+                cfg.rank, gpu_forward ? "GPU" : "CPU", cfg.pp_stage(),
+                (long long)owned.begin, (long long)owned.end, pp_argmax, max_diff);
     return 0;
 #else
     std::printf("test_pp_forward: SKIPPED (CPU-only build; rebuild with GPU=1)\n");

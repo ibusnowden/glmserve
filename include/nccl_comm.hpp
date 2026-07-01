@@ -53,6 +53,9 @@ public:
     // Pipeline send/recv of a hidden-state buffer to the next/prev stage.
     void pipeline_send_next(const float* data, int64_t count);
     void pipeline_recv_prev(float* data, int64_t count);
+    // Pipeline send/recv for integer side-channel metadata such as DSA masks.
+    void pipeline_send_next_int(const int* data, int64_t count);
+    void pipeline_recv_prev_int(int* data, int64_t count);
 
     void barrier();
 

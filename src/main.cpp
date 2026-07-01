@@ -110,6 +110,8 @@ int cmd_serve(const Args& a) {
     return 0;
 }
 
+std::vector<int> parse_int_list(const std::string& s);
+
 int cmd_generate(const Args& a) {
     Engine engine(engine_opts(a));
     SamplingParams p;
@@ -118,6 +120,7 @@ int cmd_generate(const Args& a) {
     p.top_k = static_cast<int>(a.get_int("top-k", 0));
     p.max_tokens = static_cast<int>(a.get_int("max-tokens", 128));
     p.seed = static_cast<uint64_t>(a.get_int("seed", 0));
+    p.mtp_draft_k = static_cast<int>(a.get_int("mtp-draft-k", 0));
 
     std::vector<ChatMessage> msgs;
     if (a.has("system")) msgs.push_back({"system", a.get("system")});
@@ -131,6 +134,36 @@ int cmd_generate(const Args& a) {
     });
     std::fprintf(stderr, "\n--- done: %d prompt + %d completion tokens, finish=%s ---\n",
                  c.prompt_tokens, c.completion_tokens, c.finish_reason.c_str());
+    if (c.mtp_used) {
+        std::fprintf(stderr, "--- mtp: groups=%d accepted=%d rejected=%d ---\n",
+                     c.mtp_groups, c.mtp_accepted, c.mtp_rejected);
+    }
+    return 0;
+}
+
+int cmd_tokgen(const Args& a) {
+    EngineOptions o = engine_opts(a);
+    std::vector<int> prompt = parse_int_list(a.get("tokens", "3 1 4 1 5 9 2 6"));
+    GLM_CHECK(!prompt.empty(), "tokgen requires --tokens \"id id id\"");
+    SamplingParams p;
+    p.temperature = static_cast<float>(a.get_double("temp", 0.0));
+    p.top_p = static_cast<float>(a.get_double("top-p", 1.0));
+    p.top_k = static_cast<int>(a.get_int("top-k", 0));
+    p.max_tokens = static_cast<int>(a.get_int("max-tokens", 16));
+    p.seed = static_cast<uint64_t>(a.get_int("seed", 0));
+    p.ignore_eos = a.has("ignore-eos");
+    p.mtp_draft_k = static_cast<int>(a.get_int("mtp-draft-k", 0));
+    if (o.max_model_len < static_cast<int64_t>(prompt.size()) + p.max_tokens + 1)
+        o.max_model_len = static_cast<int64_t>(prompt.size()) + p.max_tokens + 1;
+
+    Engine engine(o);
+    Completion c = engine.generate_tokens(prompt, p, nullptr);
+    std::printf("tokgen: prompt=%d generated=%d finish=%s mtp=%s groups=%d accepted=%d rejected=%d\n",
+                c.prompt_tokens, c.completion_tokens, c.finish_reason.c_str(),
+                c.mtp_used ? "on" : "off", c.mtp_groups, c.mtp_accepted, c.mtp_rejected);
+    std::printf("  tokens: ");
+    for (int t : c.tokens) std::printf("%d ", t);
+    std::printf("\n");
     return 0;
 }
 
@@ -234,6 +267,81 @@ int cmd_gencheck(const Args& a) {
     return ok ? 0 : 1;
 }
 
+int cmd_mtp(const Args& a) {
+    std::string model = a.get("model");
+    GLM_CHECK(!model.empty(), "mtp requires --model DIR");
+    std::vector<int> context = parse_int_list(a.get("tokens", "3 1 4 1 5 9 2 6"));
+    std::vector<int> draft = parse_int_list(a.get("draft", "2 7 1"));
+    GLM_CHECK(!context.empty() && !draft.empty(), "mtp requires --tokens and --draft");
+
+    GLM52Config cfg = load_config(model);
+    SafeTensors st;
+    st.load(model);
+    GLM52Model m(cfg);
+    m.load(st, a.get_int("max-layers", -1));
+    std::vector<float> logits = m.mtp_draft_logits(context, draft);
+
+    std::vector<int> argmax(draft.size(), 0);
+    for (size_t r = 0; r < draft.size(); ++r) {
+        const float* row = logits.data() + static_cast<int64_t>(r) * cfg.vocab_size;
+        for (int64_t i = 1; i < cfg.vocab_size; ++i)
+            if (row[i] > row[argmax[r]]) argmax[r] = static_cast<int>(i);
+    }
+
+    std::string out_path = a.get("out");
+    std::ostringstream o;
+    o << "{\"context\":[";
+    for (size_t i = 0; i < context.size(); ++i) o << context[i] << (i + 1 < context.size() ? "," : "");
+    o << "],\"draft\":[";
+    for (size_t i = 0; i < draft.size(); ++i) o << draft[i] << (i + 1 < draft.size() ? "," : "");
+    o << "],\"vocab\":" << cfg.vocab_size << ",\"argmax\":[";
+    for (size_t i = 0; i < argmax.size(); ++i) o << argmax[i] << (i + 1 < argmax.size() ? "," : "");
+    o << "],\"logits\":[";
+    for (size_t i = 0; i < logits.size(); ++i) {
+        o << logits[i];
+        if (i + 1 < logits.size()) o << ",";
+    }
+    o << "]}";
+
+    if (out_path.empty()) {
+        std::fputs(o.str().c_str(), stdout);
+        std::fputc('\n', stdout);
+    } else {
+        FILE* f = std::fopen(out_path.c_str(), "w");
+        GLM_CHECK(f, "cannot open --out %s", out_path.c_str());
+        std::fputs(o.str().c_str(), f);
+        std::fclose(f);
+        GLM_INFO("wrote MTP logits -> %s (draft=%zu, vocab=%lld)",
+                 out_path.c_str(), draft.size(), (long long)cfg.vocab_size);
+    }
+    return 0;
+}
+
+int cmd_mtpcheck(const Args& a) {
+    GLM_CHECK(!a.has("gpu"), "mtpcheck currently validates the CPU MTP path; omit --gpu");
+    EngineOptions o = engine_opts(a);
+    std::vector<int> prompt = parse_int_list(a.get("tokens", "3 1 4 1 5 9 2 6"));
+    int steps = static_cast<int>(a.get_int("gen", 16));
+    int draft_k = static_cast<int>(a.get_int("draft-k", 5));
+    GLM_CHECK(!prompt.empty(), "mtpcheck requires --tokens \"id id id\"");
+    GLM_CHECK(steps > 0 && draft_k > 0, "mtpcheck requires positive --gen and --draft-k");
+    if (o.max_model_len < static_cast<int64_t>(prompt.size()) + steps + 1)
+        o.max_model_len = static_cast<int64_t>(prompt.size()) + steps + 1;
+
+    Engine engine(o);
+    Engine::MTPCheck c = engine.check_mtp_speculative(prompt, steps, draft_k);
+    std::printf("mtpcheck: steps=%d draft_k=%d groups=%d accepted=%d rejected=%d\n",
+                c.steps, c.draft_k, c.groups, c.accepted, c.rejected);
+    std::printf("  proposed: ");
+    for (int t : c.proposed_tokens) std::printf("%d ", t);
+    std::printf("\n  target  : ");
+    for (int t : c.target_tokens) std::printf("%d ", t);
+    std::printf("\n  output  : ");
+    for (int t : c.output_tokens) std::printf("%d ", t);
+    std::printf("\n  RESULT: PASS\n");
+    return 0;
+}
+
 void usage() {
     std::fprintf(stderr,
         "glmserve — GLM-5.2 C++/CUDA inference engine\n\n"
@@ -241,8 +349,11 @@ void usage() {
         "  glmserve serve    --model DIR [--port 8000] [--host 0.0.0.0] [--ctx 65536]\n"
         "                    [--name glm-5.2-local] [--max-layers N] [--max-seqs 1]\n"
         "  glmserve generate --model DIR --prompt \"...\" [--max-tokens 128] [--temp 0]\n"
-        "                    [--top-p 1.0] [--top-k 0] [--seed 0] [--system \"...\"]\n"
+        "                    [--top-p 1.0] [--top-k 0] [--seed 0] [--system \"...\"] [--mtp-draft-k K]\n"
+        "  glmserve tokgen   --model DIR --tokens \"...\" [--max-tokens 16] [--mtp-draft-k K]\n"
         "  glmserve bench    --model DIR [--prompt-len 512] [--gen-len 128] [--gpu]\n"
+        "  glmserve mtp      --model DIR --tokens \"...\" --draft \"...\" [--out JSON]\n"
+        "  glmserve mtpcheck --model DIR --tokens \"...\" [--gen N] [--draft-k K]\n"
         "  glmserve inspect  --model DIR\n"
         "\n"
         "  --gpu   run the forward on the CUDA path (requires a GPU=1 build + a GPU)\n");
@@ -257,10 +368,13 @@ int main(int argc, char** argv) {
         Args a = parse_args(argc, argv, 2);
         if (cmd == "serve")    return cmd_serve(a);
         if (cmd == "generate") return cmd_generate(a);
+        if (cmd == "tokgen")   return cmd_tokgen(a);
         if (cmd == "inspect")  return cmd_inspect(a);
         if (cmd == "dump")     return cmd_dump(a);
         if (cmd == "bench")    return cmd_bench(a);
         if (cmd == "gencheck") return cmd_gencheck(a);
+        if (cmd == "mtp")      return cmd_mtp(a);
+        if (cmd == "mtpcheck") return cmd_mtpcheck(a);
         usage();
         return 1;
     } catch (const std::exception& e) {

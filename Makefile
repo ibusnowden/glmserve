@@ -110,6 +110,14 @@ run-tests: tests
 	@rc=0; for t in $(TEST_BINS); do echo "--- $$t"; $$t || rc=1; done; \
 	echo "--- tests/test_logits_match.py"; \
 	python3 tests/test_logits_match.py --bin $(BUILD)/glmserve || rc=1; \
+	echo "--- tests/test_mtp_logits.py"; \
+	python3 tests/test_mtp_logits.py --bin $(BUILD)/glmserve || rc=1; \
+	echo "--- tests/test_mtp_speculative.py"; \
+	python3 tests/test_mtp_speculative.py --bin $(BUILD)/glmserve || rc=1; \
+	echo "--- tests/test_mtp_generate.py"; \
+	python3 tests/test_mtp_generate.py --bin $(BUILD)/glmserve || rc=1; \
+	echo "--- tests/test_w4_quantized.py"; \
+	python3 tests/test_w4_quantized.py --bin $(BUILD)/glmserve || rc=1; \
 	exit $$rc
 
 # ---- benches ----------------------------------------------------------------

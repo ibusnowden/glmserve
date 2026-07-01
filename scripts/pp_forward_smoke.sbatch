@@ -9,9 +9,10 @@
 #SBATCH --output=/project/inniang/glmserve/scripts/pp_forward_smoke.%j.out
 #
 # Build, generate a tiny GLM-5.2 checkpoint, then run the pipeline-parallel
-# forward across 2 ranks (TP=1, PP=2) and check the last stage's logits match a
-# single-process full forward of the same checkpoint. This validates that the
-# NCCL PP send/recv primitives are wired into real GLM layer-stage execution.
+# GPU forward across 2 ranks (TP=1, PP=2) and check the last stage's logits
+# match a single-process full forward of the same checkpoint. This validates
+# that the NCCL PP send/recv primitives are wired into device-resident GLM
+# layer-stage execution.
 # Submit with:
 #   sbatch scripts/pp_forward_smoke.sbatch
 set -euo pipefail
@@ -36,11 +37,12 @@ test -f "$CKPT/model.safetensors" || { echo "FAIL: tiny checkpoint not generated
 export GLMSERVE_TINY_CKPT="$CKPT"
 export GLMSERVE_TP_SIZE=1
 export GLMSERVE_PP_SIZE=2
+export GLMSERVE_PP_GPU_FORWARD="${GLMSERVE_PP_GPU_FORWARD:-1}"
 export GLMSERVE_NCCL_ID_FILE="/tmp/glmserve_nccl_ppfwd_${SLURM_JOB_ID}.id"
 export NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
 rm -f "$GLMSERVE_NCCL_ID_FILE"
 
-echo "=== 2-rank PP=2 forward correctness (pp-split logits == single-process) ==="
+echo "=== 2-rank PP=2 GPU forward correctness (pp-split logits == single-process) ==="
 srun --ntasks=2 bash -lc \
   'echo "rank=${SLURM_PROCID} local=${SLURM_LOCALID} CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-}"; exec build/gpu/tests/test_pp_forward'
 

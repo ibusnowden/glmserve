@@ -28,6 +28,11 @@ public:
     // path may be a directory (auto-detects model.safetensors[.index.json])
     // or a direct .safetensors file.
     void load(const std::string& path);
+    // Sharded-directory load variant: map only shards containing tensors whose
+    // names begin with one of `prefixes`. Falls back to load() for single-file
+    // checkpoints. Used by distributed PP stages so each rank can avoid shards
+    // owned exclusively by other pipeline stages.
+    void load_prefixes(const std::string& path, const std::vector<std::string>& prefixes);
 
     bool has(const std::string& name) const { return index_.count(name) > 0; }
 

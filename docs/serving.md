@@ -12,10 +12,12 @@
 Request fields honored: `messages`/`prompt`, `temperature` (0 ⇒ greedy),
 `top_p`, `top_k`, `max_tokens`/`max_completion_tokens`, `stop` (string or list),
 `repetition_penalty`, `frequency_penalty`, `presence_penalty`, `seed`,
-`ignore_eos`, `stream`. Streaming uses SSE `chat.completion.chunk` frames ending
-with `data: [DONE]`; the final chunk carries `usage`. Streaming is UTF-8-safe
-(multi-byte characters are never split mid-sequence) and holds back a tail so a
-`stop` string is never emitted.
+`ignore_eos`, `stream`. `mtp_draft_k` enables the CPU greedy MTP path when
+`temperature=0`, no penalties are active, and MTP weights are present; GPU and
+distributed MTP are still pending. Streaming uses SSE `chat.completion.chunk`
+frames ending with `data: [DONE]`; the final chunk carries `usage`. Streaming is
+UTF-8-safe (multi-byte characters are never split mid-sequence) and holds back a
+tail so a `stop` string is never emitted.
 
 ```bash
 ./build/glmserve serve --model /path/to/GLM-5.2 \
@@ -25,6 +27,14 @@ with `data: [DONE]`; the final chunk carries `usage`. Streaming is UTF-8-safe
 `--ctx` sizes the per-sequence context (and thus the KV cache). `--max-seqs`
 is the concurrency cap (V0 = 1 for coding agents). `--max-layers N` truncates
 the stack for bring-up/debugging.
+
+### V0 serving limits
+
+The HTTP API is usable for trusted local agent traffic, but it is not hardened
+as a public endpoint yet. Generation holds a single engine mutex for the full
+request, so requests run serially even if `--max-seqs` is raised. The JSON layer
+is dependency-free and intentionally small; fuzz or replace it before exposing
+the server to arbitrary internet clients.
 
 ## Memory reality on 2×8 RTX 6000 Ada (16×48GB = 768GB)
 
@@ -67,11 +77,12 @@ Current distributed status:
   the PP link. `tests/test_pp_forward.cpp` (`scripts/pp_forward_smoke.sbatch`)
   runs the tiny checkpoint split TP=1/PP=2 and confirms the last stage's logits
   are bit-identical (`max_diff=0`) to a single-process full forward (job 125285).
-- **TP weight-sharding is wired into the forward**: head-sharded MLA attention
+- **TP weight-sharding is wired into the CPU-reference forward**: head-sharded MLA attention
   (`q_b`/`kv_b` column-parallel, `o_proj` row-parallel) + column/row-parallel
   MLP/MoE FFNs, with an `all_reduce` rebuilding the residual stream each
   sub-layer. `tests/test_tp_forward.cpp` (`scripts/tp_forward_smoke.sbatch`) runs
-  TP=2/PP=1 and matches the single-process forward to 1.5e-7 (job 125290).
+  TP=2/PP=1 and matches the single-process forward to 1.5e-7 (job 125290);
+  this is a tolerance gate because all-reduce changes floating-point order.
 - Still pending: carrying the same TP/PP sharding onto the device-resident GPU
   forward path, and the multi-process serving driver (launch ranks, route
   tokens/logits through the HTTP front-end).
@@ -87,7 +98,79 @@ python tools/convert_hf_to_glmserve.py --model /path/to/GLM-5.2 \
 
 `--check` validates both the tensor names in the index and the presence of every
 referenced safetensors shard. A directory with only config/tokenizer/index files
-is not loadable and exits nonzero.
+is not loadable and exits nonzero. Optional DSA indexer and MTP tensor coverage
+is reported separately from core loadability.
+
+If the directory has `model.safetensors.index.json` but not the referenced
+shards, fetch them explicitly:
+
+```bash
+GLMSERVE_REAL_MODEL=/path/to/GLM-5.2 bash scripts/fetch_glm52_shards.sh --dry-run
+GLMSERVE_REAL_MODEL=/path/to/GLM-5.2 bash scripts/fetch_glm52_shards.sh --probe 1 --max-files 1
+HF_TOKEN=... GLMSERVE_REAL_MODEL=/path/to/GLM-5.2 \
+  bash scripts/fetch_glm52_shards.sh --require-free-gib 1800 --verify-present --jobs 4
+```
+
+`fetch_glm52_shards.sh` is intended for a login or data-transfer node with
+internet access. It supports shard ranges (`--first-shard`, `--last-shard`) so a
+large fetch can be resumed or split, `--jobs` enables parallel downloads, and
+`--probe` performs HEAD checks without downloading shard data. `--verify-present`
+HEAD-checks existing selected shards and repairs size mismatches before the W4
+conversion runs.
+
+If the fetch fails with `Disk quota exceeded` while `df` still reports free
+space, stop increasing `--jobs`/`--max-files`: the limiting factor is a project
+or user quota on writes. Keep the completed shards, remove any `.part` files,
+and resume only after moving to a shared path with enough quota or increasing
+the quota. The 16-rank W4 gate needs the full source plus W4 output visible from
+both nodes.
+
+To plan a PP-stage-specific checkpoint instead of one monolithic W4 directory:
+
+```bash
+python tools/plan_stage_shards.py --model /path/to/GLM-5.2 --pp-size 2
+python tools/plan_stage_shards.py --model /path/to/GLM-5.2 --pp-size 2 --stage 0 --show-files
+python tools/plan_stage_shards.py --model /path/to/GLM-5.2 --pp-size 2 --stage 1 --show-files
+```
+
+The distributed load smoke uses prefix-filtered safetensors loading, so each PP
+stage maps only shards containing its embeddings/final head/MTP block and owned
+layer range. `scripts/w4_real_16x.sbatch` accepts
+`GLMSERVE_W4_MODEL_STAGE0`/`GLMSERVE_W4_MODEL_STAGE1` for stage-specific W4
+directories; otherwise all ranks use `GLMSERVE_W4_MODEL`.
+
+For `PP>1`, `test_dist_load` validates distributed rank setup and selective
+checkpoint loading by default (`GLMSERVE_DIST_LOAD_UPLOAD=0`). GPU upload still
+requires the device-resident PP handoff path; set `GLMSERVE_DIST_LOAD_UPLOAD=1`
+only for TP-only topologies or while developing that PP upload path.
+
+Repeatable W4 gates:
+
+```bash
+sbatch scripts/w4_gpu_check.sbatch
+
+GLMSERVE_REAL_MODEL=/path/to/full/GLM-5.2 \
+GLMSERVE_W4_MODEL=/path/to/GLM-5.2-w4a16 \
+sbatch scripts/w4_real_16x.sbatch
+
+GLMSERVE_FETCH_REPO=zai-org/GLM-5.2 \
+GLMSERVE_REAL_MODEL=/path/to/GLM-5.2 \
+GLMSERVE_W4_MODEL=/path/to/GLM-5.2-w4a16 \
+sbatch scripts/w4_real_16x.sbatch
+
+GLMSERVE_W4_MODEL_STAGE0=/path/to/GLM-5.2-w4a16-stage0 \
+GLMSERVE_W4_MODEL_STAGE1=/path/to/GLM-5.2-w4a16-stage1 \
+sbatch scripts/w4_real_16x.sbatch
+```
+
+`w4_gpu_check` proves the converter, CPU W4 dequant path, GPU resident qweight
+path, and incremental decode on a quantized tiny checkpoint. `w4_real_16x`
+checks the full checkpoint, builds/validates the W4 repack if needed, then runs a
+TP=8/PP=2 distributed load/upload smoke across 16 RTX ranks. It is a fit/load
+gate; combined TP/PP device serving is still a separate runtime milestone. The
+W4 repack writes each shard through a `.part` file and atomically replaces the
+final shard on success; rerunning the converter skips already-valid output
+shards and repairs corrupt/incomplete ones.
 
 ## Tokenizer
 

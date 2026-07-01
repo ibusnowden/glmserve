@@ -18,6 +18,10 @@ static bool ends_with(const std::string& s, const std::string& suf) {
     return s.size() >= suf.size() && s.compare(s.size() - suf.size(), suf.size(), suf) == 0;
 }
 
+static bool starts_with(const std::string& s, const std::string& pref) {
+    return s.size() >= pref.size() && s.compare(0, pref.size(), pref) == 0;
+}
+
 static bool file_exists(const std::string& p) {
     struct stat st;
     return ::stat(p.c_str(), &st) == 0;
@@ -136,6 +140,55 @@ void SafeTensors::load(const std::string& path) {
     } else {
         GLM_CHECK(false, "no model.safetensors[.index.json] found in %s", dir.c_str());
     }
+}
+
+void SafeTensors::load_prefixes(const std::string& path,
+                                const std::vector<std::string>& prefixes) {
+    if (prefixes.empty()) {
+        load(path);
+        return;
+    }
+
+    struct stat st;
+    bool is_dir = (::stat(path.c_str(), &st) == 0) && S_ISDIR(st.st_mode);
+    if (!is_dir && ends_with(path, ".safetensors")) {
+        load(path);
+        return;
+    }
+
+    std::string dir = path;
+    if (!dir.empty() && dir.back() != '/') dir += '/';
+
+    std::string index_json = dir + "model.safetensors.index.json";
+    std::string single = dir + "model.safetensors";
+    if (!file_exists(index_json)) {
+        if (file_exists(single)) {
+            load(single);
+            return;
+        }
+        GLM_CHECK(false, "no model.safetensors[.index.json] found in %s", dir.c_str());
+    }
+
+    auto root = json::parse(read_text(index_json));
+    GLM_CHECK(root && root->has("weight_map"), "index.json missing weight_map");
+    std::set<std::string> shard_files;
+    size_t matched_tensors = 0;
+    for (auto& [tensor_name, file_v] : root->at("weight_map")->obj) {
+        for (const std::string& p : prefixes) {
+            if (starts_with(tensor_name, p)) {
+                shard_files.insert(file_v->as_string());
+                ++matched_tensors;
+                break;
+            }
+        }
+    }
+    GLM_CHECK(!shard_files.empty(), "prefix-filtered safetensors load matched no shards in %s",
+              dir.c_str());
+    for (const auto& f : shard_files) load_shard(dir + f);
+    GLM_INFO("loaded prefix-filtered safetensors: %zu/%zu shards, %zu tensors, %.2f GiB "
+             "(%zu index matches)",
+             shard_files.size(), root->at("weight_map")->obj.size(), index_.size(),
+             total_bytes_ / (1024.0 * 1024.0 * 1024.0), matched_tensors);
 }
 
 Tensor SafeTensors::get(const std::string& name) const {

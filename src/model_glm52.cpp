@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <cstdlib>
 #include <numeric>
 #include <thread>
 
@@ -37,6 +38,8 @@ static void parallel_for(int64_t n, F&& fn) {
 
 // y[n,out] = x[n,in] @ W[out,in]^T (+ bias[out])
 static void linear_forward(const Linear& L, const float* x, float* y, int64_t n_tokens) {
+    GLM_CHECK(L.has_f32(), "linear_forward called on quantized-only weight [%lld,%lld]",
+              (long long)L.out_features, (long long)L.in_features);
     const int64_t in = L.in_features, out = L.out_features;
     const float* w = L.w.data();
     const bool bias = L.has_bias();
@@ -62,6 +65,28 @@ static void rmsnorm_rows(const float* x, const float* w, float* out,
         for (int64_t i = 0; i < dim; ++i) ss += static_cast<double>(xr[i]) * xr[i];
         float inv = static_cast<float>(1.0 / std::sqrt(ss / dim + eps));
         for (int64_t i = 0; i < dim; ++i) outr[i] = xr[i] * inv * w[i];
+    });
+}
+
+// Standard LayerNorm over rows, used by the GLM DSA indexer key path.
+static void layernorm_rows(const float* x, const float* w, const float* b, float* out,
+                           int64_t n, int64_t dim, float eps) {
+    parallel_for(n, [&](int64_t r) {
+        const float* xr = x + r * dim;
+        float* outr = out + r * dim;
+        double mean = 0.0;
+        for (int64_t i = 0; i < dim; ++i) mean += xr[i];
+        mean /= dim;
+        double var = 0.0;
+        for (int64_t i = 0; i < dim; ++i) {
+            double d = static_cast<double>(xr[i]) - mean;
+            var += d * d;
+        }
+        float inv = static_cast<float>(1.0 / std::sqrt(var / dim + eps));
+        for (int64_t i = 0; i < dim; ++i) {
+            float bias = b ? b[i] : 0.0f;
+            outr[i] = (static_cast<float>(xr[i] - mean) * inv) * w[i] + bias;
+        }
     });
 }
 
@@ -94,6 +119,33 @@ static void rmsnorm_vec(float* v, const float* w, int64_t dim, float eps) {
     for (int64_t i = 0; i < dim; ++i) v[i] = v[i] * inv * w[i];
 }
 
+static void check_dsa_indexer_shapes(const DSAIndexer& ix, const GLM52Config& c) {
+    GLM_CHECK(ix.wq_b.in_features == c.q_lora_rank,
+              "DSA indexer wq_b input %lld != q_lora_rank %lld",
+              (long long)ix.wq_b.in_features, (long long)c.q_lora_rank);
+    GLM_CHECK(ix.wq_b.out_features == c.index_n_heads * c.index_head_dim,
+              "DSA indexer wq_b output %lld != index_n_heads*index_head_dim %lld",
+              (long long)ix.wq_b.out_features,
+              (long long)(c.index_n_heads * c.index_head_dim));
+    GLM_CHECK(ix.wk.in_features == c.hidden_size && ix.wk.out_features == c.index_head_dim,
+              "DSA indexer wk shape [%lld,%lld] != [%lld,%lld]",
+              (long long)ix.wk.out_features, (long long)ix.wk.in_features,
+              (long long)c.index_head_dim, (long long)c.hidden_size);
+    GLM_CHECK(ix.weights_proj.in_features == c.hidden_size &&
+                  ix.weights_proj.out_features == c.index_n_heads,
+              "DSA indexer weights_proj shape [%lld,%lld] != [%lld,%lld]",
+              (long long)ix.weights_proj.out_features,
+              (long long)ix.weights_proj.in_features,
+              (long long)c.index_n_heads, (long long)c.hidden_size);
+    GLM_CHECK(ix.k_norm.dim == c.index_head_dim,
+              "DSA indexer k_norm dim %lld != index_head_dim %lld",
+              (long long)ix.k_norm.dim, (long long)c.index_head_dim);
+    GLM_CHECK(ix.k_norm_bias.empty() ||
+                  static_cast<int64_t>(ix.k_norm_bias.size()) == c.index_head_dim,
+              "DSA indexer k_norm bias dim %zu != index_head_dim %lld",
+              ix.k_norm_bias.size(), (long long)c.index_head_dim);
+}
+
 // ---------------------------------------------------------------------------
 // Weight loading
 // ---------------------------------------------------------------------------
@@ -111,28 +163,48 @@ static Linear load_linear(const SafeTensors& st, const std::string& base,
     }
     Tensor w = st.get(wname);
     GLM_CHECK(w.ndim() == 2, "%s expected 2-D, got %s", wname.c_str(), w.shape_str().c_str());
-    L.out_features = w.dim(0);
-    L.in_features  = w.dim(1);
-    int64_t count  = L.out_features * L.in_features;
-    L.w.resize(count);
-
     DType dt = w.dtype();
-    if (dt == DType::kI8 && st.has(base + ".weight_scale")) {
-        // per-output-channel or per-group symmetric int8
-        Tensor sc = st.get(base + ".weight_scale");
-        std::vector<float> scales = sc.dequant_to_f32();
-        int64_t groups = static_cast<int64_t>(scales.size());
-        int64_t gsize = std::max<int64_t>(1, count / std::max<int64_t>(1, groups));
-        dequant_int8_to_f32(w.as<int8_t>(), scales.data(), count, gsize, L.w.data());
-    } else if (dt == DType::kU8 && st.has(base + ".scales")) {
-        // packed int4 (two nibbles/byte) + per-group scales
+    if (wname.size() >= 8 && wname.compare(wname.size() - 8, 8, ".qweight") == 0) {
+        GLM_CHECK(dt == DType::kU8, "%s expected U8 packed int4, got %s",
+                  wname.c_str(), dtype_name(dt));
+        GLM_CHECK(st.has(base + ".scales"), "missing int4 scales: %s.scales", base.c_str());
         Tensor sc = st.get(base + ".scales");
-        std::vector<float> scales = sc.dequant_to_f32();
-        int64_t groups = static_cast<int64_t>(scales.size());
-        int64_t gsize = std::max<int64_t>(1, count / std::max<int64_t>(1, groups));
-        dequant_int4_to_f32(w.as<uint8_t>(), scales.data(), count, gsize, L.w.data());
+        GLM_CHECK(sc.ndim() == 2 && sc.dim(0) == w.dim(0),
+                  "%s.scales expected [out,groups], got %s", base.c_str(), sc.shape_str().c_str());
+        L.out_features = w.dim(0);
+        L.in_features = w.dim(1) * 2;  // one byte stores two input-column weights
+        L.scales = sc.dequant_to_f32();
+        const int64_t groups_per_row = sc.dim(1);
+        GLM_CHECK(groups_per_row > 0 && L.in_features % groups_per_row == 0,
+                  "cannot infer int4 group size for %s: in=%lld groups=%lld",
+                  base.c_str(), (long long)L.in_features, (long long)groups_per_row);
+        L.group_size = L.in_features / groups_per_row;
+        L.quantized_int4 = true;
+        L.qweight.resize(static_cast<size_t>(w.numel()));
+        std::memcpy(L.qweight.data(), w.data(), L.qweight.size());
+
+        const char* keep_quant = std::getenv("GLMSERVE_QUANT_ONLY");
+        if (!keep_quant || !*keep_quant || keep_quant[0] == '0') {
+            int64_t count = L.out_features * L.in_features;
+            L.w.resize(static_cast<size_t>(count));
+            dequant_int4_to_f32(L.qweight.data(), L.scales.data(), count, L.group_size, L.w.data());
+        }
     } else {
-        dequant_to_f32(dt, w.data(), L.w.data(), count);
+        L.out_features = w.dim(0);
+        L.in_features  = w.dim(1);
+        int64_t count  = L.out_features * L.in_features;
+        L.w.resize(count);
+
+        if (dt == DType::kI8 && st.has(base + ".weight_scale")) {
+        // per-output-channel or per-group symmetric int8
+            Tensor sc = st.get(base + ".weight_scale");
+            std::vector<float> scales = sc.dequant_to_f32();
+            int64_t groups = static_cast<int64_t>(scales.size());
+            int64_t gsize = std::max<int64_t>(1, count / std::max<int64_t>(1, groups));
+            dequant_int8_to_f32(w.as<int8_t>(), scales.data(), count, gsize, L.w.data());
+        } else {
+            dequant_to_f32(dt, w.data(), L.w.data(), count);
+        }
     }
 
     if (st.has(base + ".bias")) {
@@ -157,8 +229,9 @@ static RMSNormW load_norm(const SafeTensors& st, const std::string& name,
 
 static DSAIndexer load_dsa_indexer(const SafeTensors& st, const std::string& base) {
     DSAIndexer ix;
-    if (!st.has(base + ".wq_b.weight") && !st.has(base + ".wk.weight") &&
-        !st.has(base + ".weights_proj.weight")) {
+    if (!st.has(base + ".wq_b.weight") && !st.has(base + ".wq_b.qweight") &&
+        !st.has(base + ".wk.weight") && !st.has(base + ".wk.qweight") &&
+        !st.has(base + ".weights_proj.weight") && !st.has(base + ".weights_proj.qweight")) {
         return ix;
     }
     ix.wq_b = load_linear(st, base + ".wq_b");
@@ -179,6 +252,54 @@ static std::string first_present(const SafeTensors& st,
     return "";
 }
 
+static void load_layer_body(const SafeTensors& st, const GLM52Config& c,
+                            int64_t layer_id, Layer& L) {
+    std::string p = "model.layers." + std::to_string(layer_id) + ".";
+
+    L.input_norm     = load_norm(st, p + "input_layernorm.weight");
+    L.post_attn_norm = load_norm(st, p + "post_attention_layernorm.weight");
+
+    L.q_a_proj  = load_linear(st, p + "self_attn.q_a_proj");
+    L.q_a_norm  = load_norm(st, p + "self_attn.q_a_layernorm.weight");
+    L.q_b_proj  = load_linear(st, p + "self_attn.q_b_proj");
+    L.kv_a_proj = load_linear(st, p + "self_attn.kv_a_proj_with_mqa");
+    L.kv_a_norm = load_norm(st, p + "self_attn.kv_a_layernorm.weight");
+    L.kv_b_proj = load_linear(st, p + "self_attn.kv_b_proj");
+    L.o_proj    = load_linear(st, p + "self_attn.o_proj");
+    L.indexer   = load_dsa_indexer(st, p + "self_attn.indexer");
+
+    L.is_dense = c.is_dense_layer(layer_id);
+    if (L.is_dense) {
+        L.dense_mlp.gate_proj = load_linear(st, p + "mlp.gate_proj");
+        L.dense_mlp.up_proj   = load_linear(st, p + "mlp.up_proj");
+        L.dense_mlp.down_proj = load_linear(st, p + "mlp.down_proj");
+    } else {
+        std::string gate = (st.has(p + "mlp.gate.weight") || st.has(p + "mlp.gate.qweight"))
+                         ? p + "mlp.gate" : p + "mlp.router";
+        L.moe.router = load_linear(st, gate);
+        for (const std::string& bn : {p + "mlp.gate.e_score_correction_bias",
+                                      p + "mlp.e_score_correction_bias"}) {
+            if (st.has(bn)) { L.moe.e_bias = st.get(bn).dequant_to_f32(); break; }
+        }
+        L.moe.experts.resize(c.n_routed_experts);
+        for (int64_t e = 0; e < c.n_routed_experts; ++e) {
+            std::string ep = p + "mlp.experts." + std::to_string(e) + ".";
+            L.moe.experts[e].gate_proj = load_linear(st, ep + "gate_proj");
+            L.moe.experts[e].up_proj   = load_linear(st, ep + "up_proj");
+            L.moe.experts[e].down_proj = load_linear(st, ep + "down_proj");
+        }
+        std::string sh = first_present(st, {p + "mlp.shared_experts.gate_proj",
+                                            p + "mlp.shared_expert.gate_proj"});
+        if (!sh.empty()) {
+            std::string base = sh.substr(0, sh.size() - std::string(".gate_proj").size());
+            L.moe.shared.gate_proj = load_linear(st, base + ".gate_proj");
+            L.moe.shared.up_proj   = load_linear(st, base + ".up_proj");
+            L.moe.shared.down_proj = load_linear(st, base + ".down_proj");
+            L.moe.has_shared = true;
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tensor-parallel weight slicing (Megatron-style). A column-parallel linear
 // keeps a contiguous slice of the OUTPUT rows (out_features); a row-parallel
@@ -195,12 +316,27 @@ static void shard_linear_columns(Linear& L, int tp_rank, int tp_size) {
               (long long)out, tp_size);
     const int64_t out_l = out / tp_size;
     const int64_t r0 = static_cast<int64_t>(tp_rank) * out_l;
-    std::vector<float> w(static_cast<size_t>(out_l * in));
-    std::memcpy(w.data(), L.w.data() + r0 * in, static_cast<size_t>(out_l * in) * sizeof(float));
-    L.w.swap(w);
+    if (L.has_f32()) {
+        std::vector<float> w(static_cast<size_t>(out_l * in));
+        std::memcpy(w.data(), L.w.data() + r0 * in,
+                    static_cast<size_t>(out_l * in) * sizeof(float));
+        L.w.swap(w);
+    }
     if (L.has_bias()) {
         std::vector<float> b(L.b.begin() + r0, L.b.begin() + r0 + out_l);
         L.b.swap(b);
+    }
+    if (L.quantized_int4) {
+        const int64_t packed_in = (in + 1) / 2;
+        const int64_t groups_per_row = static_cast<int64_t>(L.scales.size()) / out;
+        std::vector<uint8_t> q(static_cast<size_t>(out_l * packed_in));
+        std::vector<float> sc(static_cast<size_t>(out_l * groups_per_row));
+        std::memcpy(q.data(), L.qweight.data() + r0 * packed_in,
+                    static_cast<size_t>(out_l * packed_in));
+        std::memcpy(sc.data(), L.scales.data() + r0 * groups_per_row,
+                    static_cast<size_t>(out_l * groups_per_row) * sizeof(float));
+        L.qweight.swap(q);
+        L.scales.swap(sc);
     }
     L.out_features = out_l;
 }
@@ -212,14 +348,47 @@ static void shard_linear_rows(Linear& L, int tp_rank, int tp_size) {
               (long long)in, tp_size);
     const int64_t in_l = in / tp_size;
     const int64_t c0 = static_cast<int64_t>(tp_rank) * in_l;
-    std::vector<float> w(static_cast<size_t>(out * in_l));
-    for (int64_t o = 0; o < out; ++o)
-        std::memcpy(w.data() + o * in_l, L.w.data() + o * in + c0,
-                    static_cast<size_t>(in_l) * sizeof(float));
-    L.w.swap(w);
+    if (L.has_f32()) {
+        std::vector<float> w(static_cast<size_t>(out * in_l));
+        for (int64_t o = 0; o < out; ++o)
+            std::memcpy(w.data() + o * in_l, L.w.data() + o * in + c0,
+                        static_cast<size_t>(in_l) * sizeof(float));
+        L.w.swap(w);
+    }
     // The bias adds to the post-all-reduce sum, so keep it on rank 0 only (else
     // it would be counted tp_size times).
     if (L.has_bias() && tp_rank != 0) std::fill(L.b.begin(), L.b.end(), 0.0f);
+    if (L.quantized_int4) {
+        GLM_CHECK(c0 % L.group_size == 0 && in_l % L.group_size == 0,
+                  "row-parallel int4 shard must align to group_size=%lld (c0=%lld in_l=%lld)",
+                  (long long)L.group_size, (long long)c0, (long long)in_l);
+        const int64_t old_packed_in = (in + 1) / 2;
+        const int64_t new_packed_in = (in_l + 1) / 2;
+        const int64_t old_groups = static_cast<int64_t>(L.scales.size()) / out;
+        const int64_t new_groups = in_l / L.group_size;
+        const int64_t g0 = c0 / L.group_size;
+        std::vector<uint8_t> q(static_cast<size_t>(out * new_packed_in), 0);
+        std::vector<float> sc(static_cast<size_t>(out * new_groups));
+        auto get_q = [](const uint8_t* row, int64_t col) {
+            uint8_t byte = row[col >> 1];
+            return static_cast<uint8_t>((col & 1) ? (byte >> 4) : (byte & 0x0F));
+        };
+        auto set_q = [](uint8_t* row, int64_t col, uint8_t v) {
+            uint8_t& byte = row[col >> 1];
+            if (col & 1) byte = static_cast<uint8_t>((byte & 0x0F) | (v << 4));
+            else         byte = static_cast<uint8_t>((byte & 0xF0) | (v & 0x0F));
+        };
+        for (int64_t o = 0; o < out; ++o) {
+            const uint8_t* src = L.qweight.data() + o * old_packed_in;
+            uint8_t* dst = q.data() + o * new_packed_in;
+            for (int64_t i = 0; i < in_l; ++i) set_q(dst, i, get_q(src, c0 + i));
+            std::memcpy(sc.data() + o * new_groups,
+                        L.scales.data() + o * old_groups + g0,
+                        static_cast<size_t>(new_groups) * sizeof(float));
+        }
+        L.qweight.swap(q);
+        L.scales.swap(sc);
+    }
     L.in_features = in_l;
 }
 
@@ -267,7 +436,7 @@ void GLM52Model::load(const SafeTensors& st, int64_t max_layers) {
     layer_begin_ = range.begin;
     const bool first = dist_.is_first_stage();
     const bool last  = dist_.is_last_stage();
-    const bool tied  = !st.has("lm_head.weight");
+    const bool tied  = !st.has("lm_head.weight") && !st.has("lm_head.qweight");
 
     // Tensor-parallel: this rank owns num_attention_heads / tp_size heads.
     const int tp = std::max(1, dist_.tp_size);
@@ -315,57 +484,8 @@ void GLM52Model::load(const SafeTensors& st, int64_t max_layers) {
         Layer& L = layers_[li];
         std::string p = "model.layers." + std::to_string(i) + ".";
 
-        L.input_norm     = load_norm(st, p + "input_layernorm.weight");
-        L.post_attn_norm = load_norm(st, p + "post_attention_layernorm.weight");
-
-        // MLA: Q via q_a_proj -> q_a_layernorm -> q_b_proj; KV via
-        // kv_a_proj_with_mqa -> kv_a_layernorm -> kv_b_proj. The DSA
-        // indexer.* weights are present but unused on the V0 dense path
-        // (index_topk=2048 >> typical prompt -> attention is exact dense).
-        L.q_a_proj  = load_linear(st, p + "self_attn.q_a_proj");
-        L.q_a_norm  = load_norm(st, p + "self_attn.q_a_layernorm.weight");
-        L.q_b_proj  = load_linear(st, p + "self_attn.q_b_proj");
-        L.kv_a_proj = load_linear(st, p + "self_attn.kv_a_proj_with_mqa");
-        L.kv_a_norm = load_norm(st, p + "self_attn.kv_a_layernorm.weight");
-        L.kv_b_proj = load_linear(st, p + "self_attn.kv_b_proj");
-        L.o_proj    = load_linear(st, p + "self_attn.o_proj");
-        L.indexer   = load_dsa_indexer(st, p + "self_attn.indexer");
+        load_layer_body(st, c, i, L);
         if (L.indexer.valid()) ++loaded_indexers;
-
-        L.is_dense = c.is_dense_layer(i);
-        if (L.is_dense) {
-            L.dense_mlp.gate_proj = load_linear(st, p + "mlp.gate_proj");
-            L.dense_mlp.up_proj   = load_linear(st, p + "mlp.up_proj");
-            L.dense_mlp.down_proj = load_linear(st, p + "mlp.down_proj");
-        } else {
-            // router gate
-            std::string gate = st.has(p + "mlp.gate.weight") ? p + "mlp.gate"
-                                                             : p + "mlp.router";
-            L.moe.router = load_linear(st, gate);
-            // sigmoid score-correction bias (aux-loss-free routing)
-            for (const std::string& bn : {p + "mlp.gate.e_score_correction_bias",
-                                          p + "mlp.e_score_correction_bias"}) {
-                if (st.has(bn)) { L.moe.e_bias = st.get(bn).dequant_to_f32(); break; }
-            }
-            // experts
-            L.moe.experts.resize(c.n_routed_experts);
-            for (int64_t e = 0; e < c.n_routed_experts; ++e) {
-                std::string ep = p + "mlp.experts." + std::to_string(e) + ".";
-                L.moe.experts[e].gate_proj = load_linear(st, ep + "gate_proj");
-                L.moe.experts[e].up_proj   = load_linear(st, ep + "up_proj");
-                L.moe.experts[e].down_proj = load_linear(st, ep + "down_proj");
-            }
-            // shared expert
-            std::string sh = first_present(st, {p + "mlp.shared_experts.gate_proj",
-                                                p + "mlp.shared_expert.gate_proj"});
-            if (!sh.empty()) {
-                std::string base = sh.substr(0, sh.size() - std::string(".gate_proj").size());
-                L.moe.shared.gate_proj = load_linear(st, base + ".gate_proj");
-                L.moe.shared.up_proj   = load_linear(st, base + ".up_proj");
-                L.moe.shared.down_proj = load_linear(st, base + ".down_proj");
-                L.moe.has_shared = true;
-            }
-        }
         // Tensor-parallel: keep only this rank's head / FFN slice of the block.
         shard_layer_tp(L, tp_rank, tp);
 
@@ -384,6 +504,32 @@ void GLM52Model::load(const SafeTensors& st, int64_t max_layers) {
     if (loaded_indexers > 0) {
         GLM_INFO("loaded DSA indexer weights for %lld/%lld transformer layers",
                  (long long)loaded_indexers, (long long)n_local);
+    }
+
+    mtp_blocks_.clear();
+    if (last && c.num_nextn_predict_layers > 0) {
+        for (int64_t m = 0; m < c.num_nextn_predict_layers; ++m) {
+            int64_t i = c.num_hidden_layers + m;
+            std::string p = "model.layers." + std::to_string(i) + ".";
+            if (!st.has(p + "eh_proj.weight") && !st.has(p + "eh_proj.qweight")) continue;
+            MTPBlock mtp;
+            mtp.eh_proj = load_linear(st, p + "eh_proj");
+            mtp.enorm = load_norm(st, p + "enorm.weight");
+            mtp.hnorm = load_norm(st, p + "hnorm.weight");
+            mtp.shared_head_norm = load_norm(st, p + "shared_head.norm.weight");
+            load_layer_body(st, c, i, mtp.layer);
+            shard_layer_tp(mtp.layer, tp_rank, tp);
+            GLM_CHECK(mtp.eh_proj.in_features == 2 * c.hidden_size &&
+                          mtp.eh_proj.out_features == c.hidden_size,
+                      "MTP eh_proj shape [%lld,%lld] != [%lld,%lld]",
+                      (long long)mtp.eh_proj.out_features,
+                      (long long)mtp.eh_proj.in_features,
+                      (long long)c.hidden_size, (long long)(2 * c.hidden_size));
+            mtp_blocks_.push_back(std::move(mtp));
+        }
+        if (!mtp_blocks_.empty()) {
+            GLM_INFO("loaded %zu MTP predictor block(s)", mtp_blocks_.size());
+        }
     }
 }
 
@@ -404,11 +550,14 @@ void GLM52Model::embed(int token_id, float* out) const {
 // into the paged cache (naive/unabsorbed form), then run standard causal
 // attention with head_dim = qk_head_dim == v_head_dim. The latent-cache
 // optimization (store the 576-wide latent instead) is a future memory win.
-// DSA indexer is a no-op here: index_topk(2048) >> typical prompt -> exact dense.
+// DSA indexer: for ctx <= index_topk the sparse mask is exact dense. Past that,
+// full-indexer layers run the learned top-k selector and refresh the shared
+// IndexShare mask; shared layers reuse that mask against their own K/V cache.
 // ---------------------------------------------------------------------------
 void GLM52Model::attention(const Layer& L, int64_t layer_idx, const float* normed,
                            float* attn_out, int64_t n_tokens, int64_t start_pos,
-                           SequenceKV& kv) {
+                           SequenceKV& kv,
+                           std::vector<std::vector<int64_t>>* shared_dsa_indices) {
     const auto& c = cfg_;
     const int64_t H = tp_heads_;   // attention heads owned by this TP rank
     const int64_t nope = c.qk_nope_head_dim, rope = c.qk_rope_head_dim;
@@ -427,6 +576,28 @@ void GLM52Model::attention(const Layer& L, int64_t layer_idx, const float* norme
     std::vector<float> q(n_tokens * H * qk);
     linear_forward(L.q_b_proj, qa.data(), q.data(), n_tokens);
 
+    const int64_t ctx_after = start_pos + n_tokens;
+    const bool sparse_dsa = c.use_dsa && ctx_after > c.index_topk;
+    const bool learned_dsa = sparse_dsa && L.indexer.valid();
+    const bool shared_dsa = sparse_dsa && !learned_dsa && shared_dsa_indices &&
+                            static_cast<int64_t>(shared_dsa_indices->size()) == n_tokens;
+    std::vector<float> index_q;
+    std::vector<float> index_w;
+    std::vector<std::vector<int64_t>> selected_keys;
+    if (learned_dsa) {
+        GLM_CHECK(kv.cache && kv.cache->indexer_dim() == c.index_head_dim,
+                  "learned DSA requires KVCache indexer_dim=%lld, got %lld",
+                  (long long)c.index_head_dim,
+                  (long long)(kv.cache ? kv.cache->indexer_dim() : 0));
+        check_dsa_indexer_shapes(L.indexer, c);
+        index_q.resize(n_tokens * c.index_n_heads * c.index_head_dim);
+        linear_forward(L.indexer.wq_b, qa.data(), index_q.data(), n_tokens);
+        index_w.resize(n_tokens * c.index_n_heads);
+        linear_forward(L.indexer.weights_proj, normed, index_w.data(), n_tokens);
+        float inv_h = 1.0f / std::sqrt(static_cast<float>(c.index_n_heads));
+        for (float& v : index_w) v *= inv_h;
+    }
+
     // KV latent: [c_kv | k_pe]
     const int64_t kva_dim = kvlat + rope;
     std::vector<float> kva(n_tokens * kva_dim);
@@ -439,6 +610,15 @@ void GLM52Model::attention(const Layer& L, int64_t layer_idx, const float* norme
     }
     std::vector<float> kvb(n_tokens * H * (nope + vd));
     linear_forward(L.kv_b_proj, ckv.data(), kvb.data(), n_tokens);
+
+    std::vector<float> index_k;
+    if (learned_dsa) {
+        index_k.resize(n_tokens * c.index_head_dim);
+        linear_forward(L.indexer.wk, normed, index_k.data(), n_tokens);
+        layernorm_rows(index_k.data(), L.indexer.k_norm.w.data(),
+                       L.indexer.k_norm_bias.empty() ? nullptr : L.indexer.k_norm_bias.data(),
+                       index_k.data(), n_tokens, c.index_head_dim, 1e-6f);
+    }
 
     // Per token: RoPE the q pe-parts and the shared k_pe, then write per-head
     // K=[k_nope|k_pe] and V into the paged cache.
@@ -462,31 +642,87 @@ void GLM52Model::attention(const Layer& L, int64_t layer_idx, const float* norme
             // V[h] = v (v_head_dim)
             std::memcpy(vslot + h * hc, kvt + h * (nope + vd) + nope, vd * sizeof(float));
         }
+        if (learned_dsa) {
+            float* iq = index_q.data() + t * c.index_n_heads * c.index_head_dim;
+            for (int64_t ih = 0; ih < c.index_n_heads; ++ih)
+                rope_inplace(iq + ih * c.index_head_dim, rope, pos, c.rope_theta, false);
+
+            float* ik = index_k.data() + t * c.index_head_dim;
+            rope_inplace(ik, rope, pos, c.rope_theta, false);
+            std::memcpy(kv.index_slot(layer_idx, pos), ik,
+                        c.index_head_dim * sizeof(float));
+        }
     }
 
+    if (learned_dsa) {
+        selected_keys.resize(static_cast<size_t>(n_tokens));
+        const float index_scale = 1.0f / std::sqrt(static_cast<float>(c.index_head_dim));
+        parallel_for(n_tokens, [&](int64_t t) {
+            int64_t pos = start_pos + t;
+            int64_t topk = std::min<int64_t>(c.index_topk, pos + 1);
+            std::vector<float> scores(pos + 1, 0.0f);
+            const float* qt = index_q.data() + t * c.index_n_heads * c.index_head_dim;
+            const float* wt = index_w.data() + t * c.index_n_heads;
+            for (int64_t j = 0; j <= pos; ++j) {
+                const float* kj = kv.index_slot(layer_idx, j);
+                float total = 0.0f;
+                for (int64_t ih = 0; ih < c.index_n_heads; ++ih) {
+                    const float* qh = qt + ih * c.index_head_dim;
+                    float dot = 0.0f;
+                    for (int64_t d = 0; d < c.index_head_dim; ++d) dot += qh[d] * kj[d];
+                    total += wt[ih] * std::max(0.0f, dot * index_scale);
+                }
+                scores[j] = total;
+            }
+
+            std::vector<int64_t> ids(pos + 1);
+            std::iota(ids.begin(), ids.end(), 0);
+            std::partial_sort(ids.begin(), ids.begin() + topk, ids.end(),
+                              [&](int64_t a, int64_t b) { return scores[a] > scores[b]; });
+            ids.resize(static_cast<size_t>(topk));
+            std::sort(ids.begin(), ids.end());
+            selected_keys[static_cast<size_t>(t)] = std::move(ids);
+        });
+    }
+
+    if (learned_dsa && shared_dsa_indices) *shared_dsa_indices = selected_keys;
+
+    const std::vector<std::vector<int64_t>>* sparse_keys = nullptr;
+    if (learned_dsa) sparse_keys = &selected_keys;
+    else if (shared_dsa) sparse_keys = shared_dsa_indices;
+
     // Standard causal attention with head_dim = qk (K) / vd (V) inside an hc slot.
+    // In DSA mode, the key loop is restricted to learned or IndexShare positions.
     parallel_for(n_tokens * H, [&](int64_t idx) {
         int64_t t = idx / H, h = idx % H;
         int64_t pos = start_pos + t;
         const float* qh = q.data() + (t * H + h) * qk;
-        std::vector<float> scores(pos + 1);
+        const std::vector<int64_t>* keys =
+            sparse_keys ? &(*sparse_keys)[static_cast<size_t>(t)] : nullptr;
+        int64_t n_keys = sparse_keys ? static_cast<int64_t>(keys->size()) : pos + 1;
+        std::vector<float> scores(n_keys);
         float maxv = -1e30f;
-        for (int64_t j = 0; j <= pos; ++j) {
+        for (int64_t kk = 0; kk < n_keys; ++kk) {
+            int64_t j = sparse_keys ? (*keys)[static_cast<size_t>(kk)] : kk;
             const float* kj = kv.k_slot(layer_idx, j) + h * hc;
             float dot = 0.0f;
             for (int64_t d = 0; d < qk; ++d) dot += qh[d] * kj[d];
             dot *= scale;
-            scores[j] = dot;
+            scores[kk] = dot;
             maxv = std::max(maxv, dot);
         }
         float sum = 0.0f;
-        for (int64_t j = 0; j <= pos; ++j) { scores[j] = std::exp(scores[j] - maxv); sum += scores[j]; }
+        for (int64_t kk = 0; kk < n_keys; ++kk) {
+            scores[kk] = std::exp(scores[kk] - maxv);
+            sum += scores[kk];
+        }
         float inv = 1.0f / sum;
         float* out = attn_out + (t * H + h) * vd;   // attn_out is [n, H, v_head_dim]
         for (int64_t d = 0; d < vd; ++d) out[d] = 0.0f;
-        for (int64_t j = 0; j <= pos; ++j) {
+        for (int64_t kk = 0; kk < n_keys; ++kk) {
+            int64_t j = sparse_keys ? (*keys)[static_cast<size_t>(kk)] : kk;
             const float* vj = kv.v_slot(layer_idx, j) + h * hc;
-            float wgt = scores[j] * inv;
+            float wgt = scores[kk] * inv;
             for (int64_t d = 0; d < vd; ++d) out[d] += wgt * vj[d];
         }
     });
@@ -564,9 +800,9 @@ void GLM52Model::moe_mlp(const MoEMLP& m, const float* x, float* out,
     });
 }
 
-void GLM52Model::run_layer(int64_t layer_idx, float* hidden, int64_t n_tokens,
-                           int64_t start_pos, SequenceKV& kv) {
-    const Layer& L = layers_[layer_idx];
+void GLM52Model::run_layer_block(const Layer& L, int64_t kv_layer_idx, float* hidden,
+                                 int64_t n_tokens, int64_t start_pos, SequenceKV& kv,
+                                 std::vector<std::vector<int64_t>>* shared_dsa_indices) {
     const int64_t H = cfg_.hidden_size;
     const float eps = static_cast<float>(cfg_.rms_norm_eps);
     const bool tp = dist_.tp_size > 1;   // tensor-parallel: o_proj / down are row-sharded
@@ -580,7 +816,8 @@ void GLM52Model::run_layer(int64_t layer_idx, float* hidden, int64_t n_tokens,
     // Under TP each rank attends its head slice and o_proj (row-parallel) yields
     // a partial residual contribution; all_reduce sums them across the TP group.
     rmsnorm_rows(hidden, L.input_norm.w.data(), normed.data(), n_tokens, H, eps);
-    attention(L, layer_idx, normed.data(), attn.data(), n_tokens, start_pos, kv);
+    attention(L, kv_layer_idx, normed.data(), attn.data(), n_tokens, start_pos, kv,
+              shared_dsa_indices);
     linear_forward(L.o_proj, attn.data(), attn_proj.data(), n_tokens);
     if (tp) {
         GLM_CHECK(comm_, "tensor-parallel forward requires a communicator");
@@ -595,6 +832,13 @@ void GLM52Model::run_layer(int64_t layer_idx, float* hidden, int64_t n_tokens,
     else            moe_mlp(L.moe, normed.data(), mlp_out.data(), n_tokens);
     if (tp) comm_->all_reduce_sum(mlp_out.data(), n_tokens * H);
     for (int64_t i = 0; i < n_tokens * H; ++i) hidden[i] += mlp_out[i];
+}
+
+void GLM52Model::run_layer(int64_t layer_idx, float* hidden, int64_t n_tokens,
+                           int64_t start_pos, SequenceKV& kv,
+                           std::vector<std::vector<int64_t>>* shared_dsa_indices) {
+    run_layer_block(layers_[layer_idx], layer_idx, hidden, n_tokens, start_pos, kv,
+                    shared_dsa_indices);
 }
 
 std::vector<float> GLM52Model::forward(const std::vector<int>& tokens, int64_t start_pos,
@@ -617,8 +861,30 @@ std::vector<float> GLM52Model::forward(const std::vector<int>& tokens, int64_t s
 
     // This stage's slice of the block stack (layers are local-indexed, and so is
     // the per-stage KV cache, so run_layer indexes both with the same l).
+    std::vector<std::vector<int64_t>> shared_dsa_indices;
+    const int64_t ctx_after = start_pos + n;
+    const bool sparse_dsa = cfg_.use_dsa && ctx_after > cfg_.index_topk;
+    auto shared_dsa_layer = [&](int64_t global_layer) {
+        return cfg_.use_dsa &&
+               global_layer >= 0 &&
+               global_layer < static_cast<int64_t>(cfg_.indexer_types.size()) &&
+               cfg_.indexer_types[static_cast<size_t>(global_layer)] != "full";
+    };
+    if (sparse_dsa && !dist_.is_first_stage() && shared_dsa_layer(layer_begin_)) {
+        GLM_CHECK(comm_, "DSA mask receive requires a communicator");
+        std::vector<int> flat(static_cast<size_t>(n * cfg_.index_topk), -1);
+        comm_->pipeline_recv_prev_int(flat.data(), n * cfg_.index_topk);
+        shared_dsa_indices.resize(static_cast<size_t>(n));
+        for (int64_t t = 0; t < n; ++t) {
+            auto& row = shared_dsa_indices[static_cast<size_t>(t)];
+            for (int64_t k = 0; k < cfg_.index_topk; ++k) {
+                int v = flat[static_cast<size_t>(t * cfg_.index_topk + k)];
+                if (v >= 0) row.push_back(v);
+            }
+        }
+    }
     for (int64_t l = 0; l < num_layers(); ++l)
-        run_layer(l, hidden.data(), n, start_pos, kv);
+        run_layer(l, hidden.data(), n, start_pos, kv, &shared_dsa_indices);
 
     kv.length = start_pos + n;
 
@@ -627,6 +893,18 @@ std::vector<float> GLM52Model::forward(const std::vector<int>& tokens, int64_t s
     if (!dist_.is_last_stage()) {
         GLM_CHECK(comm_, "non-last pipeline stage requires a communicator");
         comm_->pipeline_send_next(hidden.data(), n * H);
+        int64_t next_layer = layer_begin_ + num_layers();
+        if (sparse_dsa && shared_dsa_layer(next_layer) &&
+            static_cast<int64_t>(shared_dsa_indices.size()) == n) {
+            std::vector<int> flat(static_cast<size_t>(n * cfg_.index_topk), -1);
+            for (int64_t t = 0; t < n; ++t) {
+                const auto& row = shared_dsa_indices[static_cast<size_t>(t)];
+                int64_t m = std::min<int64_t>(cfg_.index_topk, static_cast<int64_t>(row.size()));
+                for (int64_t k = 0; k < m; ++k)
+                    flat[static_cast<size_t>(t * cfg_.index_topk + k)] = static_cast<int>(row[static_cast<size_t>(k)]);
+            }
+            comm_->pipeline_send_next_int(flat.data(), n * cfg_.index_topk);
+        }
         if (all_logits) all_logits->clear();
         return {};
     }
@@ -645,6 +923,71 @@ std::vector<float> GLM52Model::forward(const std::vector<int>& tokens, int64_t s
         linear_forward(lm_head_, normed.data(), all_logits->data(), n);
     }
     return last_logits;
+}
+
+std::vector<float> GLM52Model::mtp_draft_logits(const std::vector<int>& context_tokens,
+                                                const std::vector<int>& draft_tokens) {
+    GLM_CHECK(!context_tokens.empty(), "mtp requires nonempty context tokens");
+    GLM_CHECK(!draft_tokens.empty(), "mtp requires nonempty draft tokens");
+    GLM_CHECK(dist_.world_size == 1 && dist_.tp_size == 1 && dist_.pp_size == 1,
+              "mtp_draft_logits currently supports the single-rank CPU path");
+    GLM_CHECK(mtp_ready(), "MTP weights are not loaded");
+
+    const int64_t H = cfg_.hidden_size;
+    const int64_t block = 16;
+    const int64_t base_blocks = (static_cast<int64_t>(context_tokens.size()) + block - 1) / block + 4;
+    KVCache base_cache(num_layers(), local_kv_heads(), cfg_.kv_cache_head_dim(), block,
+                       base_blocks, cfg_.use_dsa ? cfg_.index_head_dim : 0);
+    SequenceKV base_kv = base_cache.make_sequence(9001);
+
+    std::vector<float> hidden(context_tokens.size() * static_cast<size_t>(H));
+    for (size_t t = 0; t < context_tokens.size(); ++t)
+        embed(context_tokens[t], hidden.data() + static_cast<int64_t>(t) * H);
+    base_kv.reserve(static_cast<int64_t>(context_tokens.size()));
+    std::vector<std::vector<int64_t>> shared_dsa_indices;
+    for (int64_t l = 0; l < num_layers(); ++l)
+        run_layer(l, hidden.data(), static_cast<int64_t>(context_tokens.size()), 0,
+                  base_kv, &shared_dsa_indices);
+
+    std::vector<float> prev(H);
+    std::memcpy(prev.data(), hidden.data() + (context_tokens.size() - 1) * H,
+                H * sizeof(float));
+    base_kv.release();
+
+    const MTPBlock& mtp = mtp_blocks_[0];
+    const int64_t steps = static_cast<int64_t>(draft_tokens.size());
+    KVCache mtp_cache(1, local_kv_heads(), cfg_.kv_cache_head_dim(), block,
+                      (steps + block - 1) / block + 2,
+                      cfg_.use_dsa ? cfg_.index_head_dim : 0);
+    SequenceKV mtp_kv = mtp_cache.make_sequence(9002);
+    std::vector<float> logits(static_cast<size_t>(steps) * cfg_.vocab_size);
+    std::vector<std::vector<int64_t>> mtp_shared_dsa_indices;
+
+    for (int64_t s = 0; s < steps; ++s) {
+        std::vector<float> emb(H), enormed(H), hnormed(H), fused_in(2 * H), cur(H);
+        embed(draft_tokens[static_cast<size_t>(s)], emb.data());
+        std::memcpy(enormed.data(), emb.data(), H * sizeof(float));
+        std::memcpy(hnormed.data(), prev.data(), H * sizeof(float));
+        rmsnorm_vec(enormed.data(), mtp.enorm.w.data(), H, static_cast<float>(cfg_.rms_norm_eps));
+        rmsnorm_vec(hnormed.data(), mtp.hnorm.w.data(), H, static_cast<float>(cfg_.rms_norm_eps));
+        std::memcpy(fused_in.data(), enormed.data(), H * sizeof(float));
+        std::memcpy(fused_in.data() + H, hnormed.data(), H * sizeof(float));
+        linear_forward(mtp.eh_proj, fused_in.data(), cur.data(), 1);
+
+        mtp_kv.reserve(1);
+        run_layer_block(mtp.layer, 0, cur.data(), 1, s, mtp_kv, &mtp_shared_dsa_indices);
+        mtp_kv.length = s + 1;
+
+        std::vector<float> head(H);
+        std::memcpy(head.data(), cur.data(), H * sizeof(float));
+        rmsnorm_vec(head.data(), mtp.shared_head_norm.w.data(), H,
+                    static_cast<float>(cfg_.rms_norm_eps));
+        linear_forward(lm_head_, head.data(), logits.data() + s * cfg_.vocab_size, 1);
+        prev.swap(cur);
+    }
+
+    mtp_kv.release();
+    return logits;
 }
 
 // CPU-only build: GPU entry points are stubs (the real ones live in model_gpu.cpp).

@@ -61,7 +61,8 @@ int main() {
 
     auto make_kv = [&](glmserve::GLM52Model& m) {
         return glmserve::KVCache(m.num_layers(), m.local_kv_heads(),
-                                 gcfg.kv_cache_head_dim(), /*block_size=*/16, /*num_blocks=*/64);
+                                 gcfg.kv_cache_head_dim(), /*block_size=*/16, /*num_blocks=*/64,
+                                 gcfg.use_dsa ? gcfg.index_head_dim : 0);
     };
 
     // --- tensor-parallel forward: this rank owns a head / FFN slice ---

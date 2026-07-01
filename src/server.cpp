@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cstdlib>
 #include <ctime>
 #include <sstream>
 
@@ -63,6 +64,9 @@ Engine::Engine(EngineOptions opts) : opts_(std::move(opts)) {
     SafeTensors st;
     st.load(opts_.model_path);
 
+    if (opts_.use_gpu && std::getenv("GLMSERVE_QUANT_ONLY") == nullptr)
+        setenv("GLMSERVE_QUANT_ONLY", "1", 0);
+
     model_ = std::make_unique<GLM52Model>(cfg_);
     model_->load(st, opts_.max_layers);
 
@@ -81,7 +85,8 @@ Engine::Engine(EngineOptions opts) : opts_(std::move(opts)) {
     // rank stores only its head slice (local_kv_heads()), == num_attention_heads
     // in the single-process build. Slot width is the (qk==v) per-head dim.
     kv_ = std::make_unique<KVCache>(model_->num_layers(), model_->local_kv_heads(),
-                                    cfg_.kv_cache_head_dim(), opts_.block_size, blocks);
+                                    cfg_.kv_cache_head_dim(), opts_.block_size, blocks,
+                                    cfg_.use_dsa ? cfg_.index_head_dim : 0);
     sched_ = std::make_unique<Scheduler>(opts_.max_concurrent);
     GLM_INFO("engine ready: %s, ctx=%lld, kv_blocks=%lld, max_concurrent=%d",
              opts_.served_model_name.c_str(), (long long)opts_.max_model_len,
@@ -137,6 +142,17 @@ Completion Engine::run(const std::vector<int>& prompt_in, const SamplingParams& 
         std::vector<float> logits = gpu_active_ ? model_->forward_gpu_prefill(all_tokens)
                                                 : model_->forward(prompt, 0, kv);
         Sampler sampler(p.seed);
+        const bool mtp_enabled = p.mtp_draft_k > 0;
+        if (mtp_enabled) {
+            GLM_CHECK(!gpu_active_, "MTP speculative generation currently validates the CPU path only");
+            GLM_CHECK(model_->mtp_ready(), "MTP speculative generation requested but MTP weights are not loaded");
+            GLM_CHECK(p.temperature <= 0.0f && p.top_k == 0 && p.top_p >= 1.0f,
+                      "MTP speculative generation currently supports greedy sampling only");
+            GLM_CHECK(p.repetition_penalty == 1.0f && p.frequency_penalty == 0.0f &&
+                      p.presence_penalty == 0.0f,
+                      "MTP speculative generation currently does not support sampling penalties");
+            c.mtp_used = true;
+        }
 
         size_t emitted = 0;  // bytes of c.text already streamed
         auto flush = [&](bool final_flush) -> bool {
@@ -152,37 +168,95 @@ Completion Engine::run(const std::vector<int>& prompt_in, const SamplingParams& 
             emitted = std::max(emitted, upto);
             return true;
         };
-
-        c.finish_reason = "length";
-        for (int step = 0; step < p.max_tokens; ++step) {
-            int next = sampler.sample(logits, all_tokens, p);
-
-            bool is_eos = false;
+        auto argmax_logits = [](const std::vector<float>& v) -> int {
+            int a = 0;
+            for (size_t i = 1; i < v.size(); ++i) if (v[i] > v[a]) a = static_cast<int>(i);
+            return a;
+        };
+        auto argmax_row = [&](const std::vector<float>& rows, int64_t row) -> int {
+            const float* p0 = rows.data() + row * cfg_.vocab_size;
+            int a = 0;
+            for (int64_t i = 1; i < cfg_.vocab_size; ++i)
+                if (p0[i] > p0[a]) a = static_cast<int>(i);
+            return a;
+        };
+        auto is_stop_token = [&](int tok) -> bool {
             if (!p.ignore_eos) {
-                if (tokenizer_->is_stop(next)) is_eos = true;
-                for (int64_t e : cfg_.eos_token_ids) if (next == static_cast<int>(e)) is_eos = true;
+                if (tokenizer_->is_stop(tok)) return true;
+                for (int64_t e : cfg_.eos_token_ids)
+                    if (tok == static_cast<int>(e)) return true;
             }
-            for (int sid : p.stop_token_ids) if (next == sid) is_eos = true;
-            if (is_eos) { c.finish_reason = "stop"; break; }
-
-            all_tokens.push_back(next);
-            c.tokens.push_back(next);
+            for (int sid : p.stop_token_ids) if (tok == sid) return true;
+            return false;
+        };
+        auto record_token = [&](int tok) -> bool {
+            all_tokens.push_back(tok);
+            c.tokens.push_back(tok);
             c.completion_tokens++;
-            c.text += tokenizer_->decode_token(next);
+            c.text += tokenizer_->decode_token(tok);
 
-            // stop strings
-            bool stopped = false;
             for (auto& s : p.stop) {
                 if (!s.empty()) {
                     auto pos = c.text.find(s);
-                    if (pos != std::string::npos) { c.text.resize(pos); stopped = true; break; }
+                    if (pos != std::string::npos) {
+                        c.text.resize(pos);
+                        c.finish_reason = "stop";
+                        return false;
+                    }
                 }
             }
-            if (stopped) { c.finish_reason = "stop"; break; }
+            if (!flush(false)) { c.finish_reason = "cancel"; return false; }
+            if (sched_->is_cancelled(id)) { c.finish_reason = "cancel"; return false; }
+            if (c.completion_tokens >= p.max_tokens) { c.finish_reason = "length"; return false; }
+            return true;
+        };
 
-            if (!flush(false)) { c.finish_reason = "cancel"; break; }
-            if (sched_->is_cancelled(id)) { c.finish_reason = "cancel"; break; }
-            if (c.completion_tokens >= p.max_tokens) { c.finish_reason = "length"; break; }
+        c.finish_reason = "length";
+        while (c.completion_tokens < p.max_tokens) {
+            if (mtp_enabled) {
+                const int remaining = p.max_tokens - c.completion_tokens;
+                const int group_k = std::min(p.mtp_draft_k, remaining);
+                std::vector<int> draft;
+                draft.reserve(group_k);
+                draft.push_back(argmax_logits(logits));
+                while (static_cast<int>(draft.size()) < group_k) {
+                    std::vector<float> mtp = model_->mtp_draft_logits(all_tokens, draft);
+                    draft.push_back(argmax_row(mtp, static_cast<int64_t>(draft.size()) - 1));
+                }
+
+                ++c.mtp_groups;
+                const int64_t old_kv_len = kv.length;
+                std::vector<float> target_rows;
+                std::vector<float> target_last = model_->forward(draft, kv.length, kv, &target_rows);
+                bool finish_generation = false;
+                for (int i = 0; i < group_k; ++i) {
+                    const int target = (i == 0) ? argmax_logits(logits)
+                                                : argmax_row(target_rows, i - 1);
+                    if (draft[i] == target) {
+                        ++c.mtp_accepted;
+                        if (is_stop_token(target)) { c.finish_reason = "stop"; finish_generation = true; break; }
+                        if (!record_token(target)) { finish_generation = true; break; }
+                        logits = (i + 1 < group_k) ? std::vector<float>(
+                                     target_rows.begin() + static_cast<int64_t>(i) * cfg_.vocab_size,
+                                     target_rows.begin() + (static_cast<int64_t>(i) + 1) * cfg_.vocab_size)
+                                                   : std::move(target_last);
+                    } else {
+                        ++c.mtp_rejected;
+                        kv.length = old_kv_len + i;
+                        if (is_stop_token(target)) { c.finish_reason = "stop"; finish_generation = true; break; }
+                        logits = model_->forward({target}, kv.length, kv);
+                        if (!record_token(target)) { finish_generation = true; break; }
+                        break;
+                    }
+                }
+                if (finish_generation) break;
+                continue;
+            }
+
+            int next = sampler.sample(logits, all_tokens, p);
+
+            if (is_stop_token(next)) { c.finish_reason = "stop"; break; }
+            if (!record_token(next)) break;
 
             // Incremental decode: the just-pushed token sits at the last position;
             // its K/V is appended to the persistent device cache and attention
@@ -363,6 +437,71 @@ Engine::DecodeCheck Engine::check_decode(const std::vector<int>& prompt, int ste
     return r;
 }
 
+Engine::MTPCheck Engine::check_mtp_speculative(const std::vector<int>& prompt, int steps,
+                                               int draft_k) {
+    std::lock_guard<std::mutex> guard(gen_mu_);
+    GLM_CHECK(!prompt.empty(), "check_mtp_speculative: empty prompt");
+    GLM_CHECK(steps > 0 && draft_k > 0, "check_mtp_speculative: steps/draft_k must be positive");
+    GLM_CHECK(!gpu_active_, "check_mtp_speculative currently validates the CPU MTP path");
+    GLM_CHECK(model_->mtp_ready(), "check_mtp_speculative: MTP weights are not loaded");
+
+    MTPCheck r;
+    r.steps = steps;
+    r.draft_k = draft_k;
+
+    int64_t id = sched_->admit();
+    SequenceKV kv = kv_->make_sequence(id);
+    std::vector<int> all_tokens = prompt;
+    std::vector<float> logits;
+    try {
+        logits = model_->forward(prompt, 0, kv);
+        while (static_cast<int>(r.output_tokens.size()) < steps) {
+            ++r.groups;
+            const int remaining = steps - static_cast<int>(r.output_tokens.size());
+            const int group_k = std::min(draft_k, remaining);
+
+            std::vector<int> draft;
+            draft.reserve(group_k);
+            draft.push_back(host_argmax(logits));  // target-seeded first token
+            while (static_cast<int>(draft.size()) < group_k) {
+                std::vector<float> mtp = model_->mtp_draft_logits(all_tokens, draft);
+                const float* row = mtp.data() +
+                    (static_cast<int64_t>(draft.size()) - 1) * cfg_.vocab_size;
+                int next = 0;
+                for (int64_t i = 1; i < cfg_.vocab_size; ++i)
+                    if (row[i] > row[next]) next = static_cast<int>(i);
+                draft.push_back(next);
+            }
+
+            for (int tok : draft) {
+                const int target = host_argmax(logits);
+                r.proposed_tokens.push_back(tok);
+                r.target_tokens.push_back(target);
+                if (tok == target) {
+                    ++r.accepted;
+                    r.output_tokens.push_back(tok);
+                    all_tokens.push_back(tok);
+                    logits = model_->forward({tok}, kv.length, kv);
+                } else {
+                    ++r.rejected;
+                    r.output_tokens.push_back(target);
+                    all_tokens.push_back(target);
+                    logits = model_->forward({target}, kv.length, kv);
+                    break;
+                }
+                if (static_cast<int>(r.output_tokens.size()) >= steps) break;
+            }
+        }
+    } catch (...) {
+        kv.release();
+        sched_->complete(id);
+        throw;
+    }
+    kv.release();
+    sched_->complete(id);
+    return r;
+}
+
 // ---------------------------------------------------------------------------
 // HTTP handlers
 // ---------------------------------------------------------------------------
@@ -377,6 +516,7 @@ static SamplingParams parse_params(const json::Value& r) {
     p.presence_penalty   = static_cast<float>(r.get_double("presence_penalty", 0.0));
     p.seed = static_cast<uint64_t>(r.get_int("seed", 0));
     p.ignore_eos = r.get_bool("ignore_eos", false);
+    p.mtp_draft_k = static_cast<int>(r.get_int("mtp_draft_k", 0));
     if (r.has("stop")) {
         auto s = r.at("stop");
         if (s->type == json::Type::String) p.stop.push_back(s->as_string());

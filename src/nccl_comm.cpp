@@ -73,6 +73,10 @@ static float* ensure_bounce(NcclState* s, int64_t count) {
     return s->bounce;
 }
 
+static int* ensure_bounce_int(NcclState* s, int64_t count) {
+    return reinterpret_cast<int*>(ensure_bounce(s, count));
+}
+
 static std::string id_to_hex(const ncclUniqueId& id) {
     static const char* h = "0123456789abcdef";
     const unsigned char* p = reinterpret_cast<const unsigned char*>(&id);
@@ -267,6 +271,49 @@ void Communicator::pipeline_recv_prev(float* data, int64_t count) {
                 "cudaMemcpyAsync(pp recv D2H)");
     }
     cuda_ok(cudaStreamSynchronize(s->stream), "cudaStreamSynchronize(recv)");
+#else
+    (void)data; (void)count;
+#endif
+}
+
+void Communicator::pipeline_send_next_int(const int* data, int64_t count) {
+    if (cfg_.pp_size <= 1) return;
+#ifdef GLMSERVE_CUDA
+    auto* s = static_cast<NcclState*>(state_);
+    GLM_CHECK(s && s->world, "NCCL communicator is not active");
+    int dst = cfg_.rank + cfg_.tp_size;
+    GLM_CHECK(dst < cfg_.world_size, "pipeline_send_next_int called on last pipeline stage");
+    const int* src = data;
+    if (!is_device_ptr(data)) {
+        int* b = ensure_bounce_int(s, count);
+        cuda_ok(cudaMemcpyAsync(b, data, static_cast<size_t>(count) * sizeof(int),
+                                cudaMemcpyHostToDevice, s->stream),
+                "cudaMemcpyAsync(pp int send H2D)");
+        src = b;
+    }
+    nccl_ok(ncclSend(src, count, ncclInt, dst, s->world, s->stream), "ncclSend(next int)");
+    cuda_ok(cudaStreamSynchronize(s->stream), "cudaStreamSynchronize(send int)");
+#else
+    (void)data; (void)count;
+#endif
+}
+
+void Communicator::pipeline_recv_prev_int(int* data, int64_t count) {
+    if (cfg_.pp_size <= 1) return;
+#ifdef GLMSERVE_CUDA
+    auto* s = static_cast<NcclState*>(state_);
+    GLM_CHECK(s && s->world, "NCCL communicator is not active");
+    int src = cfg_.rank - cfg_.tp_size;
+    GLM_CHECK(src >= 0, "pipeline_recv_prev_int called on first pipeline stage");
+    const bool host = !is_device_ptr(data);
+    int* dst = host ? ensure_bounce_int(s, count) : data;
+    nccl_ok(ncclRecv(dst, count, ncclInt, src, s->world, s->stream), "ncclRecv(prev int)");
+    if (host) {
+        cuda_ok(cudaMemcpyAsync(data, dst, static_cast<size_t>(count) * sizeof(int),
+                                cudaMemcpyDeviceToHost, s->stream),
+                "cudaMemcpyAsync(pp int recv D2H)");
+    }
+    cuda_ok(cudaStreamSynchronize(s->stream), "cudaStreamSynchronize(recv int)");
 #else
     (void)data; (void)count;
 #endif

@@ -19,6 +19,7 @@ struct SamplingParams {
     int    max_tokens  = 512;
     uint64_t seed      = 0;         // 0 => nondeterministic-ish default seed
     bool   ignore_eos  = false;
+    int    mtp_draft_k = 0;         // >0 enables greedy CPU MTP speculative decode
     std::vector<std::string> stop;  // stop strings (checked on decoded text)
     std::vector<int> stop_token_ids;
 };

@@ -55,9 +55,10 @@ coverage.
 | `self_attn.indexer.weights_proj.weight` | DSA index score projection | optional |
 | `self_attn.indexer.k_norm.{weight,bias}` | DSA indexer key norm | optional |
 
-The DSA indexer tensors are loaded when present, but active sparse attention
-still uses the recent-window baseline rather than learned indexer top-k
-selection.
+The DSA indexer tensors are loaded when present. The CPU reference path and CUDA
+path use them for learned top-k sparse selection on full-indexer layers once
+`ctx > index_topk`; shared IndexShare layers reuse the most recent full-indexer
+mask against their own K/V cache.
 
 ### Dense MLP (layers `i < first_k_dense_replace`)
 
@@ -74,9 +75,28 @@ selection.
 
 ### MTP (optional, `num_nextn_predict_layers`)
 
-GLM-5.2's multi-token-prediction head ships as extra layer(s) / an `mtp.*`
-block; used for 5-token speculative decoding (Phase 7). The loader skips them in
-V0; wiring is the MTP milestone.
+GLM-5.2's multi-token-prediction head ships as extra layer(s) after the base
+stack. For the public GLM-5.2 config (`num_hidden_layers=78`,
+`num_nextn_predict_layers=1`) the extra predictor is stored as
+`model.layers.78.*`.
+
+| name | purpose |
+|---|---|
+| `model.layers.78.eh_proj.weight` | MTP embedding/hidden projection |
+| `model.layers.78.enorm.weight` | MTP embedding norm |
+| `model.layers.78.hnorm.weight` | MTP hidden norm |
+| `model.layers.78.shared_head.norm.weight` | shared prediction-head norm |
+| `model.layers.78.input_layernorm.weight` / `post_attention_layernorm.weight` | MTP block norms |
+| `model.layers.78.self_attn.*` | MTP MLA attention + DSA indexer |
+| `model.layers.78.mlp.*` | MTP MoE block |
+
+`tools/convert_hf_to_glmserve.py --check` validates that these optional tensors
+are indexed. The CPU runtime now has a draft-logits verification path
+(`glmserve mtp`) that loads the MTP block, runs `eh_proj` + the extra MLA/MoE
+block, and emits draft-token logits through `shared_head.norm` + `lm_head`.
+`glmserve mtpcheck` adds a greedy speculative accept/reject correctness gate on
+the tiny checkpoint. The normal generation loop can opt into CPU greedy MTP with
+`mtp_draft_k` / `--mtp-draft-k`; GPU/distributed MTP remains a serving milestone.
 
 ## Quantized weights
 

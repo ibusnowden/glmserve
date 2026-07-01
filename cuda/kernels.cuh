@@ -19,6 +19,10 @@ namespace cuda {
 void rmsnorm(const float* x, const float* w, float* out,
              int64_t n, int64_t d, float eps, cudaStream_t s = 0);
 
+// Standard LayerNorm over rows: out = ((x - mean) / sqrt(var + eps)) * w + b.
+void layernorm(const float* x, const float* w, const float* b, float* out,
+               int64_t n, int64_t d, float eps, cudaStream_t s = 0);
+
 // Per-head RMSNorm over head_dim (qk-norm).
 void per_head_rmsnorm(float* x, const float* w, int64_t n, int64_t n_heads,
                       int64_t head_dim, float eps, cudaStream_t s = 0);
@@ -72,7 +76,23 @@ void attention_dsa_paged(const float* q, const float* k_cache, const float* v_ca
                          const int* block_table, int64_t n_query, int64_t start_pos,
                          int64_t n_heads, int64_t n_kv_heads, int64_t head_dim,
                          int64_t block_size, int64_t index_topk, float scale,
-                         float* out, cudaStream_t s = 0);
+                         float* out, cudaStream_t s = 0,
+                         float* part_acc = nullptr, float* part_m = nullptr,
+                         float* part_l = nullptr, int64_t max_splits = 0);
+
+// Learned GLM DSA selector and indexed sparse attention. index_q[n,index_heads,index_dim],
+// index_k_cache[ctx,index_dim], index_w[n,index_heads]. topk_indices[n,index_topk].
+void dsa_select_topk(const float* index_q, const float* index_k_cache,
+                     const float* index_w, int64_t n_query, int64_t start_pos,
+                     int64_t index_heads, int64_t index_dim, int64_t index_topk,
+                     float score_scale, float weight_scale, int* topk_indices,
+                     float* topk_scores, cudaStream_t s = 0);
+void attention_dsa_indexed_paged(const float* q, const float* k_cache, const float* v_cache,
+                                 const int* block_table, const int* topk_indices,
+                                 int64_t n_query, int64_t start_pos, int64_t n_heads,
+                                 int64_t n_kv_heads, int64_t head_dim, int64_t block_size,
+                                 int64_t index_topk, float scale, float* out,
+                                 cudaStream_t s = 0);
 
 // ---- MoE -----------------------------------------------------------------
 // Router: logits[n, E] -> per-token top-k expert ids and gate weights.
@@ -93,6 +113,17 @@ void moe_expert_ffn(const float* x, const int* topk_ids, const float* topk_weigh
                     int n, int topk, int hidden, int moe_inter, int E,
                     float* out, cudaStream_t s = 0);
 
+// Same routed expert FFN with packed W4A16 resident weights. gate/up layout:
+// qweight[E, moe_inter, ceil(hidden/2)], scales[E, moe_inter, ceil(hidden/group)].
+// down layout: qweight[E, hidden, ceil(moe_inter/2)],
+// scales[E, hidden, ceil(moe_inter/group)].
+void moe_expert_ffn_w4a16(const float* x, const int* topk_ids, const float* topk_weights,
+                          const uint8_t* gate_q, const float* gate_sc,
+                          const uint8_t* up_q, const float* up_sc,
+                          const uint8_t* down_q, const float* down_sc,
+                          int n, int topk, int hidden, int moe_inter, int E,
+                          int group_size, float* out, cudaStream_t s = 0);
+
 // ---- sampling ------------------------------------------------------------
 void argmax(const float* logits, int vocab, int* out_id, cudaStream_t s = 0);
 void softmax_inplace(float* logits, int vocab, float temperature, cudaStream_t s = 0);
@@ -108,6 +139,8 @@ void rope_q(float* q, int64_t n, int64_t n_heads, int64_t qk, int64_t nope, int6
             int64_t start_pos, double theta, bool interleave, cudaStream_t s = 0);
 void rope_k(float* kpe, int64_t n, int64_t rope, int64_t start_pos, double theta,
             bool interleave, cudaStream_t s = 0);
+void rope_index_q(float* q, int64_t n, int64_t n_heads, int64_t head_dim, int64_t rope,
+                  int64_t start_pos, double theta, bool interleave, cudaStream_t s = 0);
 void assemble_kv(const float* kvb, const float* kpe, float* K, float* V, int64_t n,
                  int64_t n_heads, int64_t nope, int64_t rope, int64_t vd, int64_t hc,
                  cudaStream_t s = 0);

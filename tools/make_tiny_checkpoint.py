@@ -50,7 +50,14 @@ TINY = dict(
     rms_norm_eps=1e-5,
     rope_parameters=dict(rope_theta=10000.0, rope_type="default"),
     max_position_embeddings=4096,
-    index_topk=2048,
+    # DSA indexer: intentionally tiny top-k so the default 8-token test prompt
+    # exercises learned sparse selection instead of degenerating to dense.
+    use_dsa=True,
+    index_n_heads=2,
+    index_head_dim=8,
+    index_topk=3,
+    indexer_rope_interleave=False,
+    indexer_types=["full", "shared", "shared", "full"],
     num_nextn_predict_layers=1,
     model_type="glm_moe_dsa",
     architectures=["GlmMoeDsaForCausalLM"],
@@ -69,6 +76,12 @@ def rn(rng, *shape, scale=0.02):
 def rmsnorm(x, w, eps):
     var = np.mean(x.astype(np.float64) ** 2, axis=-1, keepdims=True)
     return ((x * (1.0 / np.sqrt(var + eps))).astype(np.float32)) * w
+
+
+def layernorm(x, w, b, eps=1e-6):
+    mean = np.mean(x.astype(np.float64), axis=-1, keepdims=True)
+    var = np.mean((x.astype(np.float64) - mean) ** 2, axis=-1, keepdims=True)
+    return (((x - mean) * (1.0 / np.sqrt(var + eps))).astype(np.float32)) * w + b
 
 
 def silu(x):
@@ -103,7 +116,12 @@ def rope_inplace(v, pos, theta, interleave):
     return v
 
 
-def mla_attention(cfg, W, p, h):
+def dsa_layer_type(cfg, layer):
+    types = cfg.get("indexer_types") or []
+    return types[layer] if layer < len(types) else "full"
+
+
+def mla_attention(cfg, W, p, h, layer_idx, shared_dsa_indices=None):
     n, _ = h.shape
     H = cfg["num_attention_heads"]
     nope, rope = cfg["qk_nope_head_dim"], cfg["qk_rope_head_dim"]
@@ -113,6 +131,7 @@ def mla_attention(cfg, W, p, h):
     theta = cfg["rope_parameters"]["rope_theta"]
     il = cfg["rope_interleave"]
     scale = 1.0 / np.sqrt(qk)
+    index_topk = cfg.get("index_topk", 2048)
 
     qa = rmsnorm(linear(h, W[p + "self_attn.q_a_proj.weight"]),
                  W[p + "self_attn.q_a_layernorm.weight"], eps)
@@ -135,17 +154,44 @@ def mla_attention(cfg, W, p, h):
             K[t, hh, nope:qk] = kpe_t
             V[t, hh] = kvb[t, hh, nope:nope + vd]
 
+    selected = None
+    layer_type = dsa_layer_type(cfg, layer_idx)
+    if cfg.get("use_dsa", True) and n > index_topk and layer_type == "full":
+        iH, idim = cfg["index_n_heads"], cfg["index_head_dim"]
+        iq = linear(qa, W[p + "self_attn.indexer.wq_b.weight"]).reshape(n, iH, idim)
+        ik = layernorm(linear(h, W[p + "self_attn.indexer.wk.weight"]),
+                       W[p + "self_attn.indexer.k_norm.weight"],
+                       W[p + "self_attn.indexer.k_norm.bias"])
+        iw = linear(h, W[p + "self_attn.indexer.weights_proj.weight"]) / np.sqrt(iH)
+        for t in range(n):
+            for ih in range(iH):
+                iq[t, ih, :rope] = rope_inplace(iq[t, ih, :rope], t, theta, False)
+            ik[t, :rope] = rope_inplace(ik[t, :rope], t, theta, False)
+
+        selected = []
+        iscale = 1.0 / np.sqrt(idim)
+        for t in range(n):
+            sc = np.zeros(t + 1, np.float32)
+            for j in range(t + 1):
+                per_head = np.maximum(0.0, (iq[t] @ ik[j]) * iscale)
+                sc[j] = np.sum(iw[t] * per_head)
+            k = min(index_topk, t + 1)
+            selected.append(np.sort(np.argsort(-sc, kind="stable")[:k]))
+    elif cfg.get("use_dsa", True) and n > index_topk and shared_dsa_indices is not None:
+        selected = shared_dsa_indices
+
     out = np.zeros((n, H * vd), np.float32)
     for t in range(n):
+        keys = selected[t] if selected is not None else range(t + 1)
         for hh in range(H):
-            sc = np.array([np.dot(Q[t, hh], K[j, hh]) * scale for j in range(t + 1)], np.float32)
+            sc = np.array([np.dot(Q[t, hh], K[j, hh]) * scale for j in keys], np.float32)
             sc -= sc.max()
             e = np.exp(sc); e /= e.sum()
             acc = np.zeros(vd, np.float32)
-            for j in range(t + 1):
-                acc += e[j] * V[j, hh]
+            for jj, j in enumerate(keys):
+                acc += e[jj] * V[j, hh]
             out[t, hh * vd:(hh + 1) * vd] = acc
-    return linear(out, W[p + "self_attn.o_proj.weight"])
+    return linear(out, W[p + "self_attn.o_proj.weight"]), selected
 
 
 def moe(cfg, W, p, x):
@@ -178,13 +224,17 @@ def moe(cfg, W, p, x):
     return out
 
 
-def reference_forward(cfg, W, tokens):
+def transformer_hidden(cfg, W, tokens):
     eps = cfg["rms_norm_eps"]
     hidden = np.stack([W["model.embed_tokens.weight"][t] for t in tokens]).astype(np.float32)
+    shared_dsa_indices = None
     for L in range(cfg["num_hidden_layers"]):
         p = f"model.layers.{L}."
         normed = rmsnorm(hidden, W[p + "input_layernorm.weight"], eps)
-        hidden = hidden + mla_attention(cfg, W, p, normed)
+        attn, selected = mla_attention(cfg, W, p, normed, L, shared_dsa_indices)
+        if selected is not None and dsa_layer_type(cfg, L) == "full":
+            shared_dsa_indices = selected
+        hidden = hidden + attn
         normed = rmsnorm(hidden, W[p + "post_attention_layernorm.weight"], eps)
         if L < cfg["first_k_dense_replace"]:
             g = silu(linear(normed, W[p + "mlp.gate_proj.weight"]))
@@ -192,8 +242,38 @@ def reference_forward(cfg, W, tokens):
             hidden = hidden + linear(g * u, W[p + "mlp.down_proj.weight"])
         else:
             hidden = hidden + moe(cfg, W, p, normed)
+    return hidden
+
+
+def reference_forward(cfg, W, tokens):
+    eps = cfg["rms_norm_eps"]
+    hidden = transformer_hidden(cfg, W, tokens)
     hidden = rmsnorm(hidden, W["model.norm.weight"], eps)
     return linear(hidden, W["lm_head.weight"])
+
+
+def mtp_reference_logits(cfg, W, tokens, draft_tokens):
+    eps = cfg["rms_norm_eps"]
+    p = f"model.layers.{cfg['num_hidden_layers']}."
+    prev = transformer_hidden(cfg, W, tokens)[-1].astype(np.float32)
+    mtp_inputs = []
+    logits = []
+    for tok in draft_tokens:
+        e = W["model.embed_tokens.weight"][tok]
+        en = rmsnorm(e[None], W[p + "enorm.weight"], eps)[0]
+        hn = rmsnorm(prev[None], W[p + "hnorm.weight"], eps)[0]
+        inp = linear(np.concatenate([en, hn])[None], W[p + "eh_proj.weight"])[0]
+        mtp_inputs.append(inp)
+        h = np.stack(mtp_inputs).astype(np.float32)
+        normed = rmsnorm(h, W[p + "input_layernorm.weight"], eps)
+        attn, _ = mla_attention(cfg, W, p, normed, cfg["num_hidden_layers"], None)
+        h = h + attn
+        normed = rmsnorm(h, W[p + "post_attention_layernorm.weight"], eps)
+        h = h + moe(cfg, W, p, normed)
+        prev = h[-1].astype(np.float32)
+        head = rmsnorm(prev[None], W[p + "shared_head.norm.weight"], eps)
+        logits.append(linear(head, W["lm_head.weight"])[0])
+    return np.stack(logits).astype(np.float32)
 
 
 def build_weights(cfg, seed=1234):
@@ -204,6 +284,7 @@ def build_weights(cfg, seed=1234):
     nope = cfg["qk_nope_head_dim"]
     qlat, kvlat, rope = cfg["q_lora_rank"], cfg["kv_lora_rank"], cfg["qk_rope_head_dim"]
     inter, moei, V = cfg["intermediate_size"], cfg["moe_intermediate_size"], cfg["vocab_size"]
+    iH, idim = cfg["index_n_heads"], cfg["index_head_dim"]
     ones = lambda d: (np.ones(d, np.float32) + rn(rng, d, scale=0.01))
     W = {
         "model.embed_tokens.weight": rn(rng, V, H),
@@ -222,6 +303,12 @@ def build_weights(cfg, seed=1234):
         W[p + "self_attn.kv_a_layernorm.weight"] = ones(kvlat)
         W[p + "self_attn.kv_b_proj.weight"] = rn(rng, nH * (nope + vd), kvlat)
         W[p + "self_attn.o_proj.weight"] = rn(rng, H, nH * vd)
+        if dsa_layer_type(cfg, L) == "full":
+            W[p + "self_attn.indexer.wq_b.weight"] = rn(rng, iH * idim, qlat)
+            W[p + "self_attn.indexer.wk.weight"] = rn(rng, idim, H)
+            W[p + "self_attn.indexer.weights_proj.weight"] = rn(rng, iH, H)
+            W[p + "self_attn.indexer.k_norm.weight"] = ones(idim)
+            W[p + "self_attn.indexer.k_norm.bias"] = rn(rng, idim, scale=0.01)
         if L < cfg["first_k_dense_replace"]:
             W[p + "mlp.gate_proj.weight"] = rn(rng, inter, H)
             W[p + "mlp.up_proj.weight"] = rn(rng, inter, H)
@@ -238,6 +325,38 @@ def build_weights(cfg, seed=1234):
             W[sp + "gate_proj.weight"] = rn(rng, moei, H)
             W[sp + "up_proj.weight"] = rn(rng, moei, H)
             W[sp + "down_proj.weight"] = rn(rng, H, moei)
+    if cfg.get("num_nextn_predict_layers", 0) > 0:
+        L = cfg["num_hidden_layers"]
+        p = f"model.layers.{L}."
+        W[p + "eh_proj.weight"] = rn(rng, H, 2 * H)
+        W[p + "enorm.weight"] = ones(H)
+        W[p + "hnorm.weight"] = ones(H)
+        W[p + "shared_head.norm.weight"] = ones(H)
+        W[p + "input_layernorm.weight"] = ones(H)
+        W[p + "post_attention_layernorm.weight"] = ones(H)
+        W[p + "self_attn.q_a_proj.weight"] = rn(rng, qlat, H)
+        W[p + "self_attn.q_a_layernorm.weight"] = ones(qlat)
+        W[p + "self_attn.q_b_proj.weight"] = rn(rng, nH * qk, qlat)
+        W[p + "self_attn.kv_a_proj_with_mqa.weight"] = rn(rng, kvlat + rope, H)
+        W[p + "self_attn.kv_a_layernorm.weight"] = ones(kvlat)
+        W[p + "self_attn.kv_b_proj.weight"] = rn(rng, nH * (nope + vd), kvlat)
+        W[p + "self_attn.o_proj.weight"] = rn(rng, H, nH * vd)
+        W[p + "self_attn.indexer.wq_b.weight"] = rn(rng, iH * idim, qlat)
+        W[p + "self_attn.indexer.wk.weight"] = rn(rng, idim, H)
+        W[p + "self_attn.indexer.weights_proj.weight"] = rn(rng, iH, H)
+        W[p + "self_attn.indexer.k_norm.weight"] = ones(idim)
+        W[p + "self_attn.indexer.k_norm.bias"] = rn(rng, idim, scale=0.01)
+        W[p + "mlp.gate.weight"] = rn(rng, cfg["n_routed_experts"], H)
+        W[p + "mlp.gate.e_score_correction_bias"] = rn(rng, cfg["n_routed_experts"], scale=0.05)
+        for e in range(cfg["n_routed_experts"]):
+            ep = p + f"mlp.experts.{e}."
+            W[ep + "gate_proj.weight"] = rn(rng, moei, H)
+            W[ep + "up_proj.weight"] = rn(rng, moei, H)
+            W[ep + "down_proj.weight"] = rn(rng, H, moei)
+        sp = p + "mlp.shared_experts."
+        W[sp + "gate_proj.weight"] = rn(rng, moei, H)
+        W[sp + "up_proj.weight"] = rn(rng, moei, H)
+        W[sp + "down_proj.weight"] = rn(rng, H, moei)
     return W
 
 
@@ -261,6 +380,13 @@ def main():
     json.dump(dict(prompt=prompt, vocab=cfg["vocab_size"], argmax=int(np.argmax(last)),
                    logits=[float(x) for x in last]),
               open(os.path.join(args.out, "reference_logits.json"), "w"))
+
+    draft = [2, 7, 1]
+    mtp = mtp_reference_logits(cfg, W, prompt, draft)
+    json.dump(dict(context=prompt, draft=draft, vocab=cfg["vocab_size"],
+                   argmax=[int(np.argmax(row)) for row in mtp],
+                   logits=[float(x) for x in mtp.reshape(-1)]),
+              open(os.path.join(args.out, "reference_mtp_logits.json"), "w"))
 
     print(f"[make_tiny] MLA checkpoint -> {args.out}: {len(W)} tensors, "
           f"layers={cfg['num_hidden_layers']}, prompt={prompt}, argmax={int(np.argmax(last))}")

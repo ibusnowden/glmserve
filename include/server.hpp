@@ -44,6 +44,10 @@ struct Completion {
     int prompt_tokens = 0;
     int completion_tokens = 0;
     std::string finish_reason = "stop";     // "stop" | "length" | "cancel"
+    bool mtp_used = false;
+    int mtp_groups = 0;
+    int mtp_accepted = 0;
+    int mtp_rejected = 0;
 };
 
 class Engine {
@@ -98,6 +102,18 @@ public:
         std::vector<int> inc_tokens, ref_tokens;
     };
     DecodeCheck check_decode(const std::vector<int>& prompt, int steps);
+
+    struct MTPCheck {
+        int steps = 0;
+        int draft_k = 0;
+        int groups = 0;
+        int accepted = 0;
+        int rejected = 0;
+        std::vector<int> proposed_tokens;
+        std::vector<int> target_tokens;
+        std::vector<int> output_tokens;
+    };
+    MTPCheck check_mtp_speculative(const std::vector<int>& prompt, int steps, int draft_k);
 
     Tokenizer& tokenizer() { return *tokenizer_; }
 

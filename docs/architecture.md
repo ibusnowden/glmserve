@@ -80,9 +80,19 @@ attention when `ctx <= index_topk`.
 
 The model loader now recognizes optional GLM lightning-indexer weights
 (`self_attn.indexer.{wq_b,wk,weights_proj,k_norm.*}`) and stores them in each
-layer when present. Those weights are not yet used to select sparse keys in the
-CPU or GPU forward path; replacing the recent-window baseline with learned
-indexer top-k remains the next DSA milestone.
+layer when present. The CPU reference path and CUDA path now use those weights
+on full-indexer layers when `ctx > index_topk`: they compute the HF-style
+learned top-k mask, store per-position indexer keys in a sidecar cache, and
+restrict attention to the selected positions. Shared IndexShare layers reuse the
+most recent full-indexer mask against their own K/V cache. The remaining DSA
+work is optimization and real-weight validation rather than mask semantics.
+
+The loader also recognizes the optional MTP predictor block after the base stack
+(`model.layers.<num_hidden_layers>.*`). The CPU `glmserve mtp` command runs a
+draft-logits verification path over the tiny checkpoint, and `glmserve mtpcheck`
+exercises a greedy speculative accept/reject correctness path. The generation
+loop can opt into CPU greedy MTP with `mtp_draft_k` / `--mtp-draft-k`; GPU and
+distributed MTP integration is still pending.
 
 ## Memory: the paged KV cache (`src/kv_cache.cpp`)
 
@@ -137,6 +147,13 @@ The full-forward gates run the model itself over the tiny checkpoint on 2× RTX
 - `tests/test_tp_forward.cpp` (`tp_forward_smoke.sbatch`): TP=2/PP=1, logits
   match to **1.5e-7** (job 125290; all-reduce reorders the float sums, so this
   is ~rounding rather than bit-exact).
+
+The device-resident GPU path is also checked with numerical tolerances rather
+than bit-exact promises. In particular, the MoE expert CUDA kernel accumulates
+top-k expert outputs with `atomicAdd`, so selected expert contributions can land
+in a different floating-point order than the CPU reference loop. That is fine
+for inference quality and expected for GPU throughput, but any GPU MoE gate
+should compare with tolerances.
 
 What remains is carrying the same TP/PP sharding onto the device-resident GPU
 forward path (`model_gpu.cpp`), and the multi-process serving driver that

@@ -26,10 +26,15 @@ namespace glmserve {
 struct Linear {
     std::vector<float> w;   // out*in
     std::vector<float> b;   // out (optional, empty if none)
+    std::vector<uint8_t> qweight;  // packed int4: [out, ceil(in/2)]
+    std::vector<float> scales;     // [out, ceil(in/group_size)]
     int64_t out_features = 0;
     int64_t in_features  = 0;
+    int64_t group_size   = 0;
+    bool quantized_int4  = false;
     bool has_bias() const { return !b.empty(); }
-    bool valid()    const { return !w.empty(); }
+    bool valid()    const { return !w.empty() || !qweight.empty(); }
+    bool has_f32()  const { return !w.empty(); }
 };
 
 struct RMSNormW {
@@ -87,6 +92,18 @@ struct Layer {
     MoEMLP   moe;                  // valid when !is_dense
 };
 
+struct MTPBlock {
+    Linear eh_proj;                 // concat(enorm(embed), hnorm(hidden)) -> hidden
+    RMSNormW enorm;
+    RMSNormW hnorm;
+    RMSNormW shared_head_norm;
+    Layer layer;
+    bool valid() const {
+        return eh_proj.valid() && !enorm.w.empty() && !hnorm.w.empty() &&
+               !shared_head_norm.w.empty();
+    }
+};
+
 class GLM52Model {
 public:
     explicit GLM52Model(GLM52Config cfg) : cfg_(std::move(cfg)) {}
@@ -128,6 +145,14 @@ public:
                                SequenceKV& kv,
                                std::vector<float>* all_logits = nullptr);
 
+    // CPU MTP verification path. Runs the base model over context_tokens, then
+    // runs the first MTP block over draft_tokens and returns [draft,vocab]
+    // logits row-major. This is the correctness surface used before wiring
+    // speculative acceptance into serving.
+    std::vector<float> mtp_draft_logits(const std::vector<int>& context_tokens,
+                                        const std::vector<int>& draft_tokens);
+    bool mtp_ready() const { return !mtp_blocks_.empty() && mtp_blocks_[0].valid(); }
+
     // Embedding lookup for a single token (exposed for tests).
     void embed(int token_id, float* out) const;
 
@@ -156,10 +181,14 @@ public:
 private:
     // One transformer block over a [n_tokens, hidden] activation buffer.
     void run_layer(int64_t layer_idx, float* hidden, int64_t n_tokens,
-                   int64_t start_pos, SequenceKV& kv);
+                   int64_t start_pos, SequenceKV& kv,
+                   std::vector<std::vector<int64_t>>* shared_dsa_indices);
+    void run_layer_block(const Layer& L, int64_t kv_layer_idx, float* hidden,
+                         int64_t n_tokens, int64_t start_pos, SequenceKV& kv,
+                         std::vector<std::vector<int64_t>>* shared_dsa_indices);
     void attention(const Layer& L, int64_t layer_idx, const float* normed,
                    float* attn_out, int64_t n_tokens, int64_t start_pos,
-                   SequenceKV& kv);
+                   SequenceKV& kv, std::vector<std::vector<int64_t>>* shared_dsa_indices);
     void dense_mlp(const DenseMLP& m, const float* x, float* out, int64_t n_tokens) const;
     void moe_mlp(const MoEMLP& m, const float* x, float* out, int64_t n_tokens) const;
 
@@ -169,6 +198,7 @@ private:
     Linear lm_head_;                    // [vocab, hidden] (may alias embeddings)
     bool tied_embeddings_ = false;
     std::vector<Layer> layers_;          // this stage's layers (local-indexed)
+    std::vector<MTPBlock> mtp_blocks_;   // optional MTP/next-token predictor blocks
     void* gpu_state_ = nullptr;   // opaque GpuState* (model_gpu.cpp), null on CPU build
 
     // --- distributed state (single full rank by default) ---

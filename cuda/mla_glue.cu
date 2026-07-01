@@ -25,6 +25,34 @@ void silu_mul(const float* g, const float* u, float* out, int64_t n, cudaStream_
     silu_mul_kernel<<<(unsigned)((n + 255) / 256), 256, 0, s>>>(g, u, out, n);
 }
 
+// Standard LayerNorm over rows. One block per row; intended for the DSA
+// indexer key path where dim is small (128 in GLM-5.2).
+__global__ void layernorm_kernel(const float* __restrict__ x, const float* __restrict__ w,
+                                 const float* __restrict__ b, float* __restrict__ out,
+                                 int64_t d, float eps) {
+    int64_t r = blockIdx.x;
+    const float* xr = x + r * d;
+    float* yr = out + r * d;
+    double mean = 0.0;
+    for (int64_t i = 0; i < d; ++i) mean += xr[i];
+    mean /= (double)d;
+    double var = 0.0;
+    for (int64_t i = 0; i < d; ++i) {
+        double z = (double)xr[i] - mean;
+        var += z * z;
+    }
+    float inv = (float)(1.0 / sqrt(var / (double)d + (double)eps));
+    __syncthreads();  // allow safe in-place x==out use after all reads finish
+    for (int64_t i = threadIdx.x; i < d; i += blockDim.x) {
+        float bias = b ? b[i] : 0.0f;
+        yr[i] = ((float)((double)xr[i] - mean)) * inv * w[i] + bias;
+    }
+}
+void layernorm(const float* x, const float* w, const float* b, float* out,
+               int64_t n, int64_t d, float eps, cudaStream_t s) {
+    layernorm_kernel<<<(unsigned)n, 128, 0, s>>>(x, w, b, out, d, eps);
+}
+
 // gather embedding rows: hidden[t] = table[tokens[t]]   (n rows of width H)
 __global__ void embed_gather_kernel(const float* __restrict__ table, const int* __restrict__ tok,
                                     float* __restrict__ hidden, int64_t n, int64_t H) {
@@ -91,6 +119,24 @@ __global__ void rope_k_kernel(float* __restrict__ kpe, int64_t rope, int64_t sta
 void rope_k(float* kpe, int64_t n, int64_t rope, int64_t start_pos, double theta,
             bool interleave, cudaStream_t s) {
     rope_k_kernel<<<(unsigned)n, 32, 0, s>>>(kpe, rope, start_pos, theta, interleave);
+}
+
+// RoPE the first `rope` dims of index_q[n, index_heads, index_dim].
+__global__ void rope_index_q_kernel(float* __restrict__ q, int64_t n_heads,
+                                    int64_t head_dim, int64_t rope, int64_t start_pos,
+                                    double theta, bool interleave) {
+    int64_t row = blockIdx.x;
+    int64_t h = blockIdx.y;
+    int64_t pos = start_pos + row;
+    float* v = q + (row * n_heads + h) * head_dim;
+    for (int64_t i = threadIdx.x; i < rope / 2; i += blockDim.x)
+        rope_pair(v, rope, pos, theta, interleave, i);
+}
+void rope_index_q(float* q, int64_t n, int64_t n_heads, int64_t head_dim, int64_t rope,
+                  int64_t start_pos, double theta, bool interleave, cudaStream_t s) {
+    dim3 grid((unsigned)n, (unsigned)n_heads);
+    rope_index_q_kernel<<<grid, 32, 0, s>>>(q, n_heads, head_dim, rope, start_pos,
+                                            theta, interleave);
 }
 
 // Assemble per-head K=[k_nope|k_pe] (width hc) and V=v (width vd, in hc slot) from
