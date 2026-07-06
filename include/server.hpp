@@ -13,6 +13,7 @@
 #include "http_server.hpp"
 #include "kv_cache.hpp"
 #include "model.hpp"
+#include "nccl_comm.hpp"
 #include "safetensors.hpp"
 #include "sampler.hpp"
 #include "scheduler.hpp"
@@ -56,6 +57,14 @@ public:
 
     const GLM52Config& config() const { return model_->config(); }
     const std::string& model_name() const { return opts_.served_model_name; }
+
+    // Distributed (TP/PP) state. world_size>1 means this Engine is one rank of a
+    // multi-GPU deployment; is_root() is rank 0 (the only rank that prints /
+    // serves HTTP). barrier() syncs all ranks (no-op when single-rank).
+    bool distributed() const { return dist_.world_size > 1; }
+    bool is_root() const { return dist_.rank == 0; }
+    const DistConfig& dist() const { return dist_; }
+    void barrier();
 
     // Run a full generation. If on_delta is set, it is called with each new
     // UTF-8-safe text fragment as decoding proceeds.
@@ -134,6 +143,17 @@ private:
     std::unique_ptr<KVCache> kv_;
     std::unique_ptr<Scheduler> sched_;
     std::mutex gen_mu_;   // V0: serialize forward passes over the shared model
+
+    // Distributed (TP/PP) runtime. When world_size > 1 the Engine creates an
+    // NCCL Communicator (which also pins this rank's GPU via cudaSetDevice) and
+    // attaches it to the model before load, so load_gguf/load shard the weights
+    // across the TP group and upload_to_gpu lands on the local device. The GPU
+    // forward then all-reduces row-parallel outputs and pipelines hidden states
+    // across PP stages. Under TP=8/PP=1 every rank is first+last stage, so each
+    // rank holds a 1/8 weight shard + replicated embed/lm_head and runs the full
+    // forward in lockstep; rank 0 samples/serves.
+    std::unique_ptr<Communicator> comm_;
+    DistConfig dist_{};
 
     // GPU path (Phase 3): weights are uploaded to the device lazily on first use.
     bool gpu_active_ = false;   // upload succeeded and the GPU forward is live

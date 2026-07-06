@@ -20,3 +20,9 @@ checkpoints/
 # python
 __pycache__/
 *.pyc
+
+# dependency files leaked outside build/
+*.d
+
+# debug dump artifacts
+scripts/logs/

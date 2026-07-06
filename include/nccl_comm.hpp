@@ -57,6 +57,11 @@ public:
     void pipeline_send_next_int(const int* data, int64_t count);
     void pipeline_recv_prev_int(int* data, int64_t count);
 
+    // Broadcast a contiguous int array from root_rank to all ranks in the TP
+    // group (used to keep TP ranks in lockstep on the sampled token / prompt
+    // during distributed serving). Host pointers are staged through the device.
+    void bcast_int(int* data, int64_t count, int root_rank);
+
     void barrier();
 
 private:

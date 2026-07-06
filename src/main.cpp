@@ -9,13 +9,20 @@
 // `serve` exposes the OpenAI-compatible API for Pi Code / Cline / OpenCode.
 #include "common.hpp"
 #include "config.hpp"
+#include "gguf.hpp"
+#include "gguf_quant.hpp"
+#include "model.hpp"
+#include "model_gguf.hpp"
 #include "safetensors.hpp"
 #include "server.hpp"
 
+#include <cmath>
 #include <csignal>
 #include <cstdio>
 #include <cstring>
+#include <cstdint>
 #include <map>
+#include <set>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -63,6 +70,66 @@ void on_sigint(int) { if (g_server) g_server->stop(); }
 int cmd_inspect(const Args& a) {
     std::string model = a.get("model");
     GLM_CHECK(!model.empty(), "inspect requires --model DIR");
+    if (gguf_path_like(model)) {
+        GGUFModel gguf;
+        gguf.load(model);
+        if (a.has("require-glm52")) gguf.validate_glm52();
+        if (a.has("check-glmserve-map")) {
+            GGUFGLM52Layout layout = gguf.build_glm52_layout();
+            GLM_INFO("gguf->glmserve layout: modules=%zu dense_layers=%zu moe_layers=%zu mtp=%s "
+                     "quantized=%zu tensors %.2f GiB",
+                     layout.modules.size(), layout.dense_layers, layout.moe_layers,
+                     layout.has_mtp ? "yes" : "no", layout.quantized_tensors,
+                     layout.quantized_tensor_bytes / (1024.0 * 1024.0 * 1024.0));
+        }
+        if (a.has("touch-gguf-payloads")) {
+            uint64_t checksum = gguf.touch_payloads();
+            GLM_INFO("gguf payload mmap/touch: tensors=%zu checksum=%016llx",
+                     gguf.tensors().size(), (unsigned long long)checksum);
+        }
+
+        GLM_INFO("gguf: %zu shards, %zu tensors, %.2f GiB files, %.2f GiB tensor payload",
+                 gguf.shards().size(), gguf.tensors().size(),
+                 gguf.total_file_bytes() / (1024.0 * 1024.0 * 1024.0),
+                 gguf.total_tensor_bytes() / (1024.0 * 1024.0 * 1024.0));
+        for (const auto& sh : gguf.shards()) {
+            GLM_INFO("  shard %-44s tensors=%llu file=%.2f GiB data_off=%llu",
+                     sh.path.substr(sh.path.find_last_of('/') + 1).c_str(),
+                     (unsigned long long)sh.tensor_count,
+                     sh.file_size / (1024.0 * 1024.0 * 1024.0),
+                     (unsigned long long)sh.data_offset);
+        }
+        const char* keys[] = {
+            "general.architecture", "general.name", "general.basename",
+            "general.quantized_by", "general.size_label", "glm-dsa.block_count",
+            "glm-dsa.context_length", "glm-dsa.expert_count", "tokenizer.ggml.model",
+        };
+        for (const char* key : keys) {
+            if (gguf.has_metadata(key)) GLM_INFO("  %s=%s", key, gguf.metadata_string(key).c_str());
+        }
+        std::string qsummary;
+        for (const auto& kv : gguf.quant_counts()) {
+            if (!qsummary.empty()) qsummary += ",";
+            qsummary += kv.first + ":" + std::to_string(kv.second);
+        }
+        GLM_INFO("  quant_types=%s", qsummary.c_str());
+
+        int shown = 0;
+        for (const auto& t : gguf.tensors()) {
+            if (shown++ >= 24) {
+                GLM_INFO("  ... (%zu more)", gguf.tensors().size() - 24);
+                break;
+            }
+            std::string shape = "[";
+            for (size_t i = 0; i < t.shape.size(); ++i)
+                shape += std::to_string(t.shape[i]) + (i + 1 < t.shape.size() ? "," : "");
+            shape += "]";
+            GLM_INFO("  %-52s %-8s %s %.2f MiB", t.name.c_str(), ggml_type_name(t.type),
+                     shape.c_str(), t.n_bytes / (1024.0 * 1024.0));
+        }
+        return 0;
+    }
+
     GLM52Config cfg = load_config(model);
     cfg.summarize();
 
@@ -80,6 +147,142 @@ int cmd_inspect(const Args& a) {
             shape += std::to_string(ti->shape[i]) + (i + 1 < ti->shape.size() ? "," : "");
         shape += "]";
         GLM_INFO("  %-52s %-8s %s", n.c_str(), dtype_name(ti->dtype), shape.c_str());
+    }
+    return 0;
+}
+
+int cmd_load_gguf(const Args& a) {
+    std::string model = a.get("model");
+    GLM_CHECK(!model.empty(), "load-gguf requires --model GGUF_FILE_OR_DIR");
+    GLM_CHECK(gguf_path_like(model), "load-gguf requires a .gguf file or directory");
+    // This is a metadata/dequant-smoke gate touching a few blocks; skip the
+    // serving path's full payload prefault (hundreds of GiB of reads).
+    setenv("GLMSERVE_NO_PREFAULT", "1", 0);
+
+    GLM52Config cfg;
+    cfg.index_n_heads = 32;  // real GGUF tensors: indexer.attn_q_b [2048,4096]
+    cfg.summarize();
+
+    GLM52Model m(cfg);
+    m.load_gguf(model, a.get_int("max-layers", -1), a.has("touch-payloads"));
+    GLM_CHECK(m.gguf_ready(), "GGUF load did not leave model in ready state");
+
+    const GLM52GGUFWeights* weights = m.gguf_weights();
+    GLM_CHECK(weights != nullptr, "GGUF weights missing after load");
+    const char* smoke_roles[] = {
+        "model.embed_tokens.weight",
+        "model.layers.0.self_attn.q_a_proj.weight",
+        "model.layers.3.mlp.experts.*.gate_proj.weight",
+        "model.layers.78.eh_proj.weight",
+        "lm_head.weight",
+    };
+    for (const char* role : smoke_roles) {
+        const GGUFWeightView* v = weights->role(role);
+        GLM_CHECK(v, "missing loaded GGUF role after model load: %s", role);
+        GLM_INFO("  role %-48s <- %-36s %-8s %.2f MiB",
+                 role, v->name.c_str(), ggml_type_name(v->tensor->type),
+                 v->tensor->n_bytes / (1024.0 * 1024.0));
+    }
+
+    if (a.has("dequant-smoke")) {
+        std::set<uint32_t> seen;
+        for (const GGUFWeightView& v : weights->views()) {
+            uint32_t type = v.tensor->type;
+            if (!seen.insert(type).second) continue;
+            GLM_CHECK(gguf_type_can_dequantize(type),
+                      "no CPU dequant smoke path for GGUF type %s (%u)",
+                      ggml_type_name(type), type);
+            uint64_t n = std::min<uint64_t>(v.tensor->n_elements,
+                                            std::max<uint64_t>(1, gguf_type_block_elements(type)));
+            std::vector<float> f = gguf_dequantize_prefix(type, v.data, n);
+            double sum_abs = 0.0;
+            float max_abs = 0.0f;
+            for (float x : f) {
+                GLM_CHECK(std::isfinite(x), "dequant produced non-finite value for %s",
+                          v.name.c_str());
+                float ax = std::fabs(x);
+                sum_abs += ax;
+                max_abs = std::max(max_abs, ax);
+            }
+            GLM_INFO("  dequant %-8s %-44s n=%llu checksum=%016llx max_abs=%.6g sum_abs=%.6g",
+                     ggml_type_name(type), v.name.c_str(), (unsigned long long)n,
+                     (unsigned long long)gguf_f32_checksum(f.data(), f.size()),
+                     max_abs, sum_abs);
+        }
+    }
+
+    if (a.has("require-dequant-checksums")) {
+        struct Expected {
+            const char* role;
+            uint64_t checksum;
+        };
+        const Expected expected[] = {
+            {"model.embed_tokens.weight", 0xf53a19f5f5d7d8cbull},
+            {"model.norm.weight", 0x2f1283a084b74c14ull},
+            {"lm_head.weight", 0x238cce2bf9fa0161ull},
+            {"model.layers.3.mlp.experts.*.gate_proj.weight", 0xebec65e8bc88d245ull},
+            {"model.layers.3.mlp.experts.*.down_proj.weight", 0xb418d9e878d4c0d2ull},
+            {"model.layers.8.mlp.experts.*.down_proj.weight", 0x00d4f4cb86c63fd6ull},
+            {"model.layers.78.mlp.experts.*.gate_proj.weight", 0x84d8fa95be0b504dull},
+            {"model.layers.78.mlp.experts.*.down_proj.weight", 0x23063095b22bed2eull},
+        };
+        for (const Expected& e : expected) {
+            const GGUFWeightView* v = weights->role(e.role);
+            GLM_CHECK(v, "missing required dequant checksum role: %s", e.role);
+            uint64_t n = std::min<uint64_t>(v->tensor->n_elements,
+                                            std::max<uint64_t>(1, gguf_type_block_elements(v->tensor->type)));
+            std::vector<float> f = gguf_dequantize_prefix(v->tensor->type, v->data, n);
+            uint64_t got = gguf_f32_checksum(f.data(), f.size());
+            GLM_CHECK(got == e.checksum,
+                      "dequant checksum mismatch for %s (%s): got %016llx expected %016llx",
+                      v->name.c_str(), ggml_type_name(v->tensor->type),
+                      (unsigned long long)got, (unsigned long long)e.checksum);
+        }
+        GLM_INFO("  dequant checksum gate: PASS (%zu reference blocks)", sizeof(expected) / sizeof(expected[0]));
+    }
+
+    if (a.has("linear-smoke")) {
+        auto make_input = [](uint64_t n) {
+            std::vector<float> x(static_cast<size_t>(n));
+            uint32_t state = 0x9e3779b9u;
+            for (uint64_t i = 0; i < n; ++i) {
+                state = state * 1664525u + 1013904223u;
+                int v = static_cast<int>((state >> 8) & 0x3ffu) - 512;
+                x[static_cast<size_t>(i)] = static_cast<float>(v) / 2048.0f;
+            }
+            return x;
+        };
+        auto dot_role = [&](const char* role, uint64_t row) {
+            GGUFLinearView lin = weights->linear(role);
+            GLM_CHECK(row < lin.out_features,
+                      "linear smoke row %llu out of range for %s with out=%llu",
+                      (unsigned long long)row, role, (unsigned long long)lin.out_features);
+            std::vector<float> x = make_input(lin.in_features);
+            double dot = gguf_row_dot(lin.weight->tensor->type, lin.weight->data,
+                                      lin.in_features, row, x.data());
+            GLM_CHECK(std::isfinite(dot), "linear smoke produced non-finite dot for %s", role);
+            GLM_INFO("  linear %-48s row=%llu in=%llu out=%llu type=%-8s dot=%.9g",
+                     role, (unsigned long long)row,
+                     (unsigned long long)lin.in_features,
+                     (unsigned long long)lin.out_features,
+                     ggml_type_name(lin.weight->tensor->type), dot);
+            return dot;
+        };
+        const double d0 = dot_role("lm_head.weight", 154820);
+        const double d1 = dot_role("model.layers.0.self_attn.q_a_proj.weight", 17);
+        const double d2 = dot_role("model.layers.3.mlp.experts.*.gate_proj.weight", 257);
+        const double d3 = dot_role("model.layers.3.mlp.experts.*.down_proj.weight", 1024);
+        if (a.has("require-linear-checksums")) {
+            auto close = [](double got, double want) {
+                return std::fabs(got - want) <= 1e-7 * std::max(1.0, std::fabs(want));
+            };
+            GLM_CHECK(close(d0, -0.3679340725), "linear checksum mismatch lm_head: %.12g", d0);
+            GLM_CHECK(close(d1, -0.0584288574), "linear checksum mismatch q_a: %.12g", d1);
+            GLM_CHECK(close(d2, -0.0459673857), "linear checksum mismatch iq3 expert gate: %.12g", d2);
+            GLM_CHECK(close(d3, -0.1075344397), "linear checksum mismatch iq4 expert down: %.12g", d3);
+            GLM_INFO("  linear checksum gate: PASS (4 reference row dots)");
+        }
+        GLM_INFO("  linear smoke aggregate=%.9g", d0 + d1 + d2 + d3);
     }
     return 0;
 }
@@ -218,6 +421,8 @@ int cmd_dump(const Args& a) {
 
 // Throughput probe: time a prefill of --prompt-len tokens then a greedy decode
 // of --gen-len tokens, reporting prefill and decode tok/s for the active backend.
+// In a distributed (TP/PP) run every rank runs the same forward in lockstep (the
+// NCCL all-reduces synchronize them); only rank 0 prints, then all ranks barrier.
 int cmd_bench(const Args& a) {
     EngineOptions o = engine_opts(a);
     int prompt_len = static_cast<int>(a.get_int("prompt-len", 512));
@@ -226,17 +431,25 @@ int cmd_bench(const Args& a) {
     if (o.max_model_len < prompt_len + gen_len + 1)
         o.max_model_len = prompt_len + gen_len + 1;
     Engine engine(o);
+    const bool root = engine.is_root();
 
-    std::fprintf(stderr, "--- benchmark: prompt_len=%d gen_len=%d ---\n", prompt_len, gen_len);
+    if (root)
+        std::fprintf(stderr, "--- benchmark: prompt_len=%d gen_len=%d (world=%d tp=%d pp=%d rank=%d) ---\n",
+                     prompt_len, gen_len, engine.dist().world_size, engine.dist().tp_size,
+                     engine.dist().pp_size, engine.dist().rank);
     Engine::BenchResult r = engine.profile(prompt_len, gen_len);
+    engine.barrier();
 
-    std::printf("backend        : %s\n", r.gpu ? "CUDA (device-resident)" : "CPU reference");
-    std::printf("prefill        : %d tok in %.2f ms  = %.1f tok/s\n",
-                r.prompt_len, r.prefill_ms, r.prefill_tps());
-    std::printf("decode         : %d tok in %.2f ms  = %.1f tok/s  (%.3f ms/tok)\n",
-                r.gen_len, r.decode_ms, r.decode_tps(), r.decode_ms_per_tok());
-    std::printf("target         : 1300 tok/s  (prefill %.0f%%, decode %.0f%%)\n",
-                100.0 * r.prefill_tps() / 1300.0, 100.0 * r.decode_tps() / 1300.0);
+    if (root) {
+        std::printf("backend        : %s\n", r.gpu ? "CUDA (device-resident)" : "CPU reference");
+        std::printf("prefill        : %d tok in %.2f ms  = %.1f tok/s\n",
+                    r.prompt_len, r.prefill_ms, r.prefill_tps());
+        std::printf("decode         : %d tok in %.2f ms  = %.1f tok/s  (%.3f ms/tok)\n",
+                    r.gen_len, r.decode_ms, r.decode_tps(), r.decode_ms_per_tok());
+        std::printf("target         : 1300 tok/s  (prefill %.0f%%, decode %.0f%%)\n",
+                    100.0 * r.prefill_tps() / 1300.0, 100.0 * r.decode_tps() / 1.0);
+    }
+    engine.barrier();
     return 0;
 }
 
@@ -279,7 +492,14 @@ int cmd_mtp(const Args& a) {
     st.load(model);
     GLM52Model m(cfg);
     m.load(st, a.get_int("max-layers", -1));
-    std::vector<float> logits = m.mtp_draft_logits(context, draft);
+    std::vector<float> logits;
+    if (a.has("gpu")) {
+        const int64_t need = static_cast<int64_t>(context.size() + draft.size()) + 2;
+        GLM_CHECK(m.upload_to_gpu(need), "mtp --gpu requires a CUDA device");
+        logits = m.mtp_draft_logits_gpu(context, draft);
+    } else {
+        logits = m.mtp_draft_logits(context, draft);
+    }
 
     std::vector<int> argmax(draft.size(), 0);
     for (size_t r = 0; r < draft.size(); ++r) {
@@ -355,6 +575,9 @@ void usage() {
         "  glmserve mtp      --model DIR --tokens \"...\" --draft \"...\" [--out JSON]\n"
         "  glmserve mtpcheck --model DIR --tokens \"...\" [--gen N] [--draft-k K]\n"
         "  glmserve inspect  --model DIR\n"
+        "  glmserve load-gguf --model GGUF_FILE_OR_DIR [--touch-payloads] [--dequant-smoke]\n"
+        "                    [--require-dequant-checksums] [--linear-smoke]\n"
+        "                    [--require-linear-checksums]\n"
         "\n"
         "  --gpu   run the forward on the CUDA path (requires a GPU=1 build + a GPU)\n");
 }
@@ -370,6 +593,7 @@ int main(int argc, char** argv) {
         if (cmd == "generate") return cmd_generate(a);
         if (cmd == "tokgen")   return cmd_tokgen(a);
         if (cmd == "inspect")  return cmd_inspect(a);
+        if (cmd == "load-gguf") return cmd_load_gguf(a);
         if (cmd == "dump")     return cmd_dump(a);
         if (cmd == "bench")    return cmd_bench(a);
         if (cmd == "gencheck") return cmd_gencheck(a);

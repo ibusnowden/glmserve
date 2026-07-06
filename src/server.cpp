@@ -1,6 +1,8 @@
 #include "server.hpp"
 #include "common.hpp"
 #include "json.hpp"
+#include "gguf.hpp"
+#include "model_gguf.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -58,17 +60,43 @@ static std::string gen_id(const char* prefix) {
 // Engine construction
 // ---------------------------------------------------------------------------
 Engine::Engine(EngineOptions opts) : opts_(std::move(opts)) {
-    cfg_ = load_config(opts_.model_path);
+    const bool is_gguf = gguf_path_like(opts_.model_path);
+    if (is_gguf) {
+        // GGUF checkpoints carry the full architecture under glm-dsa.* metadata;
+        // there is no config.json on disk.
+        cfg_ = load_glm52_config_gguf(opts_.model_path);
+    } else {
+        cfg_ = load_config(opts_.model_path);
+    }
     cfg_.summarize();
 
-    SafeTensors st;
-    st.load(opts_.model_path);
+    // Distributed (TP/PP) runtime: when world_size > 1, create the NCCL
+    // communicator (which pins this rank's GPU via cudaSetDevice) and attach it
+    // to the model before load so load_gguf/load shard the weights across the TP
+    // group and upload_to_gpu lands on the local device. Under TP=8/PP=1 every
+    // rank is first+last stage and runs the full forward in lockstep.
+    dist_ = dist_config_from_env();
+    if (dist_.world_size > 1) {
+        comm_ = std::make_unique<Communicator>(dist_);
+        GLM_CHECK(comm_->active(), "distributed Engine requested (world_size=%d) but NCCL communicator is inactive",
+                  dist_.world_size);
+        model_ = std::make_unique<GLM52Model>(cfg_);
+        model_->set_distributed(comm_.get());
+    } else {
+        model_ = std::make_unique<GLM52Model>(cfg_);
+    }
 
-    if (opts_.use_gpu && std::getenv("GLMSERVE_QUANT_ONLY") == nullptr)
-        setenv("GLMSERVE_QUANT_ONLY", "1", 0);
-
-    model_ = std::make_unique<GLM52Model>(cfg_);
-    model_->load(st, opts_.max_layers);
+    if (is_gguf) {
+        // Native GGUF path: mmap the quant payloads and dequantize on the fly.
+        model_->load_gguf(opts_.model_path, opts_.max_layers, false);
+        GLM_CHECK(model_->gguf_ready(), "GGUF load did not leave model in ready state");
+    } else {
+        SafeTensors st;
+        st.load(opts_.model_path);
+        if (opts_.use_gpu && std::getenv("GLMSERVE_QUANT_ONLY") == nullptr)
+            setenv("GLMSERVE_QUANT_ONLY", "1", 0);
+        model_->load(st, opts_.max_layers);
+    }
 
     tokenizer_ = std::make_unique<Tokenizer>();
     tokenizer_->load(opts_.model_path, cfg_.vocab_size);
@@ -91,6 +119,13 @@ Engine::Engine(EngineOptions opts) : opts_(std::move(opts)) {
     GLM_INFO("engine ready: %s, ctx=%lld, kv_blocks=%lld, max_concurrent=%d",
              opts_.served_model_name.c_str(), (long long)opts_.max_model_len,
              (long long)blocks, opts_.max_concurrent);
+}
+
+// Upload weights to the GPU once (lazily). If CUDA is unavailable (CPU build or
+// no device) upload_to_gpu() returns false and we transparently stay on the CPU
+// reference path. Caller must hold gen_mu_.
+void Engine::barrier() {
+    if (comm_) comm_->barrier();
 }
 
 // Upload weights to the GPU once (lazily). If CUDA is unavailable (CPU build or
@@ -254,6 +289,13 @@ Completion Engine::run(const std::vector<int>& prompt_in, const SamplingParams& 
             }
 
             int next = sampler.sample(logits, all_tokens, p);
+
+            // Keep TP ranks in lockstep: rank 0's sampled token is the only one
+            // that matters (it has the full logits; under TP every rank computes
+            // the same logits, but a stochastic sampler would diverge). Broadcast
+            // it so every rank decodes the same sequence and the per-layer
+            // all-reduces stay matched. (Greedy sampling is already identical.)
+            if (comm_) comm_->bcast_int(&next, 1, 0);
 
             if (is_stop_token(next)) { c.finish_reason = "stop"; break; }
             if (!record_token(next)) break;

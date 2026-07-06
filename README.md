@@ -122,6 +122,31 @@ to fetch the missing safetensors shards before quantizing.
 See [`docs/serving.md`](docs/serving.md) for the 2-node TP=8/PP=2 topology and
 [`docs/pi_integration.md`](docs/pi_integration.md) to wire it to Pi Code.
 
+### Real 3-bit llama.cpp GGUF reference
+
+The sibling `/project/inniang/inference` stack currently serves the real
+GLM-5.2 Unsloth split GGUF checkpoint:
+
+```text
+/project/inniang/inference/models/GLM-5.2-GGUF/UD-Q3_K_XL/
+```
+
+Validate that weight set from this repo with:
+
+```bash
+make
+bash scripts/check_glm52_gguf.sh
+```
+
+This is the required target for a native 3-bit `glmserve` loader. Today it is a
+GGUF load gate: the `glmserve` binary parses the split GGUF shards, validates the
+GLM-5.2 tensor inventory, builds the GGUF-to-glmserve module layout, mmaps the
+payload files, touches every quantized tensor range, loads stable quant tensor
+views into `GLM52Model` via `glmserve load-gguf`, and dequantizes a real block
+from each observed GGML type including `IQ3_XXS`. Generation still
+executes safetensors or glmserve W4A16 repacks while llama.cpp executes the split
+GGUF tensors.
+
 ## Layout
 
 ```

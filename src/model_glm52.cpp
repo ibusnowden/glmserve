@@ -1,5 +1,7 @@
 #include "model.hpp"
 #include "common.hpp"
+#include "model_gguf.hpp"
+#include "gguf_quant.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -533,6 +535,343 @@ void GLM52Model::load(const SafeTensors& st, int64_t max_layers) {
     }
 }
 
+// Populate a Linear from a 2-D GGUF linear view (in=shape[0], out=product(rest)).
+// The weight stays in-place as a mmap'd quant payload (qtype/qdata/row_bytes);
+// the f32 `w` is empty so has_q() is true and the GPU forward dequantizes on the fly.
+// F32/F16 tensors (indexer proj, MoE router) are small, so dequantize them to fp32
+// `w` and run them through the cuBLAS fp32 path instead of the per-element qgemm.
+static Linear gguf_lin(const GGUFLinearView& v) {
+    Linear L;
+    GLM_CHECK(v.valid(), "gguf_lin: invalid linear view");
+    L.in_features = static_cast<int64_t>(v.in_features);
+    L.out_features = static_cast<int64_t>(v.out_features);
+    const uint32_t type = v.weight->tensor->type;
+    if (type == 0 /*F32*/ || type == 1 /*F16*/) {
+        L.w = gguf_dequantize_prefix(type, v.weight->data, v.weight->tensor->n_elements);
+    } else {
+        L.qtype = type;
+        L.qdata = v.weight->data;
+        L.row_bytes = static_cast<int64_t>(v.row_bytes);
+    }
+    return L;
+}
+
+// Dequantize a 1-D GGUF norm/bias tensor to f32.
+static RMSNormW gguf_norm_w(const GGUFWeightView* v) {
+    RMSNormW r;
+    GLM_CHECK(v && v->data, "gguf_norm_w: missing norm tensor");
+    r.dim = static_cast<int64_t>(v->tensor->n_elements);
+    r.w = gguf_dequantize_prefix(v->tensor->type, v->data, v->tensor->n_elements);
+    return r;
+}
+
+// Dequantize a 1-D GGUF bias tensor to f32.
+static std::vector<float> gguf_bias(const GGUFWeightView* v) {
+    GLM_CHECK(v && v->data, "gguf_bias: missing bias tensor");
+    return gguf_dequantize_prefix(v->tensor->type, v->data, v->tensor->n_elements);
+}
+
+// Merge the split GGUF kv_b projections (3-D per-head k_b/v_b) into a single
+// fp32 kv_b_proj [H*(nope+vd), kv_lora] matching the safetensors merged layout
+// the GPU forward expects. k_b: ne={qk_nope, kv_lora, heads}; v_b: ne={kv_lora, v_head, heads}.
+// kv_b_proj row (h*(nope+vd)+i) for i<nope <- k_b[h][i][j]; row (h*(nope+vd)+nope+j) <- v_b[h][j][i].
+static Linear gguf_merge_kv_b(const GGUFWeightView* k_b, const GGUFWeightView* v_b,
+                              int64_t heads, int64_t nope, int64_t vd, int64_t kv_lora) {
+    Linear L;
+    GLM_CHECK(k_b && v_b, "gguf_merge_kv_b: missing k_b/v_b");
+    const int64_t out = heads * (nope + vd);
+    L.in_features = kv_lora;
+    L.out_features = out;
+    L.w.resize(static_cast<size_t>(out * kv_lora), 0.0f);
+    std::vector<float> kf = gguf_dequantize_prefix(k_b->tensor->type, k_b->data, k_b->tensor->n_elements);
+    std::vector<float> vf = gguf_dequantize_prefix(v_b->tensor->type, v_b->data, v_b->tensor->n_elements);
+    // k_b: ne={nope, kv_lora, heads} -> kf[h*kv_lora*nope + j*nope + i] = W_k[h][j][i]
+    for (int64_t h = 0; h < heads; ++h)
+        for (int64_t i = 0; i < nope; ++i)
+            for (int64_t j = 0; j < kv_lora; ++j)
+                L.w[static_cast<size_t>((h * (nope + vd) + i) * kv_lora + j)] =
+                    kf[static_cast<size_t>(h * kv_lora * nope + j * nope + i)];
+    // v_b: ne={kv_lora, v_head, heads} -> vf[h*v_head*kv_lora + j*kv_lora + i] = W_v[h][j][i]
+    for (int64_t h = 0; h < heads; ++h)
+        for (int64_t j = 0; j < vd; ++j)
+            for (int64_t i = 0; i < kv_lora; ++i)
+                L.w[static_cast<size_t>((h * (nope + vd) + nope + j) * kv_lora + i)] =
+                    vf[static_cast<size_t>(h * vd * kv_lora + j * kv_lora + i)];
+    return L;
+}
+
+// Slice a quant Linear's output rows [r0, r0+out_l) (column-parallel shard).
+// qdata rows are contiguous (row_bytes each), so just advance the pointer.
+static void shard_linear_columns_q(Linear& L, int64_t r0, int64_t out_l) {
+    if (r0 == 0 && out_l == L.out_features) return;
+    L.qdata = L.qdata + r0 * L.row_bytes;
+    L.out_features = out_l;
+    if (!L.b.empty()) L.b.erase(L.b.begin(), L.b.begin() + static_cast<ptrdiff_t>(r0));
+}
+
+// Slice a quant Linear's input columns [c0, c0+in_l) (row-parallel shard).
+// Quant blocks span the input dimension; requires in_l % block_elems == 0.
+static void shard_linear_rows_q(Linear& L, int64_t c0, int64_t in_l) {
+    if (c0 == 0 && in_l == L.in_features) return;
+    const uint64_t be = gguf_type_block_elements(L.qtype);
+    const uint64_t bb = gguf_type_block_bytes(L.qtype);
+    GLM_CHECK(c0 % be == 0 && in_l % be == 0,
+              "row-parallel GGUF shard must align to block elems=%llu (c0=%lld in_l=%lld)",
+              (unsigned long long)be, (long long)c0, (long long)in_l);
+    const int64_t new_row_bytes = (in_l / static_cast<int64_t>(be)) * static_cast<int64_t>(bb);
+    const int64_t skip = (c0 / static_cast<int64_t>(be)) * static_cast<int64_t>(bb);
+    // Zero-copy: keep the mmap'd payload in place as a strided view; the GPU
+    // upload repacks it into a contiguous device buffer with one cudaMemcpy2D
+    // (no ~GBs of host-side slice buffers, no 4 KiB random page faults).
+    L.qstride = L.qsrc_stride();
+    L.qdata = L.qdata + skip;
+    L.row_bytes = new_row_bytes;
+    L.in_features = in_l;
+}
+
+// Tensor-parallel shard of one GGUF-loaded block's quant/f32 linears.
+static void shard_layer_tp_gguf(Layer& L, int tp_rank, int tp_size) {
+    if (tp_size <= 1) return;
+    const int64_t H = L.q_b_proj.out_features / tp_size * tp_size;  // (unused, kept for parity)
+    (void)H;
+    auto col = [&](Linear& lin) {
+        if (lin.has_q()) {
+            int64_t out = lin.out_features, out_l = out / tp_size;
+            shard_linear_columns_q(lin, static_cast<int64_t>(tp_rank) * out_l, out_l);
+        } else if (lin.has_f32()) {
+            shard_linear_columns(lin, tp_rank, tp_size);
+        }
+    };
+    auto row = [&](Linear& lin) {
+        if (lin.has_q()) {
+            int64_t in = lin.in_features, in_l = in / tp_size;
+            shard_linear_rows_q(lin, static_cast<int64_t>(tp_rank) * in_l, in_l);
+        } else if (lin.has_f32()) {
+            shard_linear_rows(lin, tp_rank, tp_size);
+        }
+    };
+    col(L.q_b_proj);
+    col(L.kv_b_proj);   // fp32 merged; shard_linear_columns handles .w
+    row(L.o_proj);
+    if (L.is_dense) {
+        col(L.dense_mlp.gate_proj); col(L.dense_mlp.up_proj); row(L.dense_mlp.down_proj);
+    } else {
+        for (Expert& E : L.moe.experts) {
+            col(E.gate_proj); col(E.up_proj); row(E.down_proj);
+        }
+        if (L.moe.has_shared) {
+            col(L.moe.shared.gate_proj); col(L.moe.shared.up_proj); row(L.moe.shared.down_proj);
+        }
+    }
+}
+
+void GLM52Model::load_gguf(const std::string& gguf_path, int64_t max_layers,
+                           bool touch_payloads) {
+    Timer timer;
+    const auto& c = cfg_;
+    const int tp = std::max(1, dist_.tp_size);
+
+    GLM_CHECK(c.num_attention_heads % tp == 0,
+              "num_attention_heads %lld not divisible by tp_size %d",
+              (long long)c.num_attention_heads, tp);
+    tp_heads_ = c.num_attention_heads / tp;
+
+    int64_t total_layers = (max_layers > 0) ? std::min(max_layers, c.num_hidden_layers)
+                                            : c.num_hidden_layers;
+    LayerRange range = partition_layers(total_layers, dist_.pp_stage(), dist_.pp_size);
+    layer_begin_ = range.begin;
+    layers_.clear();
+    mtp_blocks_.clear();
+
+    gguf_weights_ = std::make_unique<GLM52GGUFWeights>();
+    gguf_weights_->load(gguf_path, cfg_, max_layers, touch_payloads);
+
+    // Warm the page cache for the loaded payload ranges before any per-tensor
+    // work or the GPU upload touches the mmap: 4 KiB random faults on a network
+    // filesystem are ~100x slower than these large sequential reads. Ranks
+    // stripe the chunks (page cache is node-shared); the barrier keeps any rank
+    // from racing ahead into cold pages.
+    if (std::getenv("GLMSERVE_NO_PREFAULT") == nullptr) {
+        Timer pf;
+        const uint64_t bytes = gguf_weights_->prefault(dist_.rank, dist_.world_size);
+        GLM_INFO("prefault (rank %d/%d): read %.2f GiB into page cache in %.1f s",
+                 dist_.rank + 1, dist_.world_size, bytes / 1073741824.0, pf.ms() / 1000.0);
+        if (comm_) comm_->barrier();
+    }
+
+    const GGUFGLM52Layout& layout = gguf_weights_->layout();
+    const int64_t H = c.hidden_size;
+    const int64_t heads = c.num_attention_heads;
+    const int64_t nope = c.qk_nope_head_dim, rope = c.qk_rope_head_dim;
+    const int64_t vd = c.v_head_dim, kv_lora = c.kv_lora_rank;
+
+    const bool first = dist_.is_first_stage();
+    const bool last = dist_.is_last_stage();
+    const int tp_rank = dist_.tp_rank();
+
+    // Embeddings (first stage) and final norm + lm_head (last stage).
+    if (first) {
+        GGUFLinearView ev = gguf_weights_->linear("model.embed_tokens.weight");
+        GLM_CHECK(ev.valid(), "GGUF missing model.embed_tokens.weight");
+        embed_lin_ = gguf_lin(ev);
+        // Also dequantize a small fp32 copy for the CPU embed() path / tests.
+        if (ev.weight->tensor->type == 0 || ev.weight->tensor->type == 1) {
+            embed_tokens_ = gguf_dequantize_prefix(ev.weight->tensor->type, ev.weight->data,
+                                                   ev.weight->tensor->n_elements);
+        }
+    }
+    if (last) {
+        const GGUFWeightView* nv = gguf_weights_->role("model.norm.weight");
+        GLM_CHECK(nv, "GGUF missing model.norm.weight");
+        final_norm_ = gguf_norm_w(nv);
+        GGUFLinearView lv = gguf_weights_->linear("lm_head.weight");
+        GLM_CHECK(lv.valid(), "GGUF missing lm_head.weight");
+        lm_head_ = gguf_lin(lv);
+        // Column-parallel lm_head shard under TP: each rank computes logits for
+        // vocab rows [rank*V/tp, (rank+1)*V/tp); the GPU forward zero-fills the
+        // full logits buffer, writes its slice, and all-reduces. Saves ~0.7 GiB
+        // of replicated Q6_K weight per rank and cuts the per-token lm_head
+        // read 8x at the cost of one extra small all-reduce.
+        if (lm_head_.has_q() && tp > 1 && cfg_.vocab_size % tp == 0) {
+            const int64_t v_l = cfg_.vocab_size / tp;
+            lm_head_shard_off_ = static_cast<int64_t>(tp_rank) * v_l;
+            shard_linear_columns_q(lm_head_, lm_head_shard_off_, v_l);
+        }
+    }
+
+    layers_.resize(range.end - range.begin);
+    for (int64_t li = 0; li < static_cast<int64_t>(layers_.size()); ++li) {
+        const int64_t gi = layer_begin_ + li;
+        Layer& L = layers_[li];
+        const std::string hf = "model.layers." + std::to_string(gi) + ".";
+        L.is_dense = c.is_dense_layer(gi);
+        L.input_norm = gguf_norm_w(gguf_weights_->role(hf + "input_layernorm.weight"));
+        L.post_attn_norm = gguf_norm_w(gguf_weights_->role(hf + "post_attention_layernorm.weight"));
+        L.q_a_proj = gguf_lin(gguf_weights_->linear(hf + "self_attn.q_a_proj.weight"));
+        L.q_a_norm = gguf_norm_w(gguf_weights_->role(hf + "self_attn.q_a_layernorm.weight"));
+        L.q_b_proj = gguf_lin(gguf_weights_->linear(hf + "self_attn.q_b_proj.weight"));
+        L.kv_a_proj = gguf_lin(gguf_weights_->linear(hf + "self_attn.kv_a_proj_with_mqa.weight"));
+        L.kv_a_norm = gguf_norm_w(gguf_weights_->role(hf + "self_attn.kv_a_layernorm.weight"));
+        L.kv_b_proj = gguf_merge_kv_b(gguf_weights_->role(hf + "self_attn.kv_b_proj.weight[k]"),
+                                      gguf_weights_->role(hf + "self_attn.kv_b_proj.weight[v]"),
+                                      heads, nope, vd, kv_lora);
+        L.o_proj = gguf_lin(gguf_weights_->linear(hf + "self_attn.o_proj.weight"));
+        if (gguf_weights_->role(hf + "self_attn.indexer.wq_b.weight")) {
+            L.indexer.wq_b = gguf_lin(gguf_weights_->linear(hf + "self_attn.indexer.wq_b.weight"));
+            L.indexer.wk = gguf_lin(gguf_weights_->linear(hf + "self_attn.indexer.wk.weight"));
+            L.indexer.weights_proj = gguf_lin(gguf_weights_->linear(hf + "self_attn.indexer.weights_proj.weight"));
+            L.indexer.k_norm = gguf_norm_w(gguf_weights_->role(hf + "self_attn.indexer.k_norm.weight"));
+            const GGUFWeightView* kb = gguf_weights_->role(hf + "self_attn.indexer.k_norm.bias");
+            if (kb) L.indexer.k_norm_bias = gguf_bias(kb);
+        }
+        if (L.is_dense) {
+            L.dense_mlp.gate_proj = gguf_lin(gguf_weights_->linear(hf + "mlp.gate_proj.weight"));
+            L.dense_mlp.up_proj = gguf_lin(gguf_weights_->linear(hf + "mlp.up_proj.weight"));
+            L.dense_mlp.down_proj = gguf_lin(gguf_weights_->linear(hf + "mlp.down_proj.weight"));
+        } else {
+            L.moe.router = gguf_lin(gguf_weights_->linear(hf + "mlp.gate.weight"));
+            const GGUFWeightView* eb = gguf_weights_->role(hf + "mlp.gate.e_score_correction_bias");
+            if (eb) L.moe.e_bias = gguf_bias(eb);
+            const int64_t E = c.n_routed_experts, moei = c.moe_intermediate_size;
+            GGUFLinearView gv = gguf_weights_->linear(hf + "mlp.experts.*.gate_proj.weight");
+            GGUFLinearView uv = gguf_weights_->linear(hf + "mlp.experts.*.up_proj.weight");
+            GGUFLinearView dv = gguf_weights_->linear(hf + "mlp.experts.*.down_proj.weight");
+            GLM_CHECK(gv.valid() && uv.valid() && dv.valid(), "GGUF missing expert tensors for layer %lld", (long long)gi);
+            GLM_CHECK(gv.out_features == moei * E && gv.in_features == H, "GGUF expert gate shape mismatch");
+            L.moe.experts.resize(static_cast<size_t>(E));
+            for (int64_t e = 0; e < E; ++e) {
+                Expert& E0 = L.moe.experts[static_cast<size_t>(e)];
+                E0.gate_proj = gguf_lin(gv); E0.gate_proj.qdata += e * moei * gv.row_bytes; E0.gate_proj.out_features = moei;
+                E0.up_proj = gguf_lin(uv);   E0.up_proj.qdata   += e * moei * uv.row_bytes; E0.up_proj.out_features = moei;
+                E0.down_proj = gguf_lin(dv); E0.down_proj.qdata += e * H * dv.row_bytes;  E0.down_proj.out_features = H;
+            }
+            const GGUFWeightView* sg = gguf_weights_->role(hf + "mlp.shared_experts.gate_proj.weight");
+            if (sg) {
+                L.moe.shared.gate_proj = gguf_lin(gguf_weights_->linear(hf + "mlp.shared_experts.gate_proj.weight"));
+                L.moe.shared.up_proj = gguf_lin(gguf_weights_->linear(hf + "mlp.shared_experts.up_proj.weight"));
+                L.moe.shared.down_proj = gguf_lin(gguf_weights_->linear(hf + "mlp.shared_experts.down_proj.weight"));
+                L.moe.has_shared = true;
+            }
+        }
+        shard_layer_tp_gguf(L, tp_rank, tp);
+    }
+
+    // MTP/NextN block (layer 78 = num_hidden_layers). The GGUF stores its
+    // attention/MLP as blk.78.* (trunk-style) and its nextn extras as
+    // blk.78.nextn.*. Only load on the last pipeline stage; skip if absent.
+    if (last && c.num_nextn_predict_layers > 0 &&
+        gguf_weights_->role("model.layers.78.eh_proj.weight")) {
+        MTPBlock m;
+        const std::string p = "model.layers.78.";
+        m.eh_proj = gguf_lin(gguf_weights_->linear(p + "eh_proj.weight"));
+        m.enorm = gguf_norm_w(gguf_weights_->role(p + "enorm.weight"));
+        m.hnorm = gguf_norm_w(gguf_weights_->role(p + "hnorm.weight"));
+        m.shared_head_norm = gguf_norm_w(gguf_weights_->role(p + "shared_head.norm.weight"));
+        Layer L;
+        L.is_dense = c.is_dense_layer(78);
+        L.input_norm = gguf_norm_w(gguf_weights_->role(p + "input_layernorm.weight"));
+        L.post_attn_norm = gguf_norm_w(gguf_weights_->role(p + "post_attention_layernorm.weight"));
+        L.q_a_proj = gguf_lin(gguf_weights_->linear(p + "self_attn.q_a_proj.weight"));
+        L.q_a_norm = gguf_norm_w(gguf_weights_->role(p + "self_attn.q_a_layernorm.weight"));
+        L.q_b_proj = gguf_lin(gguf_weights_->linear(p + "self_attn.q_b_proj.weight"));
+        L.kv_a_proj = gguf_lin(gguf_weights_->linear(p + "self_attn.kv_a_proj_with_mqa.weight"));
+        L.kv_a_norm = gguf_norm_w(gguf_weights_->role(p + "self_attn.kv_a_layernorm.weight"));
+        L.kv_b_proj = gguf_merge_kv_b(gguf_weights_->role(p + "self_attn.kv_b_proj.weight[k]"),
+                                      gguf_weights_->role(p + "self_attn.kv_b_proj.weight[v]"),
+                                      heads, nope, vd, kv_lora);
+        L.o_proj = gguf_lin(gguf_weights_->linear(p + "self_attn.o_proj.weight"));
+        if (L.is_dense) {
+            L.dense_mlp.gate_proj = gguf_lin(gguf_weights_->linear(p + "mlp.gate_proj.weight"));
+            L.dense_mlp.up_proj = gguf_lin(gguf_weights_->linear(p + "mlp.up_proj.weight"));
+            L.dense_mlp.down_proj = gguf_lin(gguf_weights_->linear(p + "mlp.down_proj.weight"));
+        } else {
+            L.moe.router = gguf_lin(gguf_weights_->linear(p + "mlp.gate.weight"));
+            const GGUFWeightView* eb = gguf_weights_->role(p + "mlp.gate.e_score_correction_bias");
+            if (eb) L.moe.e_bias = gguf_bias(eb);
+            const int64_t E = c.n_routed_experts, moei = c.moe_intermediate_size;
+            GGUFLinearView gv = gguf_weights_->linear(p + "mlp.experts.*.gate_proj.weight");
+            GGUFLinearView uv = gguf_weights_->linear(p + "mlp.experts.*.up_proj.weight");
+            GGUFLinearView dv = gguf_weights_->linear(p + "mlp.experts.*.down_proj.weight");
+            if (gv.valid() && uv.valid() && dv.valid()) {
+                L.moe.experts.resize(static_cast<size_t>(E));
+                for (int64_t e = 0; e < E; ++e) {
+                    Expert& E0 = L.moe.experts[static_cast<size_t>(e)];
+                    E0.gate_proj = gguf_lin(gv); E0.gate_proj.qdata += e * moei * gv.row_bytes; E0.gate_proj.out_features = moei;
+                    E0.up_proj = gguf_lin(uv);   E0.up_proj.qdata   += e * moei * uv.row_bytes; E0.up_proj.out_features = moei;
+                    E0.down_proj = gguf_lin(dv); E0.down_proj.qdata += e * H * dv.row_bytes;  E0.down_proj.out_features = H;
+                }
+                const GGUFWeightView* sg = gguf_weights_->role(p + "mlp.shared_experts.gate_proj.weight");
+                if (sg) {
+                    L.moe.shared.gate_proj = gguf_lin(gguf_weights_->linear(p + "mlp.shared_experts.gate_proj.weight"));
+                    L.moe.shared.up_proj = gguf_lin(gguf_weights_->linear(p + "mlp.shared_experts.up_proj.weight"));
+                    L.moe.shared.down_proj = gguf_lin(gguf_weights_->linear(p + "mlp.shared_experts.down_proj.weight"));
+                    L.moe.has_shared = true;
+                }
+            }
+        }
+        shard_layer_tp_gguf(L, tp_rank, tp);
+        m.layer = std::move(L);
+        mtp_blocks_.push_back(std::move(m));
+    }
+
+    GLM_INFO("GGUF quant weights loaded: views=%zu/%zu shards=%zu tensors=%zu mapped=%.2f GiB "
+             "quantized=%zu tensors %.2f GiB in %.1f s",
+             gguf_weights_->views().size(), layout.modules.size(),
+             gguf_weights_->gguf().shards().size(), gguf_weights_->gguf().tensors().size(),
+             gguf_weights_->mapped_payload_bytes() / (1024.0 * 1024.0 * 1024.0),
+             layout.quantized_tensors,
+             layout.quantized_tensor_bytes / (1024.0 * 1024.0 * 1024.0),
+             timer.ms() / 1000.0);
+    if (touch_payloads) {
+        GLM_INFO("GGUF payload touch checksum=%016llx",
+                 (unsigned long long)gguf_weights_->payload_checksum());
+    }
+}
+
+bool GLM52Model::gguf_ready() const {
+    return gguf_weights_ && gguf_weights_->ready();
+}
+
 void GLM52Model::embed(int token_id, float* out) const {
     GLM_CHECK(token_id >= 0 && token_id < cfg_.vocab_size, "token id %d out of range", token_id);
     std::memcpy(out, embed_tokens_.data() + static_cast<int64_t>(token_id) * cfg_.hidden_size,
@@ -1004,6 +1343,11 @@ std::vector<float> GLM52Model::forward_gpu_prefill(const std::vector<int>&) {
 }
 std::vector<float> GLM52Model::forward_gpu_decode(int, int64_t) {
     GLM_CHECK(false, "forward_gpu_decode: built without CUDA (rebuild with GPU=1)");
+    return {};
+}
+std::vector<float> GLM52Model::mtp_draft_logits_gpu(const std::vector<int>&,
+                                                    const std::vector<int>&) {
+    GLM_CHECK(false, "mtp_draft_logits_gpu: built without CUDA (rebuild with GPU=1)");
     return {};
 }
 #endif

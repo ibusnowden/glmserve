@@ -12,6 +12,7 @@
 
 #include "config.hpp"
 #include "safetensors.hpp"
+#include "model_gguf.hpp"
 #include "kv_cache.hpp"
 #include "nccl_comm.hpp"
 
@@ -32,8 +33,22 @@ struct Linear {
     int64_t in_features  = 0;
     int64_t group_size   = 0;
     bool quantized_int4  = false;
+    // GGUF block-quantized weight (Q8_0/Q3_K/Q4_K/Q5_K/Q6_K/IQ3_XXS/IQ4_XS/F16).
+    // When set, the GPU forward dequantizes on the fly (gemm_q); the f32 `w` is
+    // empty. `data` is a host pointer into the mmap'd GGUF payload (not owned).
+    uint32_t qtype = 0;             // GGML type id (0 = no GGUF quant)
+    const uint8_t* qdata = nullptr; // [out, in] row-major, in contiguous
+    int64_t row_bytes = 0;          // bytes per (logical) output row
+    // Host source stride between rows (0 = contiguous == row_bytes). A
+    // row-parallel TP shard keeps the mmap'd payload in place and views a
+    // row_bytes-wide slice of each qstride-wide source row; the GPU upload
+    // repacks it into a contiguous device buffer via cudaMemcpy2D.
+    int64_t qstride = 0;
+    std::vector<uint8_t> qbuf;      // owns sliced quant bytes (row-parallel shard)
+    int64_t qsrc_stride() const { return qstride > 0 ? qstride : row_bytes; }
+    bool has_q() const { return qtype != 0 && (qdata != nullptr || !qbuf.empty()); }
     bool has_bias() const { return !b.empty(); }
-    bool valid()    const { return !w.empty() || !qweight.empty(); }
+    bool valid()    const { return !w.empty() || !qweight.empty() || has_q(); }
     bool has_f32()  const { return !w.empty(); }
 };
 
@@ -128,6 +143,15 @@ public:
     // correctness tests) and is applied before the pipeline partition.
     void load(const SafeTensors& st, int64_t max_layers = -1);
 
+    // Load mmap-backed GLM-5.2 GGUF quantized weight views. This validates the
+    // full GGUF->glmserve tensor map and keeps the real payloads resident, but
+    // generation still uses the safetensors/W4 path until GGML quant kernels are
+    // wired into forward().
+    void load_gguf(const std::string& gguf_path, int64_t max_layers = -1,
+                   bool touch_payloads = false);
+    bool gguf_ready() const;
+    const GLM52GGUFWeights* gguf_weights() const { return gguf_weights_.get(); }
+
     // Number of layers held *on this stage* (the full count when not sharded).
     int64_t num_layers() const { return static_cast<int64_t>(layers_.size()); }
 
@@ -176,6 +200,12 @@ public:
     // token's K/V to the device cache and attends over [0, pos], reusing the
     // persistent scratch (no per-token allocation). Returns logits [vocab].
     std::vector<float> forward_gpu_decode(int token, int64_t pos);
+    // GPU mirror of mtp_draft_logits() (single-rank reference path). Runs the
+    // trunk over the context on-device (clobbers the persistent KV cache, like
+    // forward_gpu_prefill), then the device-resident MTP block over the draft
+    // tokens with its own single-layer draft cache. Returns [draft, vocab].
+    std::vector<float> mtp_draft_logits_gpu(const std::vector<int>& context_tokens,
+                                            const std::vector<int>& draft_tokens);
     ~GLM52Model();
 
 private:
@@ -195,10 +225,13 @@ private:
     GLM52Config cfg_;
     RMSNormW final_norm_;
     std::vector<float> embed_tokens_;   // [vocab, hidden]
+    Linear embed_lin_;                  // GGUF quant embedding [vocab, hidden] (has_q)
     Linear lm_head_;                    // [vocab, hidden] (may alias embeddings)
+    int64_t lm_head_shard_off_ = 0;     // first vocab row of this rank's TP shard
     bool tied_embeddings_ = false;
     std::vector<Layer> layers_;          // this stage's layers (local-indexed)
     std::vector<MTPBlock> mtp_blocks_;   // optional MTP/next-token predictor blocks
+    std::unique_ptr<GLM52GGUFWeights> gguf_weights_; // mmap-backed quant weight views
     void* gpu_state_ = nullptr;   // opaque GpuState* (model_gpu.cpp), null on CPU build
 
     // --- distributed state (single full rank by default) ---

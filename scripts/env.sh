@@ -10,7 +10,7 @@
 export GLMSERVE_ROOT="${GLMSERVE_ROOT:-/project/inniang/glmserve}"
 
 # --- CUDA toolkit (nvcc, cuBLAS/cuBLASLt, cudart, NCCL 2.30) ------------------
-export CUDAENV="${CUDAENV:-/project/inniang/mmllm/.cudaenv}"
+export CUDAENV="${CUDAENV:-/project/inniang/entropy/.cudaenv}"
 export NVCC="${CUDAENV}/bin/nvcc"
 
 # Host C++ compiler. Compute nodes have no /usr/bin/g++, so use the conda gcc

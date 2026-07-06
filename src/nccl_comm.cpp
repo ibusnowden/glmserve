@@ -178,7 +178,13 @@ Communicator::Communicator(DistConfig cfg) : cfg_(cfg) {
               cfg_.local_rank, ndev);
     cuda_ok(cudaSetDevice(dev), "cudaSetDevice");
     auto* s = new NcclState();
-    cuda_ok(cudaStreamCreateWithFlags(&s->stream, cudaStreamNonBlocking), "cudaStreamCreateWithFlags");
+    // NOTE: this must be a BLOCKING stream (no cudaStreamNonBlocking). The
+    // compute kernels run on the legacy default stream; a blocking stream is
+    // implicitly ordered against it in both directions, so NCCL collectives
+    // consume completed producer tensors and later kernels see reduced data.
+    // With a non-blocking stream every all-reduce raced its producer gemm
+    // (observed: the sharded lm_head tail was reduced before it was written).
+    cuda_ok(cudaStreamCreate(&s->stream), "cudaStreamCreate");
     ncclUniqueId id = rendezvous_id(cfg_.rank);
     nccl_ok(ncclCommInitRank(&s->world, cfg_.world_size, id, cfg_.rank), "ncclCommInitRank(world)");
 
@@ -213,9 +219,10 @@ void Communicator::all_reduce_sum(float* data, int64_t count) {
     auto* s = static_cast<NcclState*>(state_);
     GLM_CHECK(s && s->tp, "NCCL communicator is not active");
     if (is_device_ptr(data)) {
+        // No host sync needed: the blocking stream orders this against both
+        // the producer kernels and any later default-stream consumers.
         nccl_ok(ncclAllReduce(data, data, count, ncclFloat, ncclSum, s->tp, s->stream),
                 "ncclAllReduce(tp)");
-        cuda_ok(cudaStreamSynchronize(s->stream), "cudaStreamSynchronize(all_reduce)");
     } else {  // host activation buffer (CPU reference forward) -> stage round-trip
         float* b = ensure_bounce(s, count);
         cuda_ok(cudaMemcpyAsync(b, data, static_cast<size_t>(count) * sizeof(float),
@@ -273,6 +280,30 @@ void Communicator::pipeline_recv_prev(float* data, int64_t count) {
     cuda_ok(cudaStreamSynchronize(s->stream), "cudaStreamSynchronize(recv)");
 #else
     (void)data; (void)count;
+#endif
+}
+
+void Communicator::bcast_int(int* data, int64_t count, int root_rank) {
+    if (cfg_.tp_size <= 1) return;
+#ifdef GLMSERVE_CUDA
+    auto* s = static_cast<NcclState*>(state_);
+    GLM_CHECK(s && s->tp, "NCCL communicator is not active");
+    int* buf = data;
+    if (!is_device_ptr(data)) {  // host -> stage on device, bcast, copy back
+        buf = ensure_bounce_int(s, count);
+        if (cfg_.tp_rank() == root_rank)
+            cuda_ok(cudaMemcpyAsync(buf, data, static_cast<size_t>(count) * sizeof(int),
+                                     cudaMemcpyHostToDevice, s->stream),
+                    "cudaMemcpyAsync(bcast H2D)");
+    }
+    nccl_ok(ncclBcast(buf, count, ncclInt, root_rank, s->tp, s->stream), "ncclBcast(tp)");
+    if (!is_device_ptr(data))
+        cuda_ok(cudaMemcpyAsync(data, buf, static_cast<size_t>(count) * sizeof(int),
+                                 cudaMemcpyDeviceToHost, s->stream),
+                "cudaMemcpyAsync(bcast D2H)");
+    cuda_ok(cudaStreamSynchronize(s->stream), "cudaStreamSynchronize(bcast)");
+#else
+    (void)data; (void)count; (void)root_rank;
 #endif
 }
 

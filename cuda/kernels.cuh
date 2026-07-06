@@ -50,6 +50,38 @@ void gemm_fp8(const float* x, const uint8_t* fp8W, const float* w_scale,
               const float* bias, float* y, int64_t n, int64_t in, int64_t out,
               cudaStream_t s = 0);
 
+// GGUF quant GEMM: y[n,out] = x[n,in] @ W[out,in]^T (+bias) where W is a GGML
+// block-quantized weight ([out,in] row-major, in contiguous, row_bytes stride).
+// qtype is a GGML type id (8=Q8_0, 11=Q3_K, 12=Q4_K, 13=Q5_K, 14=Q6_K,
+// 18=IQ3_XXS, 23=IQ4_XS, 0=F32, 1=F16). Dequantizes on the fly inside the kernel
+// (bandwidth-bound, like llama.cpp's MMVQ). One block per output column.
+void gemm_q(uint32_t qtype, const float* x, const uint8_t* qW, const float* bias,
+            float* y, int64_t n, int64_t in, int64_t out, int64_t row_bytes,
+            cudaStream_t s = 0);
+
+// Dequantize a single row (in elements) of a quant weight into fp32 dst (used
+// for the embedding gather, where one row per token is needed).
+void dequant_row_q(uint32_t qtype, const uint8_t* qW, float* dst, int64_t in,
+                   int64_t row_bytes, cudaStream_t s = 0);
+
+// Gather embeddings from a quant [vocab, H] table: for each token t, dequantize
+// row tok[t] (H elements) into hidden[t*H]. qtable row o is at qtable + o*row_bytes.
+void embed_gather_q(uint32_t qtype, const uint8_t* qtable, const int* tokens,
+                    float* hidden, int64_t n, int64_t H, int64_t row_bytes,
+                    cudaStream_t s = 0);
+
+// MoE expert FFN reading merged per-expert GGUF quant tensors (only the active
+// top-k experts are read). gate/up are [E, moe_inter, hidden] (in=hidden),
+// down is [E, hidden, moe_inter] (in=moe_inter); row o of expert e lives at
+// base + (e*out + o)*row_bytes. h_act is caller scratch [n, topk, moe_inter].
+// out is zeroed and accumulated with topk weights.
+void moe_expert_ffn_q(uint32_t gate_type, uint32_t up_type, uint32_t down_type,
+                      const float* x, const int* topk_ids, const float* topk_w,
+                      const uint8_t* gate_q, const uint8_t* up_q, const uint8_t* down_q,
+                      int n, int topk, int hidden, int moe_inter, int E,
+                      int64_t gate_row_bytes, int64_t up_row_bytes, int64_t down_row_bytes,
+                      float* h_act, float* out, cudaStream_t s = 0);
+
 // ---- attention -----------------------------------------------------------
 // Dense causal attention reading K/V from a paged cache. q[n,H,hd]; the cache
 // stores K/V for absolute positions [0, ctx). block_table maps logical->phys.

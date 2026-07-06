@@ -172,6 +172,46 @@ W4 repack writes each shard through a `.part` file and atomically replaces the
 final shard on success; rerunning the converter skips already-valid output
 shards and repairs corrupt/incomplete ones.
 
+## GLM-5.2 3-bit GGUF reference
+
+The active llama.cpp reference in `/project/inniang/inference` uses the Unsloth
+`UD-Q3_K_XL` split GGUF checkpoint. Before attempting native `glmserve` GGUF
+ingestion, verify the real shard set and quantization inventory:
+
+```bash
+make
+bash scripts/check_glm52_gguf.sh
+```
+
+Expected high-level facts for the current GLM-5.2 reference:
+
+- 9 split GGUF files under
+  `/project/inniang/inference/models/GLM-5.2-GGUF/UD-Q3_K_XL`
+- `general.architecture=glm-dsa`
+- `glm-dsa.expert_count=256`
+- payload quant types include `IQ3_XXS`
+- the native `glmserve` layout builder maps all 1809 GGUF tensors into
+  GLM-5.2 module views (`3` dense layers, `76` MoE/MTP layers)
+- `glmserve load-gguf --model ... --touch-payloads` mmaps the shards and keeps
+  stable quant tensor views in `GLM52Model`
+- `--dequant-smoke` decodes a real block from each observed GGML payload type,
+  including the `IQ3_XXS` 3-bit expert tensors
+- `--require-dequant-checksums` pins those decoded blocks to the current
+  llama.cpp/Python reference checksums for this GLM-5.2 shard set
+- `--linear-smoke` runs deterministic row-dot products through real mapped GGUF
+  linears, including one `IQ3_XXS` expert matrix
+- `--require-linear-checksums` pins those row-dot products to llama.cpp/Python
+  reference values for the same encoded rows
+
+This check deliberately does not claim generation support. The native binary now
+parses GGUF shard metadata/tensor tables, validates the GGUF-to-glmserve
+module-name map, mmaps the split payload files, touches every quantized tensor
+range, runs the model-level GGUF quant-weight load, and CPU-dequantizes smoke
+blocks from those mapped quant payloads. The execution engine still runs
+safetensors/W4A16. Serving `UD-Q3_K_XL` natively requires wiring those GGUF
+tensor views into the forward path plus GGML quant GEMM kernels for the observed
+payload types.
+
 ## Tokenizer
 
 V0 ships a byte-level fallback (always correct round-trips) and a best-effort

@@ -23,11 +23,14 @@ LDFLAGS   := -pthread
 CPP_SRCS := \
 	src/config.cpp \
 	src/tensor.cpp \
+	src/gguf.cpp \
+	src/gguf_quant.cpp \
 	src/safetensors.cpp \
 	src/tokenizer.cpp \
 	src/kv_cache.cpp \
 	src/sampler.cpp \
 	src/model_glm52.cpp \
+	src/model_gguf.cpp \
 	src/scheduler.cpp \
 	src/http_server.cpp \
 	src/server.cpp \

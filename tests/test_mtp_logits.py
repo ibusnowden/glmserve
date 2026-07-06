@@ -18,6 +18,8 @@ def main():
     ap.add_argument("--bin", default=os.path.join(ROOT, "build", "glmserve"))
     ap.add_argument("--python", default=sys.executable)
     ap.add_argument("--tol", type=float, default=1e-3)
+    ap.add_argument("--gpu", action="store_true",
+                    help="validate the GPU MTP path (mtp --gpu) against the numpy reference")
     args = ap.parse_args()
 
     if not os.path.exists(args.bin):
@@ -41,6 +43,8 @@ def main():
             "--draft", " ".join(map(str, ref["draft"])),
             "--out", out_path,
         ]
+        if args.gpu:
+            cmd.append("--gpu")
         run = subprocess.run(cmd, capture_output=True, text=True,
                              env=dict(os.environ, GLMSERVE_LOG="error"))
         if run.returncode != 0:
