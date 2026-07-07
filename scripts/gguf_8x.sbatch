@@ -68,10 +68,15 @@ make GPU=1 -j"$JOBS"
 MONITOR_PID=$!
 trap 'kill "$MONITOR_PID" 2>/dev/null || true' EXIT
 
-# Legacy NCCL peer-access maps every later cudaMalloc into 7 peer IOMMU
-# domains and slows the 40 GiB/rank weight upload ~20x; P2P bw ~= host bw on
-# this PCIe fabric anyway, so disabling it is free for the forward all-reduces.
-export NCCL_P2P_DISABLE="${NCCL_P2P_DISABLE:-1}"
+# P2P across the root complex: these GPUs sit on different PCI root ports, so
+# NCCL's default NCCL_P2P_LEVEL rejects P2P and silently falls back to SHM —
+# 48.7 ms per 25 MB fp32 all-reduce (56% of prefill!), identical with
+# NCCL_P2P_DISABLE=0. Forcing P2P_LEVEL=SYS selects P2P/CUMEM: 9.3x faster
+# all-reduces (job 143998: prefill 75.6 -> 151.5 tok/s), and the upload stays
+# NFS-bound (CUMEM lazy connect avoids the legacy peer-access cudaMalloc
+# penalty that motivated the old NCCL_P2P_DISABLE=1 default).
+export NCCL_P2P_DISABLE="${NCCL_P2P_DISABLE:-0}"
+export NCCL_P2P_LEVEL="${NCCL_P2P_LEVEL:-SYS}"
 # Skip the 20-min up-front prefault: upload_to_gpu prefetches its mmap source
 # a few layers ahead (GLMSERVE_UPLOAD_PREFETCH) and evicts consumed ranges a
 # few layers behind (GLMSERVE_EVICT_LAG) — a single sliding ~50 GiB window, so
