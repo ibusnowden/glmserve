@@ -378,11 +378,13 @@ struct Scratch {
     float* topk_w = nullptr;
     float* moe_h_act = nullptr;   // [n, topk, moe_inter] scratch for quant MoE
     int*   moe_dispatch = nullptr; // [3E+1 + n*topk] expert-major dispatch scratch
+    float* moe_gu_part = nullptr;  // [2, kMoeSplitK, kMoeSplitKMaxTs, moe_inter] split-K partials
 
     void free_all() {
         for (float* p : {hidden_d, normed, qa, q, kva, ckv, kpe, kvb, attn,
                          attn_proj, mlp, gbuf, ubuf, gu, rlogits, shbuf,
-                         index_q, index_k, index_w, dsa_scores, topk_w, moe_h_act})
+                         index_q, index_k, index_w, dsa_scores, topk_w, moe_h_act,
+                         moe_gu_part})
             if (p) cudaFree(p);
         if (d_tokens) cudaFree(d_tokens);
         if (topk_ids) cudaFree(topk_ids);
@@ -432,6 +434,9 @@ struct Scratch {
         if (cudaMalloc(&moe_dispatch,
                        (3 * E + 1 + n * topk) * sizeof(int)) != cudaSuccess)
             throw std::runtime_error("cudaMalloc failed");
+        moe_gu_part = dmalloc(2ll * glmserve::cuda::kMoeSplitK *
+                              glmserve::cuda::kMoeSplitKMaxTs *
+                              std::max<int64_t>(1, max_moe_inter));
         cap = n;
     }
 };
@@ -1054,7 +1059,7 @@ bool run_layer_step(GpuState* g, const GLM52Config& c, Communicator* comm,
                              d.qexp_gate_q, d.qexp_up_q, d.qexp_down_q,
                              n, topk, hidden, moei, E,
                              d.qexp_gate_rb, d.qexp_up_rb, d.qexp_down_rb,
-                             s.moe_h_act, s.mlp, s.moe_dispatch);
+                             s.moe_h_act, s.mlp, s.moe_dispatch, s.moe_gu_part);
         } else if (d.quantized_experts) {
             moe_expert_ffn_w4a16(s.normed, s.topk_ids, s.topk_w,
                                  d.qexp_gate, d.sexp_gate, d.qexp_up, d.sexp_up,

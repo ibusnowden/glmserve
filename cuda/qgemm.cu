@@ -497,6 +497,7 @@ __global__ void moe_dispatch_scatter_kernel(const int* __restrict__ topk_ids, in
     ts_sorted[offsets[e] + atomicAdd(&cursor[e], 1)] = i;
 }
 
+template <int T>
 __global__ void moe_gate_up_q_emajor_kernel(const float* __restrict__ x,
                                             const int* __restrict__ ts_sorted,
                                             const int* __restrict__ offsets,
@@ -517,20 +518,20 @@ __global__ void moe_gate_up_q_emajor_kernel(const float* __restrict__ x,
     const int g_gbytes = qgroup_bytes(gate_type);
     const int u_gbytes = qgroup_bytes(up_type);
     const int ngroups = (hidden + 255) >> 8;
-    for (int base = beg; base < end; base += 8) {
-        const int B = min(8, end - base);
-        int ts[8];
-        const float* xt[8];
+    for (int base = beg; base < end; base += T) {
+        const int B = min(T, end - base);
+        int ts[T];
+        const float* xt[T];
         #pragma unroll
-        for (int j = 0; j < 8; ++j) {
+        for (int j = 0; j < T; ++j) {
             if (j < B) {
                 ts[j] = ts_sorted[base + j];
                 xt[j] = x + (size_t)(ts[j] / topk) * hidden;
             }
         }
-        float g8[8], u8[8];
+        float g8[T], u8[T];
         #pragma unroll
-        for (int j = 0; j < 8; ++j) { g8[j] = 0.0f; u8[j] = 0.0f; }
+        for (int j = 0; j < T; ++j) { g8[j] = 0.0f; u8[j] = 0.0f; }
         for (int gi = 0; gi < ngroups; ++gi) {
             const int idx0 = (gi << 8) + (lane << 3);
             const int rem = hidden - idx0;
@@ -538,15 +539,15 @@ __global__ void moe_gate_up_q_emajor_kernel(const float* __restrict__ x,
             float w8[8];
             dq8(gate_type, grow + (size_t)gi * g_gbytes, lane, w8);
             #pragma unroll
-            for (int j = 0; j < 8; ++j)
+            for (int j = 0; j < T; ++j)
                 if (j < B) g8[j] += frag_dot(w8, xt[j] + idx0, rem);
             dq8(up_type, urow + (size_t)gi * u_gbytes, lane, w8);
             #pragma unroll
-            for (int j = 0; j < 8; ++j)
+            for (int j = 0; j < T; ++j)
                 if (j < B) u8[j] += frag_dot(w8, xt[j] + idx0, rem);
         }
         #pragma unroll
-        for (int j = 0; j < 8; ++j) {
+        for (int j = 0; j < T; ++j) {
             if (j >= B) continue;
             const float g = warp_reduce_sum(g8[j]);
             const float u = warp_reduce_sum(u8[j]);
@@ -555,6 +556,7 @@ __global__ void moe_gate_up_q_emajor_kernel(const float* __restrict__ x,
     }
 }
 
+template <int T>
 __global__ void moe_down_q_emajor_kernel(const int* __restrict__ ts_sorted,
                                          const int* __restrict__ offsets,
                                          const float* __restrict__ topk_w,
@@ -572,20 +574,20 @@ __global__ void moe_down_q_emajor_kernel(const int* __restrict__ ts_sorted,
     const uint8_t* drow = down_q + ((size_t)e * hidden + o) * down_row_bytes;
     const int gbytes = qgroup_bytes(down_type);
     const int ngroups = (moe_inter + 255) >> 8;
-    for (int base = beg; base < end; base += 8) {
-        const int B = min(8, end - base);
-        int ts[8];
-        const float* ha[8];
+    for (int base = beg; base < end; base += T) {
+        const int B = min(T, end - base);
+        int ts[T];
+        const float* ha[T];
         #pragma unroll
-        for (int j = 0; j < 8; ++j) {
+        for (int j = 0; j < T; ++j) {
             if (j < B) {
                 ts[j] = ts_sorted[base + j];
                 ha[j] = h_act + (size_t)ts[j] * moe_inter;
             }
         }
-        float a8[8];
+        float a8[T];
         #pragma unroll
-        for (int j = 0; j < 8; ++j) a8[j] = 0.0f;
+        for (int j = 0; j < T; ++j) a8[j] = 0.0f;
         for (int gi = 0; gi < ngroups; ++gi) {
             const int idx0 = (gi << 8) + (lane << 3);
             const int rem = moe_inter - idx0;
@@ -593,11 +595,11 @@ __global__ void moe_down_q_emajor_kernel(const int* __restrict__ ts_sorted,
             float w8[8];
             dq8(down_type, drow + (size_t)gi * gbytes, lane, w8);
             #pragma unroll
-            for (int j = 0; j < 8; ++j)
+            for (int j = 0; j < T; ++j)
                 if (j < B) a8[j] += frag_dot(w8, ha[j] + idx0, rem);
         }
         #pragma unroll
-        for (int j = 0; j < 8; ++j) {
+        for (int j = 0; j < T; ++j) {
             if (j >= B) continue;
             const float acc = warp_reduce_sum(a8[j]);
             if (lane == 0)
@@ -606,16 +608,101 @@ __global__ void moe_down_q_emajor_kernel(const int* __restrict__ ts_sorted,
     }
 }
 
+// ---- split-K single/few-token path -----------------------------------------
+// At decode (n=1, topk=8) the token-major gate/up grid is (moe_inter_local/8,
+// 8) blocks — ~192 blocks on a 142-SM part, each warp walking the whole
+// hidden-dim group loop serially. Splitting the input dim kMoeSplitK ways
+// multiplies the block count and shortens each warp's loop; partials land in
+// gu_part [2, S, nts, moe_inter] (one slot per (split, ts, row) — no atomics)
+// and a small epilogue reduces splits in fixed order (deterministic) and
+// applies silu(g)*u.
+
+__global__ void moe_gate_up_q_splitk_kernel(const float* __restrict__ x,
+                                            const int* __restrict__ topk_ids,
+                                            const uint8_t* __restrict__ gate_q,
+                                            const uint8_t* __restrict__ up_q,
+                                            int nts, int topk, int hidden, int moe_inter,
+                                            int64_t gate_row_bytes, int64_t up_row_bytes,
+                                            uint32_t gate_type, uint32_t up_type,
+                                            float* __restrict__ gu_part) {
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int f = blockIdx.x * kWarpsPerBlock + warp;
+    if (f >= moe_inter) return;
+    const int ts = blockIdx.y;
+    const int sp = blockIdx.z;
+    const int e = topk_ids[ts];
+    const float* xt = x + (size_t)(ts / topk) * hidden;
+    const uint8_t* grow = gate_q + ((size_t)e * moe_inter + f) * gate_row_bytes;
+    const uint8_t* urow = up_q + ((size_t)e * moe_inter + f) * up_row_bytes;
+    const int g_gbytes = qgroup_bytes(gate_type);
+    const int u_gbytes = qgroup_bytes(up_type);
+    const int ngroups = (hidden + 255) >> 8;
+    const int chunk = (ngroups + kMoeSplitK - 1) / kMoeSplitK;
+    const int g0 = sp * chunk, g1 = min(ngroups, g0 + chunk);
+    float g = 0.0f, u = 0.0f;
+    for (int gi = g0; gi < g1; ++gi) {
+        const int idx0 = (gi << 8) + (lane << 3);
+        const int rem = hidden - idx0;
+        if (rem <= 0) continue;
+        float w8[8];
+        dq8(gate_type, grow + (size_t)gi * g_gbytes, lane, w8);
+        g += frag_dot(w8, xt + idx0, rem);
+        dq8(up_type, urow + (size_t)gi * u_gbytes, lane, w8);
+        u += frag_dot(w8, xt + idx0, rem);
+    }
+    g = warp_reduce_sum(g);
+    u = warp_reduce_sum(u);
+    if (lane == 0) {
+        const size_t slab = (size_t)kMoeSplitK * nts * moe_inter;
+        const size_t slot = ((size_t)sp * nts + ts) * moe_inter + f;
+        gu_part[slot] = g;
+        gu_part[slab + slot] = u;
+    }
+}
+
+__global__ void moe_gate_up_splitk_reduce_kernel(const float* __restrict__ gu_part,
+                                                 int nts, int moe_inter,
+                                                 float* __restrict__ h_act) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= nts * moe_inter) return;
+    const size_t slab = (size_t)kMoeSplitK * nts * moe_inter;
+    float g = 0.0f, u = 0.0f;
+    for (int sp = 0; sp < kMoeSplitK; ++sp) {
+        g += gu_part[(size_t)sp * nts * moe_inter + i];
+        u += gu_part[slab + (size_t)sp * nts * moe_inter + i];
+    }
+    h_act[i] = silu(g) * u;
+}
+
 void moe_expert_ffn_q(uint32_t gate_type, uint32_t up_type, uint32_t down_type,
                       const float* x, const int* topk_ids, const float* topk_w,
                       const uint8_t* gate_q, const uint8_t* up_q, const uint8_t* down_q,
                       int n, int topk, int hidden, int moe_inter, int E,
                       int64_t gate_row_bytes, int64_t up_row_bytes, int64_t down_row_bytes,
-                      float* h_act, float* out, int* dispatch, cudaStream_t s) {
+                      float* h_act, float* out, int* dispatch, float* gu_part,
+                      cudaStream_t s) {
     seed_tables();
     cudaMemsetAsync(out, 0, (size_t)n * hidden * sizeof(float), s);
     const int threads = kWarpsPerBlock * 32;
     const int nts = n * topk;
+    if (gu_part && nts < kMoeSplitKMaxTs) {
+        // Split-K gate/up + reduce epilogue, then the token-major down (its
+        // grid spans `hidden` rows — no occupancy problem at n=1).
+        dim3 gs((unsigned)((moe_inter + kWarpsPerBlock - 1) / kWarpsPerBlock),
+                (unsigned)nts, (unsigned)kMoeSplitK);
+        moe_gate_up_q_splitk_kernel<<<gs, threads, 0, s>>>(
+            x, topk_ids, gate_q, up_q, nts, topk, hidden, moe_inter,
+            gate_row_bytes, up_row_bytes, gate_type, up_type, gu_part);
+        const int hcount = nts * moe_inter;
+        moe_gate_up_splitk_reduce_kernel<<<(unsigned)((hcount + 255) / 256), 256, 0, s>>>(
+            gu_part, nts, moe_inter, h_act);
+        dim3 dn0((unsigned)((hidden + kWarpsPerBlock - 1) / kWarpsPerBlock),
+                 (unsigned)nts);
+        moe_down_q_kernel<<<dn0, threads, 0, s>>>(
+            topk_ids, topk_w, down_q, h_act, topk, hidden, moe_inter,
+            down_row_bytes, down_type, out);
+        return;
+    }
     if (dispatch && nts >= 64) {
         // Expert-major: dispatch layout [counts E | offsets E+1 | cursor E | ts nts].
         int* counts = dispatch;
@@ -630,11 +717,11 @@ void moe_expert_ffn_q(uint32_t gate_type, uint32_t up_type, uint32_t down_type,
         moe_dispatch_scatter_kernel<<<db, 256, 0, s>>>(topk_ids, nts, offsets, cursor,
                                                        ts_sorted);
         dim3 gu((unsigned)((moe_inter + kWarpsPerBlock - 1) / kWarpsPerBlock), (unsigned)E);
-        moe_gate_up_q_emajor_kernel<<<gu, threads, 0, s>>>(
+        moe_gate_up_q_emajor_kernel<8><<<gu, threads, 0, s>>>(
             x, ts_sorted, offsets, gate_q, up_q, topk, hidden, moe_inter,
             gate_row_bytes, up_row_bytes, gate_type, up_type, h_act);
         dim3 dn((unsigned)((hidden + kWarpsPerBlock - 1) / kWarpsPerBlock), (unsigned)E);
-        moe_down_q_emajor_kernel<<<dn, threads, 0, s>>>(
+        moe_down_q_emajor_kernel<8><<<dn, threads, 0, s>>>(
             ts_sorted, offsets, topk_w, down_q, h_act, hidden, moe_inter,
             down_row_bytes, down_type, out, topk);
         return;

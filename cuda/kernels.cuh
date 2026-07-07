@@ -78,13 +78,21 @@ void embed_gather_q(uint32_t qtype, const uint8_t* qtable, const int* tokens,
 // scratch [3E+1 + n*topk]: when given and n*topk is large enough, the FFN runs
 // expert-major (tokens grouped by expert, 8-token weight-fragment reuse) —
 // ~8x fewer quant decodes at prefill; pass nullptr for the token-major path.
+// Split-K decode path constants: with a single token the gate/up grid is only
+// (moe_inter_local/8 x topk) blocks — far below SM count — so the input-dim
+// loop is split kMoeSplitK ways into `gu_part` partials [2, kMoeSplitK, nts,
+// moe_inter] and reduced (in fixed split order — deterministic) by a small
+// epilogue. Used when nts < kMoeSplitKMaxTs and `gu_part` is non-null.
+constexpr int kMoeSplitK = 8;
+constexpr int kMoeSplitKMaxTs = 64;
+
 void moe_expert_ffn_q(uint32_t gate_type, uint32_t up_type, uint32_t down_type,
                       const float* x, const int* topk_ids, const float* topk_w,
                       const uint8_t* gate_q, const uint8_t* up_q, const uint8_t* down_q,
                       int n, int topk, int hidden, int moe_inter, int E,
                       int64_t gate_row_bytes, int64_t up_row_bytes, int64_t down_row_bytes,
                       float* h_act, float* out, int* dispatch = nullptr,
-                      cudaStream_t s = 0);
+                      float* gu_part = nullptr, cudaStream_t s = 0);
 
 // ---- attention -----------------------------------------------------------
 // Dense causal attention reading K/V from a paged cache. q[n,H,hd]; the cache

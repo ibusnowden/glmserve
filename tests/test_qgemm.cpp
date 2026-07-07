@@ -212,6 +212,32 @@ int main() {
         std::printf("  moe_expert_ffn_q expert-major vs token-major:");
         rc |= check(got_em, got, 1e-4f);
         cudaFree(ddisp);
+
+        // Split-K few-token path (nts < kMoeSplitKMaxTs, gu_part provided):
+        // first 4 tokens of the same problem; ref rows 0..3 still apply. The
+        // split reduce reorders the input-dim sum, so compare with a relative
+        // tolerance rather than exact equality.
+        {
+            const int ns = 4;
+            float* dgu = nullptr;
+            CUDA_TEST_CHECK(cudaMalloc(&dgu, (size_t)2 * kMoeSplitK * kMoeSplitKMaxTs *
+                                              moe_inter * sizeof(float)));
+            moe_expert_ffn_q(gtype, utype, dtype, dx, dti, dtw, dg, du, dd,
+                             ns, topk, hidden, moe_inter, E, g_rb, u_rb, d_rb, dh, dy,
+                             nullptr, dgu);
+            CUDA_TEST_CHECK(cudaGetLastError());
+            CUDA_TEST_CHECK(cudaDeviceSynchronize());
+            std::vector<float> got_sk((size_t)ns * hidden);
+            CUDA_TEST_CHECK(cudaMemcpy(got_sk.data(), dy, got_sk.size() * sizeof(float),
+                                       cudaMemcpyDeviceToHost));
+            std::vector<float> ref_s(ref.begin(), ref.begin() + (size_t)ns * hidden);
+            std::vector<float> got_s(got.begin(), got.begin() + (size_t)ns * hidden);
+            std::printf("  moe_expert_ffn_q split-K vs CPU ref [n=%d]:", ns);
+            rc |= check(got_sk, ref_s, 1e-2f);
+            std::printf("  moe_expert_ffn_q split-K vs token-major:");
+            rc |= check(got_sk, got_s, 1e-5f);
+            cudaFree(dgu);
+        }
         cudaFree(dx); cudaFree(dti); cudaFree(dtw); cudaFree(dg); cudaFree(du); cudaFree(dd); cudaFree(dh); cudaFree(dy);
     }
 
