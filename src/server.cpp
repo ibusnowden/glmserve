@@ -385,10 +385,12 @@ Engine::BenchResult Engine::profile(int prompt_len, int gen_len) {
     if (gpu_active_) {
         // Warm-up prefill (primes cuBLAS, allocates scratch/KV) — not timed.
         model_->forward_gpu_prefill(prompt);
+        gpu_prof_report("warmup", false);  // reset GLMSERVE_PROF accumulator
 
         Timer tp;
         std::vector<float> logits = model_->forward_gpu_prefill(prompt);
         r.prefill_ms = tp.ms();
+        gpu_prof_report("prefill", is_root());
 
         int next = host_argmax(logits);
         int64_t pos = prompt_len;
@@ -399,6 +401,7 @@ Engine::BenchResult Engine::profile(int prompt_len, int gen_len) {
             ++pos;
         }
         r.decode_ms = td.ms();
+        gpu_prof_report("decode", is_root());
         return r;
     }
 

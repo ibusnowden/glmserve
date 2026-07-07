@@ -29,6 +29,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <map>
 #include <stdexcept>
 #include <thread>
 #include <vector>
@@ -211,6 +212,69 @@ inline void evict_ranges(const GGUFModel* gg, std::vector<PfRange> rs) {
     }
     gg->evict_range(cur, static_cast<size_t>(end - cur));
 }
+// --- Stage profiler (GLMSERVE_PROF=1) -----------------------------------
+// The forward records a cudaEvent on the default stream at each stage
+// boundary; the elapsed time between consecutive marks is attributed to the
+// later mark's stage. Events timestamp the GPU timeline, so host launch gaps
+// show up too (the "gap" stage) — a launch-bound forward is directly visible.
+// flush() folds one forward's marks into the accumulator that
+// gpu_prof_report() prints and resets.
+struct StageProf {
+    bool on = std::getenv("GLMSERVE_PROF") != nullptr;
+    std::vector<cudaEvent_t> pool;
+    std::vector<const char*> names;
+    size_t used = 0;
+    std::map<std::string, std::pair<double, uint64_t>> acc;  // name -> (ms, hits)
+    void mark(const char* name) {
+        if (!on) return;
+        if (used == pool.size()) {
+            cudaEvent_t e;
+            if (cudaEventCreate(&e) != cudaSuccess) { on = false; return; }
+            pool.push_back(e);
+        }
+        cudaEventRecord(pool[used]);
+        names.push_back(name);
+        ++used;
+    }
+    void flush() {
+        if (!on || used == 0) return;
+        cudaEventSynchronize(pool[used - 1]);
+        for (size_t i = 1; i < used; ++i) {
+            float ms = 0.0f;
+            cudaEventElapsedTime(&ms, pool[i - 1], pool[i]);
+            auto& a = acc[names[i]];
+            a.first += ms;
+            a.second += 1;
+        }
+        used = 0;
+        names.clear();
+    }
+};
+StageProf g_prof;
+}  // namespace
+
+void gpu_prof_report(const char* tag, bool print) {
+    if (!g_prof.on) return;
+    g_prof.flush();
+    if (print && !g_prof.acc.empty()) {
+        double total = 0.0;
+        for (const auto& kv : g_prof.acc) total += kv.second.first;
+        std::vector<std::pair<std::string, std::pair<double, uint64_t>>> rows(
+            g_prof.acc.begin(), g_prof.acc.end());
+        std::sort(rows.begin(), rows.end(),
+                  [](const auto& a, const auto& b) { return a.second.first > b.second.first; });
+        std::fprintf(stderr, "[prof] %s: GPU timeline %.1f ms across %zu stages\n",
+                     tag, total, rows.size());
+        for (const auto& r : rows)
+            std::fprintf(stderr, "[prof]   %-14s %9.2f ms  %5.1f%%  x%llu\n",
+                         r.first.c_str(), r.second.first,
+                         total > 0 ? 100.0 * r.second.first / total : 0.0,
+                         static_cast<unsigned long long>(r.second.second));
+    }
+    g_prof.acc.clear();
+}
+
+namespace {
 // Surface any pending CUDA error (async kernel launch failures included) so a
 // bad GPU forward fails loudly instead of returning garbage logits to the gate.
 inline void cuda_check(const char* what) {
@@ -313,6 +377,7 @@ struct Scratch {
     int*   dsa_indices = nullptr;
     float* topk_w = nullptr;
     float* moe_h_act = nullptr;   // [n, topk, moe_inter] scratch for quant MoE
+    int*   moe_dispatch = nullptr; // [3E+1 + n*topk] expert-major dispatch scratch
 
     void free_all() {
         for (float* p : {hidden_d, normed, qa, q, kva, ckv, kpe, kvb, attn,
@@ -322,6 +387,7 @@ struct Scratch {
         if (d_tokens) cudaFree(d_tokens);
         if (topk_ids) cudaFree(topk_ids);
         if (dsa_indices) cudaFree(dsa_indices);
+        if (moe_dispatch) cudaFree(moe_dispatch);
         *this = Scratch{};
     }
     void ensure(int64_t n, const GLM52Config& c, int64_t local_heads,
@@ -363,6 +429,9 @@ struct Scratch {
             throw std::runtime_error("cudaMalloc failed");
         topk_w    = dmalloc(n * topk);
         moe_h_act = dmalloc(n * topk * ffmax);
+        if (cudaMalloc(&moe_dispatch,
+                       (3 * E + 1 + n * topk) * sizeof(int)) != cudaSuccess)
+            throw std::runtime_error("cudaMalloc failed");
         cap = n;
     }
 };
@@ -447,6 +516,18 @@ bool GLM52Model::upload_to_gpu(int64_t max_ctx) {
     g->local_heads = tp_heads_;
     GLM_CHECK(g->local_heads > 0, "GPU upload requires at least one local attention head");
 
+    // Consumed-source eviction (see evict_ranges above).
+    // GLMSERVE_EVICT_LAG = layers behind the upload (default 8, negative disables).
+    int evict_lag = 8;
+    if (const char* e = std::getenv("GLMSERVE_EVICT_LAG")) evict_lag = std::atoi(e);
+    const GGUFModel* evict_gg =
+        (evict_lag >= 0 && gguf_weights_) ? &gguf_weights_->gguf() : nullptr;
+    // Deterministic cold start: drop any stale GGUF page cache (ours or a dead
+    // job's) so the sequential upload faults into free RAM instead of paying
+    // direct-reclaim latency per page (job 143981 crawled at 1 MB/s from layer
+    // 1 on a node whose cache was saturated by a killed predecessor).
+    if (evict_gg) evict_gg->evict_all();
+
     if (dist_.is_first_stage()) {
         if (embed_lin_.has_q() &&
             (dist_.world_size > 1 || std::getenv("GLMSERVE_HOST_EMBED") != nullptr)) {
@@ -526,12 +607,6 @@ bool GLM52Model::upload_to_gpu(int64_t max_ctx) {
     // GLMSERVE_UPLOAD_PREFETCH = layers ahead (default 4, 0 disables).
     int pf_ahead = 4;
     if (const char* e = std::getenv("GLMSERVE_UPLOAD_PREFETCH")) pf_ahead = std::atoi(e);
-    // Consumed-source eviction (see evict_ranges above).
-    // GLMSERVE_EVICT_LAG = layers behind the upload (default 8, negative disables).
-    int evict_lag = 8;
-    if (const char* e = std::getenv("GLMSERVE_EVICT_LAG")) evict_lag = std::atoi(e);
-    const GGUFModel* evict_gg =
-        (evict_lag >= 0 && gguf_weights_) ? &gguf_weights_->gguf() : nullptr;
     if (evict_gg && dist_.is_last_stage()) {
         // lm_head was uploaded above and is never read from the mmap again.
         std::vector<PfRange> rs;
@@ -697,6 +772,13 @@ bool GLM52Model::upload_to_gpu(int64_t max_ctx) {
             }
         }
         pf_uploaded.store(i + 1);
+        // Layer-lockstep across ranks before evicting: per-rank eviction lag is
+        // relative to OWN progress, so a rank that pulls ahead evicts source
+        // pages slower ranks have not read yet, re-faulting them from NFS and
+        // compounding the skew until the upload collapses (job 143980: rank 0
+        // at layer 70 while rank 5 was at 27). The barrier makes the lag global
+        // and convoys the ranks, which also maximizes shared-page-cache reuse.
+        if (dist_.world_size > 1 && comm_) comm_->barrier();
         if (evict_gg && i >= static_cast<size_t>(evict_lag))
             evict_ranges(evict_gg,
                          layer_prefetch_ranges(layers_[i - static_cast<size_t>(evict_lag)]));
@@ -869,6 +951,7 @@ bool run_layer_step(GpuState* g, const GLM52Config& c, Communicator* comm,
     const bool tp = dist.tp_size > 1;
 
     // attention sub-block
+    g_prof.mark("gap");
     rmsnorm(s.hidden_d, d.input_norm, s.normed, n, hidden, eps);
     dbg_csum("normed", s.normed, n * hidden);
     gemm_linear(s.normed, d.q_a, nullptr, s.qa, n);
@@ -876,6 +959,7 @@ bool run_layer_step(GpuState* g, const GLM52Config& c, Communicator* comm,
     dbg_csum("qa", s.qa, n * qlat);
     gemm_linear(s.qa, d.q_b, nullptr, s.q, n);
     dbg_csum("q(local)", s.q, n * nheads * qk);
+    g_prof.mark("attn.q_proj");
     gemm_linear(s.normed, d.kv_a, nullptr, s.kva, n);
     slice_rows(s.kva, s.ckv, n, kvlat + rope, 0, kvlat);
     rmsnorm(s.ckv, d.kv_a_norm, s.ckv, n, kvlat, eps);
@@ -887,6 +971,7 @@ bool run_layer_step(GpuState* g, const GLM52Config& c, Communicator* comm,
     float* Kbase = Kc + start_pos * nheads * hc;
     float* Vbase = Vc + start_pos * nheads * hc;
     assemble_kv(s.kvb, s.kpe, Kbase, Vbase, n, nheads, nope, rope, vd, hc);
+    g_prof.mark("attn.kv_rope");
 
     const int64_t ctx_after = start_pos + n;
     const bool sparse_dsa = c.use_dsa && ctx_after > c.index_topk;
@@ -910,6 +995,7 @@ bool run_layer_step(GpuState* g, const GLM52Config& c, Communicator* comm,
                         1.0f / std::sqrt(static_cast<float>(c.index_n_heads)),
                         s.dsa_indices, s.dsa_scores);
         have_shared_dsa_indices = true;
+        g_prof.mark("dsa.index");
         attention_dsa_indexed_paged(s.q, Kc, Vc, g->block_table,
                                     s.dsa_indices, n, start_pos, nheads, nheads, qk,
                                     g->max_ctx, c.index_topk, scale, s.attn);
@@ -930,16 +1016,20 @@ bool run_layer_step(GpuState* g, const GLM52Config& c, Communicator* comm,
                               nheads, nheads, qk, g->max_ctx, scale, s.attn);
     }
     dbg_csum("attn(local)", s.attn, n * nheads * vd);
+    g_prof.mark("attn.core");
     gemm_linear(s.attn, d.o, nullptr, s.attn_proj, n);
+    g_prof.mark("attn.o_proj");
     if (tp) {
         GLM_CHECK(comm, "tensor-parallel GPU forward requires a communicator");
         comm->all_reduce_sum(s.attn_proj, n * hidden);
+        g_prof.mark("ar.attn");
     }
     dbg_csum("attn_proj", s.attn_proj, n * hidden);
     add_inplace(s.hidden_d, s.attn_proj, n * hidden);
 
     // MLP sub-block
     rmsnorm(s.hidden_d, d.post_norm, s.normed, n, hidden, eps);
+    g_prof.mark("resid.norm");
     if (d.is_dense) {
         const int64_t inter = d.gate.out;
         gemm_linear(s.normed, d.gate, nullptr, s.gbuf, n);
@@ -950,11 +1040,13 @@ bool run_layer_step(GpuState* g, const GLM52Config& c, Communicator* comm,
         dbg_csum("gu(local)", s.gu, n * inter);
         gemm_linear(s.gu, d.down, nullptr, s.mlp, n);
         dbg_csum("mlp_pre(local)", s.mlp, n * hidden);
+        g_prof.mark("mlp.dense");
     } else {
         const int64_t moei = d.expert_inter;
         gemm_linear(s.normed, d.router, nullptr, s.rlogits, n);
         moe_router(s.rlogits, d.e_bias, n, E, topk, c.norm_topk_prob,
                    static_cast<float>(c.routed_scaling_factor), s.topk_ids, s.topk_w);
+        g_prof.mark("moe.router");
         cudaMemset(s.mlp, 0, n * hidden * sizeof(float));
         if (d.quant_experts_gguf) {
             moe_expert_ffn_q(d.qexp_gate_type, d.qexp_up_type, d.qexp_down_type,
@@ -962,7 +1054,7 @@ bool run_layer_step(GpuState* g, const GLM52Config& c, Communicator* comm,
                              d.qexp_gate_q, d.qexp_up_q, d.qexp_down_q,
                              n, topk, hidden, moei, E,
                              d.qexp_gate_rb, d.qexp_up_rb, d.qexp_down_rb,
-                             s.moe_h_act, s.mlp);
+                             s.moe_h_act, s.mlp, s.moe_dispatch);
         } else if (d.quantized_experts) {
             moe_expert_ffn_w4a16(s.normed, s.topk_ids, s.topk_w,
                                  d.qexp_gate, d.sexp_gate, d.qexp_up, d.sexp_up,
@@ -972,6 +1064,7 @@ bool run_layer_step(GpuState* g, const GLM52Config& c, Communicator* comm,
             moe_expert_ffn(s.normed, s.topk_ids, s.topk_w, d.exp_gate, d.exp_up, d.exp_down,
                            n, topk, hidden, moei, E, s.mlp);
         }
+        g_prof.mark("moe.experts");
         if (d.sh_gate.out > 0) {
             const int64_t sh_inter = d.sh_gate.out;
             gemm_linear(s.normed, d.sh_gate, nullptr, s.gbuf, n);
@@ -979,9 +1072,13 @@ bool run_layer_step(GpuState* g, const GLM52Config& c, Communicator* comm,
             silu_mul(s.gbuf, s.ubuf, s.gu, n * sh_inter);
             gemm_linear(s.gu, d.sh_down, nullptr, s.shbuf, n);
             add_inplace(s.mlp, s.shbuf, n * hidden);
+            g_prof.mark("moe.shared");
         }
     }
-    if (tp) comm->all_reduce_sum(s.mlp, n * hidden);
+    if (tp) {
+        comm->all_reduce_sum(s.mlp, n * hidden);
+        g_prof.mark("ar.mlp");
+    }
     dbg_csum("mlp", s.mlp, n * hidden);
     add_inplace(s.hidden_d, s.mlp, n * hidden);
     dbg_csum("hidden", s.hidden_d, n * hidden);
@@ -1052,6 +1149,7 @@ std::vector<float> GLM52Model::forward_gpu_prefill(const std::vector<int>& token
               (long long)n, (long long)g->max_ctx);
 
     g->sc.ensure(n, cfg_, g->local_heads, g->max_dense_inter, g->max_moe_inter);
+    g_prof.mark("fwd.start");
     if (dist_.is_first_stage()) {
         GLM_CHECK(g->embed || g->embed_q || g->embed_host,
                   "forward_gpu_prefill: first GPU pipeline stage is missing embeddings");
@@ -1083,6 +1181,7 @@ std::vector<float> GLM52Model::forward_gpu_prefill(const std::vector<int>& token
     }
 
     dbg_csum("embed", g->sc.hidden_d, n * cfg_.hidden_size);
+    g_prof.mark("embed");
     const int64_t ctx_after = n;
     const bool sparse_dsa = cfg_.use_dsa && ctx_after > cfg_.index_topk;
     const bool recv_shared_dsa = sparse_dsa && !dist_.is_first_stage() &&
@@ -1102,10 +1201,13 @@ std::vector<float> GLM52Model::forward_gpu_prefill(const std::vector<int>& token
         if (sparse_dsa && have_shared_dsa && is_shared_dsa_layer(cfg_, next_layer))
             comm_->pipeline_send_next_int(g->sc.dsa_indices, n * cfg_.index_topk);
         cuda_check("forward_gpu_prefill");
+        g_prof.flush();
         return {};
     }
     std::vector<float> logits = finish_logits(g, cfg_, n, comm_);
+    g_prof.mark("lm_head");
     cuda_check("forward_gpu_prefill");
+    g_prof.flush();
     return logits;
 }
 
@@ -1117,6 +1219,7 @@ std::vector<float> GLM52Model::forward_gpu_decode(int token, int64_t pos) {
               "(raise --ctx)", (long long)pos, (long long)g->max_ctx);
 
     g->sc.ensure(1, cfg_, g->local_heads, g->max_dense_inter, g->max_moe_inter);
+    g_prof.mark("fwd.start");
     if (dist_.is_first_stage()) {
         GLM_CHECK(g->embed || g->embed_q || g->embed_host,
                   "forward_gpu_decode: first GPU pipeline stage is missing embeddings");
@@ -1138,6 +1241,7 @@ std::vector<float> GLM52Model::forward_gpu_decode(int token, int64_t pos) {
         GLM_CHECK(comm_, "forward_gpu_decode: non-first pipeline stage requires a communicator");
         comm_->pipeline_recv_prev(g->sc.hidden_d, cfg_.hidden_size);
     }
+    g_prof.mark("embed");
 
     const int64_t ctx_after = pos + 1;
     const bool sparse_dsa = cfg_.use_dsa && ctx_after > cfg_.index_topk;
@@ -1158,10 +1262,13 @@ std::vector<float> GLM52Model::forward_gpu_decode(int token, int64_t pos) {
         if (sparse_dsa && have_shared_dsa && is_shared_dsa_layer(cfg_, next_layer))
             comm_->pipeline_send_next_int(g->sc.dsa_indices, cfg_.index_topk);
         cuda_check("forward_gpu_decode");
+        g_prof.flush();
         return {};
     }
     std::vector<float> logits = finish_logits(g, cfg_, 1, comm_);
+    g_prof.mark("lm_head");
     cuda_check("forward_gpu_decode");
+    g_prof.flush();
     return logits;
 }
 

@@ -1350,6 +1350,7 @@ std::vector<float> GLM52Model::mtp_draft_logits_gpu(const std::vector<int>&,
     GLM_CHECK(false, "mtp_draft_logits_gpu: built without CUDA (rebuild with GPU=1)");
     return {};
 }
+void gpu_prof_report(const char*, bool) {}
 #endif
 
 }  // namespace glmserve

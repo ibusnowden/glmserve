@@ -241,4 +241,9 @@ private:
     int64_t tp_heads_ = 0;           // attention heads owned by this TP rank
 };
 
+// GLMSERVE_PROF=1 stage profiler (GPU build): the forward records per-stage
+// cudaEvent marks; this prints the accumulated per-stage GPU-timeline table
+// under `tag` (if `print`) and resets the accumulator. No-op otherwise.
+void gpu_prof_report(const char* tag, bool print);
+
 }  // namespace glmserve

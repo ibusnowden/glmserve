@@ -131,13 +131,16 @@ int main() {
     // ---- MoE expert FFN (merged per-expert quant tensors) -----------------
     // gate/up: IQ3_XXS [E, moe_inter, hidden]; down: IQ4_XS [E, hidden, moe_inter].
     {
-        const int E = 4, topk = 2, hidden = 512, moe_inter = 256, n = 3;
+        // n chosen so n*topk >= 64: exercises the expert-major dispatch path
+        // (token-major is still checked below by passing dispatch = nullptr).
+        const int E = 4, topk = 2, hidden = 512, moe_inter = 256, n = 48;
         uint32_t gtype = 18, utype = 18, dtype = 23;  // IQ3_XXS gate/up, IQ4_XS down
         int64_t g_rb, u_rb, d_rb;
         std::vector<uint8_t> gate_q = make_quant(gtype, E * moe_inter, hidden, g_rb, rng);
         std::vector<uint8_t> up_q   = make_quant(utype, E * moe_inter, hidden, u_rb, rng);
         std::vector<uint8_t> down_q = make_quant(dtype, E * hidden, moe_inter, d_rb, rng);
-        std::vector<int> topk_ids = {1, 3, 0, 2, 3, 1};  // n*topk
+        std::vector<int> topk_ids(n * topk);
+        for (auto& v : topk_ids) v = (int)(rng() % E);
         std::vector<float> topk_w(n * topk);
         for (auto& v : topk_w) v = 0.5f;
         std::vector<float> xin((size_t)n * hidden);
@@ -191,9 +194,25 @@ int main() {
         CUDA_TEST_CHECK(cudaDeviceSynchronize());
         std::vector<float> got(ref.size());
         CUDA_TEST_CHECK(cudaMemcpy(got.data(), dy, got.size() * sizeof(float), cudaMemcpyDeviceToHost));
-        cudaFree(dx); cudaFree(dti); cudaFree(dtw); cudaFree(dg); cudaFree(du); cudaFree(dd); cudaFree(dh); cudaFree(dy);
-        std::printf("  moe_expert_ffn_q [E=%d topk=%d hidden=%d moe_inter=%d n=%d]:", E, topk, hidden, moe_inter, n);
+        std::printf("  moe_expert_ffn_q [E=%d topk=%d hidden=%d moe_inter=%d n=%d] token-major:",
+                    E, topk, hidden, moe_inter, n);
         rc |= check(got, ref, 1e-2f);
+
+        // Expert-major path (dispatch scratch provided, n*topk >= 64).
+        int* ddisp = nullptr;
+        CUDA_TEST_CHECK(cudaMalloc(&ddisp, (3 * E + 1 + n * topk) * sizeof(int)));
+        moe_expert_ffn_q(gtype, utype, dtype, dx, dti, dtw, dg, du, dd,
+                         n, topk, hidden, moe_inter, E, g_rb, u_rb, d_rb, dh, dy, ddisp);
+        CUDA_TEST_CHECK(cudaGetLastError());
+        CUDA_TEST_CHECK(cudaDeviceSynchronize());
+        std::vector<float> got_em(ref.size());
+        CUDA_TEST_CHECK(cudaMemcpy(got_em.data(), dy, got_em.size() * sizeof(float), cudaMemcpyDeviceToHost));
+        std::printf("  moe_expert_ffn_q expert-major vs CPU ref:");
+        rc |= check(got_em, ref, 1e-2f);
+        std::printf("  moe_expert_ffn_q expert-major vs token-major:");
+        rc |= check(got_em, got, 1e-4f);
+        cudaFree(ddisp);
+        cudaFree(dx); cudaFree(dti); cudaFree(dtw); cudaFree(dg); cudaFree(du); cudaFree(dd); cudaFree(dh); cudaFree(dy);
     }
 
     // ---- TP shard consistency (col/row slicing + strided 2D repack) --------

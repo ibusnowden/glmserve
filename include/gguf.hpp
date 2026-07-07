@@ -92,6 +92,13 @@ public:
     // DONTNEED). Shrinks inward to page boundaries so neighboring tensors'
     // pages survive. No-op for pointers outside the mapped shards.
     void evict_range(const uint8_t* p, size_t n) const;
+    // Drop every shard's pages from this process and the page cache. Run
+    // before a sequential upload on a node whose RAM is already full of stale
+    // GGUF cache (e.g. from an earlier killed job): faulting into a full page
+    // cache pays synchronous direct-reclaim latency per page and collapses to
+    // random-fault NFS reads, so starting from a clean cache is faster even
+    // though warm ranges are re-read.
+    void evict_all() const;
 
     bool has_metadata(const std::string& key) const { return metadata_.count(key) != 0; }
     bool has_tensor(const std::string& name) const;

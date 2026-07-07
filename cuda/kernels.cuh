@@ -74,13 +74,17 @@ void embed_gather_q(uint32_t qtype, const uint8_t* qtable, const int* tokens,
 // top-k experts are read). gate/up are [E, moe_inter, hidden] (in=hidden),
 // down is [E, hidden, moe_inter] (in=moe_inter); row o of expert e lives at
 // base + (e*out + o)*row_bytes. h_act is caller scratch [n, topk, moe_inter].
-// out is zeroed and accumulated with topk weights.
+// out is zeroed and accumulated with topk weights. `dispatch` is optional int
+// scratch [3E+1 + n*topk]: when given and n*topk is large enough, the FFN runs
+// expert-major (tokens grouped by expert, 8-token weight-fragment reuse) —
+// ~8x fewer quant decodes at prefill; pass nullptr for the token-major path.
 void moe_expert_ffn_q(uint32_t gate_type, uint32_t up_type, uint32_t down_type,
                       const float* x, const int* topk_ids, const float* topk_w,
                       const uint8_t* gate_q, const uint8_t* up_q, const uint8_t* down_q,
                       int n, int topk, int hidden, int moe_inter, int E,
                       int64_t gate_row_bytes, int64_t up_row_bytes, int64_t down_row_bytes,
-                      float* h_act, float* out, cudaStream_t s = 0);
+                      float* h_act, float* out, int* dispatch = nullptr,
+                      cudaStream_t s = 0);
 
 // ---- attention -----------------------------------------------------------
 // Dense causal attention reading K/V from a paged cache. q[n,H,hd]; the cache

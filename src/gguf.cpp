@@ -483,6 +483,17 @@ uint64_t GGUFModel::prefault_payloads(int start, int stride) const {
     return total;
 }
 
+void GGUFModel::evict_all() const {
+    for (const auto& sh : shards_) {
+        if (sh.base)
+            ::madvise(const_cast<uint8_t*>(sh.base), static_cast<size_t>(sh.file_size),
+                      MADV_DONTNEED);
+        if (sh.fd >= 0)
+            ::posix_fadvise(sh.fd, 0, static_cast<off_t>(sh.file_size),
+                            POSIX_FADV_DONTNEED);
+    }
+}
+
 void GGUFModel::evict_range(const uint8_t* p, size_t n) const {
     if (!p || n == 0) return;
     for (const auto& sh : shards_) {
