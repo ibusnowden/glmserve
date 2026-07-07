@@ -94,6 +94,29 @@ void moe_expert_ffn_q(uint32_t gate_type, uint32_t up_type, uint32_t down_type,
                       float* h_act, float* out, int* dispatch = nullptr,
                       float* gu_part = nullptr, cudaStream_t s = 0);
 
+// ---- absorbed-MLA latent KV (cuda/mla_absorb.cu, fp16 dequant in qgemm.cu) --
+// Latent cache row = [normed c_kv (kvlat) | roped k_pe (rope)] in fp16, shared
+// by every head; decode attention runs absorbed (MQA over latents).
+void latent_store(const float* ckv, const float* kpe, __half* latent, int64_t start_pos,
+                  int64_t n, int64_t kvlat, int64_t rope, cudaStream_t s = 0);
+void mla_absorb_q(const float* q, const __half* kvb_f16, int64_t n_heads, int64_t qk,
+                  int64_t nope, int64_t vd, int64_t kvlat, int64_t rope, float* qhat,
+                  cudaStream_t s = 0);
+void mla_expand_o(const float* ohat, const __half* kvb_f16, int64_t n_heads, int64_t nope,
+                  int64_t vd, int64_t kvlat, float* out, cudaStream_t s = 0);
+// Key modes: indices != nullptr -> DSA top-k gather (negatives skipped);
+// else keys [j0, j0+n_keys) (j0=0 dense, j0>0 recent window). part_acc must
+// hold n_heads * max_splits * kvlat floats.
+void mla_attention_decode(const float* qhat, const __half* latent, const int* indices,
+                          int64_t j0, int64_t n_keys, int64_t qpos, int64_t n_heads,
+                          int64_t kvlat, int64_t rope, float scale, float* ohat,
+                          float* part_acc, float* part_m, float* part_l,
+                          int64_t max_splits, cudaStream_t s = 0);
+void convert_f32_f16(const float* src, int64_t n, __half* dst, cudaStream_t s = 0);
+// Batch-dequantize a device-resident GGUF quant weight [rows, in] to fp16.
+void dequant_rows_f16(uint32_t qtype, const uint8_t* qW, int64_t rows, int64_t in,
+                      int64_t row_bytes, __half* out, cudaStream_t s = 0);
+
 // ---- attention -----------------------------------------------------------
 // Dense causal attention reading K/V from a paged cache. q[n,H,hd]; the cache
 // stores K/V for absolute positions [0, ctx). block_table maps logical->phys.

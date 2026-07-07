@@ -340,6 +340,7 @@ inline void gemm_linear(const float* x, const DLinear& d, const float* bias,
 struct DLayer {
     float *input_norm = nullptr, *post_norm = nullptr;
     float *q_a_norm = nullptr, *kv_a_norm = nullptr;
+    __half* mla_kvb = nullptr;   // fp16 kv_b shard [heads, nope+vd, kvlat] (absorbed decode)
     DLinear q_a, q_b, kv_a, kv_b, o;
     DLinear index_wq_b, index_wk, index_weights;
     float* index_k_norm = nullptr;
@@ -379,12 +380,16 @@ struct Scratch {
     float* moe_h_act = nullptr;   // [n, topk, moe_inter] scratch for quant MoE
     int*   moe_dispatch = nullptr; // [3E+1 + n*topk] expert-major dispatch scratch
     float* moe_gu_part = nullptr;  // [2, kMoeSplitK, kMoeSplitKMaxTs, moe_inter] split-K partials
+    // Latent-KV mode: prefill-scratch per-head K/V (the cache holds latents
+    // only) + absorbed-decode q/o buffers.
+    float *kscr = nullptr, *vscr = nullptr;   // [cap, local_heads, hc]
+    float *qhat = nullptr, *ohat = nullptr;   // [heads, kvlat+rope] / [heads, kvlat]
 
     void free_all() {
         for (float* p : {hidden_d, normed, qa, q, kva, ckv, kpe, kvb, attn,
                          attn_proj, mlp, gbuf, ubuf, gu, rlogits, shbuf,
                          index_q, index_k, index_w, dsa_scores, topk_w, moe_h_act,
-                         moe_gu_part})
+                         moe_gu_part, kscr, vscr, qhat, ohat})
             if (p) cudaFree(p);
         if (d_tokens) cudaFree(d_tokens);
         if (topk_ids) cudaFree(topk_ids);
@@ -437,6 +442,11 @@ struct Scratch {
         moe_gu_part = dmalloc(2ll * glmserve::cuda::kMoeSplitK *
                               glmserve::cuda::kMoeSplitKMaxTs *
                               std::max<int64_t>(1, max_moe_inter));
+        const int64_t hc = c.kv_cache_head_dim();
+        kscr = dmalloc(n * nheads * hc);
+        vscr = dmalloc(n * nheads * hc);
+        qhat = dmalloc(nheads * (kvlat + rope));
+        ohat = dmalloc(nheads * kvlat);
         cap = n;
     }
 };
@@ -478,6 +488,12 @@ struct GpuState {
     // sequence's one logical block to it, so the paged-attention kernel runs
     // unchanged with block_size = max_ctx.
     std::vector<float*> Kc, Vc, Ic;
+    // Absorbed-MLA latent cache (GLMSERVE_LATENT_KV, default on): one fp16 row
+    // [kvlat + rope] per token per layer, shared by all local heads — replaces
+    // Kc/Vc for the trunk. Prefill materializes its own per-head K/V into
+    // Scratch (kscr/vscr); decode attends over latents directly.
+    bool latent = false;
+    std::vector<__half*> Lc;
     int64_t max_ctx = 0;
     int*   block_table = nullptr;    // single entry, value 0
     float* logits_d = nullptr;       // [vocab]
@@ -798,14 +814,55 @@ bool GLM52Model::upload_to_gpu(int64_t max_ctx) {
 
     // Persistent KV cache + small persistent buffers.
     const int64_t nheads = g->local_heads, hc = c.kv_cache_head_dim();
+    const int64_t kvlat = c.kv_lora_rank, rope = c.qk_rope_head_dim;
     g->max_ctx = max_ctx > 0 ? max_ctx : 4096;
+    // Absorbed-MLA latent cache (GLMSERVE_LATENT_KV=0 restores per-head fp32
+    // K/V): [max_ctx, kvlat+rope] fp16 per layer — 14x smaller per rank than
+    // Kc+Vc at GLM-5.2 dims. Requires an MLA config (kvlat > 0) and dims
+    // within the decode kernel's register fragment cap.
+    {
+        const char* e = std::getenv("GLMSERVE_LATENT_KV");
+        g->latent = kvlat > 0 && kvlat + rope <= 32 * 24 &&
+                    !(e && std::atoi(e) == 0);
+    }
     g->Kc.resize(layers_.size());
     g->Vc.resize(layers_.size());
     g->Ic.resize(layers_.size());
+    g->Lc.resize(layers_.size());
     for (size_t i = 0; i < layers_.size(); ++i) {
-        g->Kc[i] = dmalloc(g->max_ctx * nheads * hc);
-        g->Vc[i] = dmalloc(g->max_ctx * nheads * hc);
+        if (g->latent) {
+            if (cudaMalloc(&g->Lc[i], static_cast<size_t>(g->max_ctx) *
+                           (kvlat + rope) * sizeof(__half)) != cudaSuccess)
+                throw std::runtime_error("cudaMalloc for latent KV cache failed");
+        } else {
+            g->Kc[i] = dmalloc(g->max_ctx * nheads * hc);
+            g->Vc[i] = dmalloc(g->max_ctx * nheads * hc);
+        }
         g->Ic[i] = dmalloc(g->max_ctx * c.index_head_dim);
+    }
+    if (g->latent) {
+        // fp16 kv_b residency for the absorbed q/o projections.
+        for (size_t i = 0; i < layers_.size(); ++i) {
+            DLayer& d = g->layers[i];
+            const int64_t rows = d.kv_b.out, in = d.kv_b.in;
+            GLM_CHECK(in == kvlat, "kv_b input dim %lld != kv_lora_rank %lld",
+                      (long long)in, (long long)kvlat);
+            if (cudaMalloc(&d.mla_kvb, static_cast<size_t>(rows) * in *
+                           sizeof(__half)) != cudaSuccess)
+                throw std::runtime_error("cudaMalloc for fp16 kv_b failed");
+            if (d.kv_b.has_q())
+                glmserve::cuda::dequant_rows_f16(d.kv_b.qtype, d.kv_b.qdata, rows, in,
+                                                 d.kv_b.row_bytes, d.mla_kvb);
+            else if (d.kv_b.w)
+                glmserve::cuda::convert_f32_f16(d.kv_b.w, rows * in, d.mla_kvb);
+            else
+                GLM_CHECK(false, "latent KV requires a GGUF-quant or fp32 kv_b "
+                                 "(set GLMSERVE_LATENT_KV=0)");
+        }
+        GLM_INFO("latent KV cache: ctx=%lld x %lld fp16/layer (%.2f GiB total), "
+                 "absorbed decode on",
+                 (long long)g->max_ctx, (long long)(kvlat + rope),
+                 layers_.size() * g->max_ctx * (kvlat + rope) * 2.0 / 1073741824.0);
     }
     cudaMalloc(&g->block_table, sizeof(int));
     int zero = 0;
@@ -813,15 +870,16 @@ bool GLM52Model::upload_to_gpu(int64_t max_ctx) {
     if (dist_.is_last_stage())
         g->logits_d = dmalloc(c.vocab_size);
 
-    // Flash-decoding partials: [n_heads, kMaxSplits, hc] + [n_heads, kMaxSplits].
-    g->part_acc = dmalloc(nheads * kMaxSplits * hc);
+    // Flash-decoding partials: [n_heads, kMaxSplits, hc|kvlat] + [n_heads, kMaxSplits].
+    g->part_acc = dmalloc(nheads * kMaxSplits * std::max(hc, kvlat));
     g->part_m   = dmalloc(nheads * kMaxSplits);
     g->part_l   = dmalloc(nheads * kMaxSplits);
 
     // MTP/NextN draft block (single-rank only: the draft path needs embeddings
     // and the lm_head co-resident, and mtp_draft_logits_gpu mirrors the CPU
-    // reference which is single-rank).
-    if (mtp_ready() && dist_.world_size == 1) {
+    // reference which is single-rank). Not wired for the latent cache yet —
+    // its draft step is a suffix prefill, which the absorbed path rejects.
+    if (mtp_ready() && dist_.world_size == 1 && !g->latent) {
         const MTPBlock& m = mtp_blocks_[0];
         GpuMTP& gm = g->mtp;
         DLayer& d = gm.layer;
@@ -938,10 +996,12 @@ namespace {
 // Appends the layer's K/V to (Kc, Vc, Ic) at absolute offset `start_pos` and
 // attends over [0, start_pos+n). The cache buffers are always g->max_ctx
 // tokens deep (the attention kernels use g->max_ctx as the block size).
-// Returns the updated have_shared_dsa_indices flag.
+// With a latent cache (Lc != nullptr) the layer stores fp16 latents instead of
+// per-head K/V; prefill materializes its own K/V into Scratch and decode runs
+// the absorbed path. Returns the updated have_shared_dsa_indices flag.
 bool run_layer_step(GpuState* g, const GLM52Config& c, Communicator* comm,
                     const DistConfig& dist, const DLayer& d,
-                    float* Kc, float* Vc, float* Ic,
+                    float* Kc, float* Vc, float* Ic, __half* Lc,
                     int64_t n, int64_t start_pos, bool have_shared_dsa_indices) {
     using namespace glmserve::cuda;
     Scratch& s = g->sc;
@@ -973,15 +1033,43 @@ bool run_layer_step(GpuState* g, const GLM52Config& c, Communicator* comm,
     rope_k(s.kpe, n, rope, start_pos, c.rope_theta, il);
     rope_q(s.q, n, nheads, qk, nope, rope, start_pos, c.rope_theta, il);
 
-    float* Kbase = Kc + start_pos * nheads * hc;
-    float* Vbase = Vc + start_pos * nheads * hc;
-    assemble_kv(s.kvb, s.kpe, Kbase, Vbase, n, nheads, nope, rope, vd, hc);
+    // Per-head K/V for this call's tokens: into the persistent cache normally,
+    // or (latent mode) into Scratch for prefill only — the persistent record
+    // is the fp16 latent row, written for every token either way.
+    const float* Katt = Kc;
+    const float* Vatt = Vc;
+    if (Lc) {
+        latent_store(s.ckv, s.kpe, Lc, start_pos, n, kvlat, rope);
+        GLM_CHECK(n == 1 || start_pos == 0,
+                  "latent KV: suffix prefill (start_pos>0, n>1) is not supported "
+                  "(set GLMSERVE_LATENT_KV=0)");
+        if (n > 1) {
+            assemble_kv(s.kvb, s.kpe, s.kscr, s.vscr, n, nheads, nope, rope, vd, hc);
+            Katt = s.kscr;
+            Vatt = s.vscr;
+        }
+    } else {
+        float* Kbase = Kc + start_pos * nheads * hc;
+        float* Vbase = Vc + start_pos * nheads * hc;
+        assemble_kv(s.kvb, s.kpe, Kbase, Vbase, n, nheads, nope, rope, vd, hc);
+    }
     g_prof.mark("attn.kv_rope");
 
     const int64_t ctx_after = start_pos + n;
     const bool sparse_dsa = c.use_dsa && ctx_after > c.index_topk;
     const bool learned_dsa = sparse_dsa && d.index_wq_b.out > 0;
     const bool shared_dsa = sparse_dsa && !learned_dsa && have_shared_dsa_indices;
+    // Absorbed decode over latents (n == 1): score/value both read the shared
+    // fp16 latent rows once for all local heads; the DSA index selection above
+    // is unchanged (the indexer has its own fp32 Ic cache).
+    const bool absorbed = Lc != nullptr && n == 1;
+    auto latent_attn = [&](const int* idx, int64_t j0, int64_t n_keys) {
+        mla_absorb_q(s.q, d.mla_kvb, nheads, qk, nope, vd, kvlat, rope, s.qhat);
+        mla_attention_decode(s.qhat, Lc, idx, j0, n_keys, start_pos, nheads,
+                             kvlat, rope, scale, s.ohat,
+                             g->part_acc, g->part_m, g->part_l, kMaxSplits);
+        mla_expand_o(s.ohat, d.mla_kvb, nheads, nope, vd, kvlat, s.attn);
+    };
     if (learned_dsa) {
         gemm_linear(s.qa, d.index_wq_b, nullptr, s.index_q, n);
         gemm_linear(s.normed, d.index_wk, nullptr, s.index_k, n);
@@ -1001,23 +1089,38 @@ bool run_layer_step(GpuState* g, const GLM52Config& c, Communicator* comm,
                         s.dsa_indices, s.dsa_scores);
         have_shared_dsa_indices = true;
         g_prof.mark("dsa.index");
-        attention_dsa_indexed_paged(s.q, Kc, Vc, g->block_table,
-                                    s.dsa_indices, n, start_pos, nheads, nheads, qk,
-                                    g->max_ctx, c.index_topk, scale, s.attn);
+        if (absorbed)
+            latent_attn(s.dsa_indices, 0, c.index_topk);
+        else
+            attention_dsa_indexed_paged(s.q, Katt, Vatt, g->block_table,
+                                        s.dsa_indices, n, start_pos, nheads, nheads, qk,
+                                        g->max_ctx, c.index_topk, scale, s.attn);
     } else if (shared_dsa) {
-        attention_dsa_indexed_paged(s.q, Kc, Vc, g->block_table,
-                                    s.dsa_indices, n, start_pos, nheads, nheads, qk,
-                                    g->max_ctx, c.index_topk, scale, s.attn);
+        if (absorbed)
+            latent_attn(s.dsa_indices, 0, c.index_topk);
+        else
+            attention_dsa_indexed_paged(s.q, Katt, Vatt, g->block_table,
+                                        s.dsa_indices, n, start_pos, nheads, nheads, qk,
+                                        g->max_ctx, c.index_topk, scale, s.attn);
     } else if (sparse_dsa) {
-        attention_dsa_paged(s.q, Kc, Vc, g->block_table, n, start_pos,
-                            nheads, nheads, qk, g->max_ctx, c.index_topk, scale, s.attn, 0,
-                            g->part_acc, g->part_m, g->part_l, kMaxSplits);
+        if (absorbed) {
+            // Recent-window fallback (mirrors attention_dsa_paged).
+            const int64_t lo = ctx_after > c.index_topk ? ctx_after - c.index_topk : 0;
+            latent_attn(nullptr, lo, ctx_after - lo);
+        } else {
+            attention_dsa_paged(s.q, Katt, Vatt, g->block_table, n, start_pos,
+                                nheads, nheads, qk, g->max_ctx, c.index_topk, scale, s.attn, 0,
+                                g->part_acc, g->part_m, g->part_l, kMaxSplits);
+        }
     } else if (n == 1) {
-        attention_decode_paged(s.q, Kc, Vc, g->block_table, start_pos,
-                               nheads, nheads, qk, g->max_ctx, scale, s.attn,
-                               g->part_acc, g->part_m, g->part_l, kMaxSplits);
+        if (absorbed)
+            latent_attn(nullptr, 0, ctx_after);
+        else
+            attention_decode_paged(s.q, Katt, Vatt, g->block_table, start_pos,
+                                   nheads, nheads, qk, g->max_ctx, scale, s.attn,
+                                   g->part_acc, g->part_m, g->part_l, kMaxSplits);
     } else {
-        attention_dense_paged(s.q, Kc, Vc, g->block_table, n, start_pos,
+        attention_dense_paged(s.q, Katt, Vatt, g->block_table, n, start_pos,
                               nheads, nheads, qk, g->max_ctx, scale, s.attn);
     }
     dbg_csum("attn(local)", s.attn, n * nheads * vd);
@@ -1101,6 +1204,7 @@ bool run_block_stack(GpuState* g, const GLM52Config& c, Communicator* comm,
         have_shared_dsa_indices =
             run_layer_step(g, c, comm, dist, g->layers[l],
                            g->Kc[l], g->Vc[l], g->Ic[l],
+                           g->latent ? g->Lc[l] : nullptr,
                            n, start_pos, have_shared_dsa_indices);
     }
     return have_shared_dsa_indices;
@@ -1329,7 +1433,7 @@ std::vector<float> GLM52Model::mtp_draft_logits_gpu(const std::vector<int>& cont
         gemm_linear(gm.fused, gm.eh_proj, nullptr, g->sc.hidden_d, 1);
 
         run_layer_step(g, cfg_, comm_, dist_, gm.layer, gm.Kc, gm.Vc, gm.Ic,
-                       /*n=*/1, /*start_pos=*/s, false);
+                       /*Lc=*/nullptr, /*n=*/1, /*start_pos=*/s, false);
         cudaMemcpy(gm.prev, g->sc.hidden_d, H * sizeof(float), cudaMemcpyDeviceToDevice);
 
         rmsnorm(g->sc.hidden_d, gm.shared_head_norm, g->sc.normed, 1, H, eps);
@@ -1360,6 +1464,7 @@ GLM52Model::~GLM52Model() {
                              &d.gate, &d.up, &d.down, &d.router,
                              &d.sh_gate, &d.sh_up, &d.sh_down})
             free_lin(*lin);
+        if (d.mla_kvb) cudaFree(d.mla_kvb);
     }
     if (g->mtp.ready) {
         GpuMTP& gm = g->mtp;
@@ -1385,6 +1490,7 @@ GLM52Model::~GLM52Model() {
     for (float* p : g->Kc) if (p) cudaFree(p);
     for (float* p : g->Vc) if (p) cudaFree(p);
     for (float* p : g->Ic) if (p) cudaFree(p);
+    for (__half* p : g->Lc) if (p) cudaFree(p);
     if (g->block_table) cudaFree(g->block_table);
     if (g->logits_d) cudaFree(g->logits_d);
     if (g->part_acc) cudaFree(g->part_acc);

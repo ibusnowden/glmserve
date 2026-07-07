@@ -389,6 +389,35 @@ void dequant_row_q(uint32_t qtype, const uint8_t* qW, float* dst, int64_t in,
     dequant_row_q_kernel<<<1, kWarpsPerBlock * 32, 0, s>>>(qW, dst, (int)in, qtype);
 }
 
+// Batch-dequantize a quant weight [rows, in] into fp16 (one block per row):
+// used to keep kv_b resident in fp16 for the absorbed-MLA decode path.
+__global__ void dequant_rows_f16_kernel(const uint8_t* __restrict__ qW, int64_t in,
+                                        int64_t row_bytes, uint32_t type,
+                                        __half* __restrict__ out) {
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int64_t r = blockIdx.x;
+    const uint8_t* wrow = qW + (size_t)r * row_bytes;
+    const int gbytes = qgroup_bytes(type);
+    const int ngroups = (int)((in + 255) >> 8);
+    for (int g = warp; g < ngroups; g += kWarpsPerBlock) {
+        const int idx0 = (g << 8) + (lane << 3);
+        const int64_t rem = in - idx0;
+        if (rem <= 0) continue;
+        float w8[8];
+        dq8(type, wrow + (size_t)g * gbytes, lane, w8);
+        const int cnt = rem >= 8 ? 8 : (int)rem;
+        for (int j = 0; j < cnt; ++j)
+            out[(size_t)r * in + idx0 + j] = __float2half(w8[j]);
+    }
+}
+
+void dequant_rows_f16(uint32_t qtype, const uint8_t* qW, int64_t rows, int64_t in,
+                      int64_t row_bytes, __half* out, cudaStream_t s) {
+    seed_tables();
+    dequant_rows_f16_kernel<<<(unsigned)rows, kWarpsPerBlock * 32, 0, s>>>(
+        qW, in, row_bytes, qtype, out);
+}
+
 // ---- MoE expert FFN (only active top-k experts are read) ------------------
 // gate/up are [E, out=moe_inter, in=hidden] (row o of expert e at
 // base + (e*moe_inter + o)*row_bytes); down is [E, out=hidden, in=moe_inter].
