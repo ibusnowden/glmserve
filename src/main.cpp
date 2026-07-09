@@ -361,9 +361,10 @@ int cmd_tokgen(const Args& a) {
 
     Engine engine(o);
     Completion c = engine.generate_tokens(prompt, p, nullptr);
-    std::printf("tokgen: prompt=%d generated=%d finish=%s mtp=%s groups=%d accepted=%d rejected=%d\n",
+    std::printf("tokgen: prompt=%d generated=%d finish=%s mtp=%s groups=%d accepted=%d rejected=%d ngram_groups=%d\n",
                 c.prompt_tokens, c.completion_tokens, c.finish_reason.c_str(),
-                c.mtp_used ? "on" : "off", c.mtp_groups, c.mtp_accepted, c.mtp_rejected);
+                c.mtp_used ? "on" : "off", c.mtp_groups, c.mtp_accepted, c.mtp_rejected,
+                c.ngram_groups);
     std::printf("  tokens: ");
     for (int t : c.tokens) std::printf("%d ", t);
     std::printf("\n");
@@ -448,8 +449,9 @@ int cmd_bench(const Args& a) {
         std::printf("decode         : %d tok in %.2f ms  = %.1f tok/s  (%.3f ms/tok)\n",
                     r.gen_len, r.decode_ms, r.decode_tps(), r.decode_ms_per_tok());
         if (r.spec_groups > 0)
-            std::printf("speculative    : %d groups, %.2f tok/group accepted (draft_k=%d)%s\n",
-                        r.spec_groups, (double)r.spec_accepted / r.spec_groups, draft_k,
+            std::printf("speculative    : %d groups (%d ngram), %.2f tok/group accepted (draft_k=%d)%s\n",
+                        r.spec_groups, r.spec_ngram_groups,
+                        (double)r.spec_accepted / r.spec_groups, draft_k,
                         r.spec_fallback ? " adaptive-fallback" : "");
         std::printf("target         : 1300 tok/s  (prefill %.0f%%, decode %.0f%%)\n",
                     100.0 * r.prefill_tps() / 1300.0, 100.0 * r.decode_tps() / 1.0);

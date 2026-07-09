@@ -49,6 +49,7 @@ struct Completion {
     int mtp_groups = 0;
     int mtp_accepted = 0;
     int mtp_rejected = 0;
+    int ngram_groups = 0;                   // groups drafted by n-gram lookup (not MTP)
 };
 
 class Engine {
@@ -94,6 +95,7 @@ public:
         double prefill_ms = 0, decode_ms = 0;
         bool   gpu = false;
         int    spec_groups = 0, spec_accepted = 0;   // draft_k > 0 only
+        int    spec_ngram_groups = 0;                // groups drafted by n-gram lookup
         bool   spec_fallback = false;                // adaptive GPU spec fallback
         double prefill_tps() const { return prefill_ms > 0 ? prompt_len / (prefill_ms / 1e3) : 0; }
         double decode_tps()  const { return decode_ms  > 0 ? gen_len    / (decode_ms  / 1e3) : 0; }

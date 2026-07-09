@@ -79,6 +79,49 @@ static bool gpu_spec_should_fallback(int groups, int accepted) {
     return static_cast<double>(accepted) / groups < min_accept;
 }
 
+// N-gram lookup drafter (llama.cpp lookup-decoding style): the trailing
+// (m-1)-gram of the context plus the committed seed token is searched backward
+// through the context; on a hit the tokens that followed the previous
+// occurrence become the draft. Pure CPU and deterministic from (ctx, seed), so
+// every TP rank drafts the identical chunk without a collective. A wrong draft
+// costs only rejected verify rows — the longest-prefix accept keeps the output
+// stream equal to plain greedy decode regardless of draft origin.
+// GLMSERVE_SPEC_NGRAM=0 disables; GLMSERVE_SPEC_NGRAM_MIN sets the minimum
+// match length m (default 3: seed + 2 committed tokens).
+static std::vector<int> ngram_draft(const std::vector<int>& ctx, int seed, int max_k) {
+    static const bool enabled = [] {
+        const char* v = std::getenv("GLMSERVE_SPEC_NGRAM");
+        return !(v && *v && *v == '0');
+    }();
+    if (!enabled || max_k <= 0) return {};
+    const int m_min = std::max(2, env_int("GLMSERVE_SPEC_NGRAM_MIN", 3));
+    const int64_t n = static_cast<int64_t>(ctx.size());
+    for (int m = std::max(m_min, 4); m >= m_min; --m) {
+        if (n < m) continue;
+        // pattern = ctx[n-m+1 .. n-1] + seed; a match ending at ctx[j] drafts
+        // ctx[j+1 ..]. Scan backward for the most recent match whose
+        // continuation fills max_k — inside a token run the latest match sits
+        // at the tail with a 1-token continuation, so latest-match-only would
+        // never draft more than one token.
+        int64_t best_j = -1;
+        int best_len = 0;
+        for (int64_t j = n - 2; j >= m - 1; --j) {
+            if (ctx[j] != seed) continue;
+            bool hit = true;
+            for (int t = 1; t < m; ++t)
+                if (ctx[j - t] != ctx[n - t]) { hit = false; break; }
+            if (!hit) continue;
+            const int len = static_cast<int>(std::min<int64_t>(n - (j + 1), max_k));
+            if (len > best_len) { best_len = len; best_j = j; }
+            if (best_len >= max_k) break;
+        }
+        if (best_j >= 0)
+            return std::vector<int>(ctx.begin() + best_j + 1,
+                                    ctx.begin() + best_j + 1 + best_len);
+    }
+    return {};
+}
+
 static std::string gen_id(const char* prefix) {
     static std::atomic<uint64_t> ctr{0};
     return std::string(prefix) + std::to_string(now_unix()) + "-" +
@@ -313,17 +356,28 @@ Completion Engine::run(const std::vector<int>& prompt_in, const SamplingParams& 
                 if (L + group_k > model_->gpu_kv_ctx()) { c.finish_reason = "length"; break; }
                 std::vector<int> chunk;
                 chunk.push_back(gpu_seed);
-                if (group_k > 1) {
-                    std::vector<int> ds = model_->mtp_gpu_draft(chunk[0], group_k - 1);
-                    chunk.insert(chunk.end(), ds.begin(), ds.end());
+                // Drafts: n-gram lookup when it can match MTP's length (it may
+                // draft past group_k, up to the verify-chunk cap), else MTP.
+                const int draft_cap = static_cast<int>(std::min<int64_t>(
+                    std::min(kSpecGroupMax, remaining),
+                    model_->gpu_kv_ctx() - L)) - 1;
+                std::vector<int> ds = ngram_draft(all_tokens, chunk[0], draft_cap);
+                const bool from_ngram =
+                    !ds.empty() && static_cast<int>(ds.size()) >= group_k - 1;
+                if (!from_ngram) {
+                    ds.clear();
+                    if (group_k > 1) ds = model_->mtp_gpu_draft(chunk[0], group_k - 1);
                 }
+                chunk.insert(chunk.end(), ds.begin(), ds.end());
+                const int chunk_n = static_cast<int>(chunk.size());
                 ++c.mtp_groups;
+                if (from_ngram) ++c.ngram_groups;
                 std::vector<int> am;
                 model_->forward_gpu_chunk_greedy(chunk, L, &am);
                 int a = 1;
-                while (a < group_k && chunk[a] == am[a - 1]) ++a;
+                while (a < chunk_n && chunk[a] == am[a - 1]) ++a;
                 c.mtp_accepted += a;
-                if (a < group_k) ++c.mtp_rejected;
+                if (a < chunk_n) ++c.mtp_rejected;
                 model_->gpu_rewind(L + a);
                 bool finish_generation = false;
                 for (int i = 0; i < a; ++i) {
@@ -498,6 +552,7 @@ Engine::BenchResult Engine::profile(int prompt_len, int gen_len, int draft_k) {
             model_->mtp_gpu_absorb(
                 std::vector<int>(prompt.begin() + row0 + 1, prompt.end()), row0);
             int seed = host_argmax(logits);
+            std::vector<int> all_tokens = prompt;  // n-gram drafter history
             int64_t L = prompt_len;
             int gen = 0;
             Timer td;
@@ -505,6 +560,7 @@ Engine::BenchResult Engine::profile(int prompt_len, int gen_len, int draft_k) {
                 if (r.spec_fallback) {
                     if (L >= model_->gpu_kv_ctx()) break;
                     logits = model_->forward_gpu_decode(seed, L);
+                    all_tokens.push_back(seed);
                     seed = host_argmax(logits);
                     ++L;
                     ++gen;
@@ -514,15 +570,25 @@ Engine::BenchResult Engine::profile(int prompt_len, int gen_len, int draft_k) {
                 if (L + group_k > model_->gpu_kv_ctx()) break;
                 std::vector<int> chunk;
                 chunk.push_back(seed);
-                if (group_k > 1) {
-                    std::vector<int> ds = model_->mtp_gpu_draft(chunk[0], group_k - 1);
-                    chunk.insert(chunk.end(), ds.begin(), ds.end());
+                const int draft_cap = static_cast<int>(std::min<int64_t>(
+                    std::min(kSpecGroupMax, gen_len - gen),
+                    model_->gpu_kv_ctx() - L)) - 1;
+                std::vector<int> ds = ngram_draft(all_tokens, chunk[0], draft_cap);
+                const bool from_ngram =
+                    !ds.empty() && static_cast<int>(ds.size()) >= group_k - 1;
+                if (!from_ngram) {
+                    ds.clear();
+                    if (group_k > 1) ds = model_->mtp_gpu_draft(chunk[0], group_k - 1);
                 }
+                chunk.insert(chunk.end(), ds.begin(), ds.end());
+                const int chunk_n = static_cast<int>(chunk.size());
+                if (from_ngram) ++r.spec_ngram_groups;
                 std::vector<int> am;
                 model_->forward_gpu_chunk_greedy(chunk, L, &am);
                 int a = 1;
-                while (a < group_k && chunk[a] == am[a - 1]) ++a;
+                while (a < chunk_n && chunk[a] == am[a - 1]) ++a;
                 model_->gpu_rewind(L + a);
+                all_tokens.insert(all_tokens.end(), chunk.begin(), chunk.begin() + a);
                 seed = am[a - 1];
                 L += a;
                 gen += a;
@@ -714,26 +780,36 @@ Engine::MTPCheck Engine::check_mtp_speculative(const std::vector<int>& prompt, i
         }
         int64_t L = static_cast<int64_t>(prompt.size());
         int seed = host_argmax(logits);
+        std::vector<int> all_tokens = prompt;  // n-gram drafter history
         while (static_cast<int>(r.output_tokens.size()) < steps) {
             const int remaining = steps - static_cast<int>(r.output_tokens.size());
             const int group_k = std::min({draft_k, remaining, kSpecGroupMax});
             std::vector<int> chunk;
             chunk.push_back(seed);
-            if (group_k > 1) {
-                std::vector<int> ds = model_->mtp_gpu_draft(chunk[0], group_k - 1);
-                chunk.insert(chunk.end(), ds.begin(), ds.end());
+            const int draft_cap = static_cast<int>(std::min<int64_t>(
+                std::min(kSpecGroupMax, remaining),
+                model_->gpu_kv_ctx() - L)) - 1;
+            std::vector<int> ds = ngram_draft(all_tokens, chunk[0], draft_cap);
+            const bool from_ngram =
+                !ds.empty() && static_cast<int>(ds.size()) >= group_k - 1;
+            if (!from_ngram) {
+                ds.clear();
+                if (group_k > 1) ds = model_->mtp_gpu_draft(chunk[0], group_k - 1);
             }
+            chunk.insert(chunk.end(), ds.begin(), ds.end());
+            const int chunk_n = static_cast<int>(chunk.size());
             ++r.groups;
             std::vector<int> am;
             model_->forward_gpu_chunk_greedy(chunk, L, &am);
             int a = 1;
-            for (int i = 1; i < group_k; ++i) {
+            for (int i = 1; i < chunk_n; ++i) {
                 r.proposed_tokens.push_back(chunk[i]);
                 r.target_tokens.push_back(am[i - 1]);
             }
-            while (a < group_k && chunk[a] == am[a - 1]) ++a;
+            while (a < chunk_n && chunk[a] == am[a - 1]) ++a;
             r.accepted += a;
-            if (a < group_k) ++r.rejected;
+            if (a < chunk_n) ++r.rejected;
+            all_tokens.insert(all_tokens.end(), chunk.begin(), chunk.begin() + a);
             model_->gpu_rewind(L + a);
             model_->mtp_gpu_absorb(std::vector<int>(chunk.begin() + 1, chunk.begin() + a), L);
             for (int i = 0; i < a && static_cast<int>(r.output_tokens.size()) < steps; ++i)
