@@ -222,6 +222,20 @@ if [[ "$PHASES" == *S* ]]; then
     done
 fi
 
+if [[ "$PHASES" == *R* ]]; then
+    # Real-prompt spec-decode bench: acceptance is meaningless on the synthetic
+    # pseudo-random prompt (phase S falls back after the probe window), so this
+    # is the number that answers llama.cpp's ngram-mod serving throughput.
+    # diverse = README text (honest case), repetitive = looped paragraph
+    # (llama.cpp measures ~120 tok/s here via 100% ngram acceptance).
+    for PF in ${GLMSERVE_PROMPT_FILES:-bench/prompts/diverse_1024.ids bench/prompts/repetitive_1024.ids}; do
+        echo "=== phase R: TP=8 real-prompt spec bench ($PF, draft_k=${GLMSERVE_DRAFT_K:-4}) ==="
+        run_tp8 "$BIN" bench --model "$GGUF" --gpu --ctx "$CTX" \
+            --prompt-file "$PF" --gen-len "$GEN_LEN" \
+            --mtp-draft-k "${GLMSERVE_DRAFT_K:-4}"
+    done
+fi
+
 if [[ "$PHASES" == *E* ]]; then
     # Long-context decode-at-depth probe: the fp16 latent cache + fp16 indexer
     # cache keep 16K ctx at ~1.7 GiB/rank; decode beyond index_topk=2048 runs

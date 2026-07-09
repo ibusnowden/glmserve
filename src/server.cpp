@@ -520,19 +520,28 @@ static int host_argmax_row(const float* v, int64_t n) {
     return a;
 }
 
-Engine::BenchResult Engine::profile(int prompt_len, int gen_len, int draft_k) {
+Engine::BenchResult Engine::profile(int prompt_len, int gen_len, int draft_k,
+                                    const std::vector<int>* prompt_ids) {
     std::lock_guard<std::mutex> guard(gen_mu_);
     ensure_gpu();
+
+    if (prompt_ids && !prompt_ids->empty())
+        prompt_len = static_cast<int>(prompt_ids->size());
 
     BenchResult r;
     r.prompt_len = prompt_len;
     r.gen_len = gen_len;
     r.gpu = gpu_active_;
 
-    // Synthetic but valid token ids (deterministic, spread across the vocab).
+    // Synthetic but valid token ids (deterministic, spread across the vocab),
+    // unless the caller supplied real ones.
     std::vector<int> prompt(prompt_len);
-    for (int i = 0; i < prompt_len; ++i)
-        prompt[i] = static_cast<int>((static_cast<int64_t>(i) * 1234577 + 7) % cfg_.vocab_size);
+    if (prompt_ids && !prompt_ids->empty()) {
+        prompt = *prompt_ids;
+    } else {
+        for (int i = 0; i < prompt_len; ++i)
+            prompt[i] = static_cast<int>((static_cast<int64_t>(i) * 1234577 + 7) % cfg_.vocab_size);
+    }
 
     if (gpu_active_) {
         // Warm-up prefill (primes cuBLAS, allocates scratch/KV) — not timed.

@@ -21,6 +21,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdint>
+#include <fstream>
 #include <map>
 #include <set>
 #include <sstream>
@@ -429,6 +430,19 @@ int cmd_bench(const Args& a) {
     int prompt_len = static_cast<int>(a.get_int("prompt-len", 512));
     int gen_len    = static_cast<int>(a.get_int("gen-len", 128));
     int draft_k    = static_cast<int>(a.get_int("mtp-draft-k", 0));
+    // Real token ids (whitespace-separated) instead of the synthetic prompt —
+    // spec-decode acceptance is only meaningful on real text.
+    std::vector<int> prompt_ids;
+    std::string prompt_file = a.get("prompt-file");
+    if (!prompt_file.empty()) {
+        std::ifstream f(prompt_file);
+        GLM_CHECK(f.good(), "cannot open --prompt-file %s", prompt_file.c_str());
+        std::stringstream ss;
+        ss << f.rdbuf();
+        prompt_ids = parse_int_list(ss.str());
+        GLM_CHECK(!prompt_ids.empty(), "--prompt-file %s has no token ids", prompt_file.c_str());
+        prompt_len = static_cast<int>(prompt_ids.size());
+    }
     // Make sure the device KV cache spans prompt + generation.
     if (o.max_model_len < prompt_len + gen_len + 1)
         o.max_model_len = prompt_len + gen_len + 1;
@@ -439,7 +453,8 @@ int cmd_bench(const Args& a) {
         std::fprintf(stderr, "--- benchmark: prompt_len=%d gen_len=%d draft_k=%d (world=%d tp=%d pp=%d rank=%d) ---\n",
                      prompt_len, gen_len, draft_k, engine.dist().world_size,
                      engine.dist().tp_size, engine.dist().pp_size, engine.dist().rank);
-    Engine::BenchResult r = engine.profile(prompt_len, gen_len, draft_k);
+    Engine::BenchResult r = engine.profile(prompt_len, gen_len, draft_k,
+                                           prompt_ids.empty() ? nullptr : &prompt_ids);
     engine.barrier();
 
     if (root) {

@@ -101,7 +101,10 @@ public:
         double decode_tps()  const { return decode_ms  > 0 ? gen_len    / (decode_ms  / 1e3) : 0; }
         double decode_ms_per_tok() const { return gen_len ? decode_ms / gen_len : 0; }
     };
-    BenchResult profile(int prompt_len, int gen_len, int draft_k = 0);
+    // prompt_ids overrides the synthetic prompt (real-text spec-decode bench:
+    // draft acceptance is meaningless on pseudo-random tokens).
+    BenchResult profile(int prompt_len, int gen_len, int draft_k = 0,
+                        const std::vector<int>* prompt_ids = nullptr);
 
     // Correctness probe for the incremental GPU decode: greedily generate `steps`
     // tokens two ways — the incremental KV path (forward_gpu_decode) vs the
