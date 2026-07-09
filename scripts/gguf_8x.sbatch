@@ -62,8 +62,15 @@ if [ ! -f "$GGUF/$(ls "$GGUF" | grep -m1 '00001-of')" ]; then
 fi
 
 JOBS="${GLMSERVE_BUILD_JOBS:-8}"
-echo "=== build GPU=1 ==="
-make GPU=1 -j"$JOBS"
+if [ "${GLMSERVE_SKIP_BUILD:-0}" = 1 ]; then
+    # Caller guarantees build/glmserve is current. Avoids the in-job rebuild
+    # racing an interactive login-node build of the same NFS build/ dir
+    # (write-write on build/glmserve corrupted the staged binary, job 145319).
+    echo "=== build skipped (GLMSERVE_SKIP_BUILD=1) ==="
+else
+    echo "=== build GPU=1 ==="
+    make GPU=1 -j"$JOBS"
+fi
 
 # Run from a node-local copy: the NFS build/glmserve is demand-paged, so a
 # login-node rebuild mid-job truncates the mapped ELF -> SIGBUS on all ranks
