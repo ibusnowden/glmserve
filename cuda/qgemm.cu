@@ -24,6 +24,7 @@
 #include "gguf_quant.hpp"
 
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 
 namespace glmserve {
@@ -495,6 +496,23 @@ __device__ __forceinline__ float frag_dot(const float* w, const float* xt, int r
 
 constexpr int kWarpsPerBlock = 8;
 
+// Expert-major shared-decode tiles engage above this many token-slots: below
+// it experts see too few tokens for the 64-token tile to amortize anything and
+// the (rows x E) grid only adds launch overhead.
+constexpr int kMoeSmemMinTs = 2048;
+
+// GLMSERVE_SMEM=1 enables the shared-decode (non-tensor-core) tile kernels.
+// Default OFF: the mma path supersedes them for every prefill-hot case, and
+// the stub A/B showed the smem MoE variant REGRESSES vs the register-tile
+// kernel (135 -> 227 ms — prefill MoE is instruction-bound, not decode-bound).
+static bool smem_kernels_enabled() {
+    static const bool on = [] {
+        const char* v = std::getenv("GLMSERVE_SMEM");
+        return v && *v && *v == '1';
+    }();
+    return on;
+}
+
 bool qtype_has_i8(uint32_t qtype) {
     switch (qtype) {
         case QTYPE_Q8_0: case QTYPE_Q3_K: case QTYPE_Q4_K: case QTYPE_Q5_K:
@@ -605,6 +623,64 @@ __global__ void gemv_q_kernel(const float* __restrict__ x, const int8_t* __restr
     }
 }
 
+// Shared-decode prefill GEMM: one output row x one 64-token tile per block.
+// Each of the 8 warps decodes one 256-element group of the row into shared
+// WFrags, then every warp dots the whole decoded chunk against its own 8
+// tokens — the decode (the expensive half of dq8/dq8i) runs once per 64
+// tokens instead of once per 8. Per token the groups still accumulate in
+// ascending order into the same per-lane partials, so results are bitwise
+// identical to gemv_q_kernel.
+template <bool I8>
+__global__ void gemm_q_smem_kernel(const float* __restrict__ x, const int8_t* __restrict__ xq,
+                                   const float* __restrict__ xs, const uint8_t* __restrict__ qW,
+                                   const float* __restrict__ bias, float* __restrict__ y,
+                                   int n, int in, int out, int64_t row_bytes, uint32_t type) {
+    constexpr int kChunk = kWarpsPerBlock;
+    constexpr int kTok = 8;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int o = blockIdx.x;
+    const uint8_t* wrow = qW + (size_t)o * row_bytes;
+    const int gbytes = qgroup_bytes(type);
+    const int ngroups = (in + 255) >> 8;
+    __shared__ WFrag<I8> sh[kChunk][32];
+    const int tb = blockIdx.y * (kChunk * kTok) + warp * kTok;
+    const int B = min(kTok, n - tb);  // <= 0 marks an idle warp (still syncs)
+    float acc[kTok];
+    #pragma unroll
+    for (int t = 0; t < kTok; ++t) acc[t] = 0.0f;
+    for (int gc = 0; gc < ngroups; gc += kChunk) {
+        const int gd = gc + warp;
+        if (gd < ngroups && ((gd << 8) + (lane << 3)) < in)
+            sh[warp][lane].decode(type, wrow + (size_t)gd * gbytes, lane);
+        __syncthreads();
+        const int gn = min(kChunk, ngroups - gc);
+        for (int gi = 0; gi < gn; ++gi) {
+            const int idx0 = ((gc + gi) << 8) + (lane << 3);
+            const int rem = in - idx0;
+            if (rem <= 0) continue;
+            #pragma unroll
+            for (int t = 0; t < kTok; ++t)
+                if (t < B) acc[t] += sh[gi][lane].dot(
+                    ActView<I8>(x, xq, xs, (size_t)(tb + t), in), idx0, rem);
+        }
+        __syncthreads();
+    }
+    #pragma unroll
+    for (int t = 0; t < kTok; ++t) {
+        if (t >= B) continue;
+        const float r = warp_reduce_sum(acc[t]);
+        if (lane == 0) y[(size_t)(tb + t) * out + o] = bias ? (r + bias[o]) : r;
+    }
+}
+
+// Defined with the other mma kernels below.
+static bool mma_type_ok(uint32_t type);
+static bool mma_kernels_enabled();
+__global__ void gemm_q_mma_s8_kernel(const int8_t* xq, const float* xs,
+                                     const uint8_t* qW, const float* bias, float* y,
+                                     int n, int K, int out, int64_t row_bytes,
+                                     uint32_t type);
+
 template <bool I8>
 static void gemm_q_launch(uint32_t qtype, const float* x, const int8_t* xq, const float* xs,
                           const uint8_t* qW, const float* bias, float* y, int64_t n,
@@ -612,6 +688,21 @@ static void gemm_q_launch(uint32_t qtype, const float* x, const int8_t* xq, cons
     seed_tables();
     const dim3 grid((unsigned)((out + kWarpsPerBlock - 1) / kWarpsPerBlock));
     const int threads = kWarpsPerBlock * 32;
+    if (I8 && n >= 64 && mma_kernels_enabled() && mma_type_ok(qtype) &&
+        (out & 15) == 0 && (in & 255) == 0) {
+        const dim3 gm((unsigned)(out / 16), (unsigned)((n + 63) / 64));
+        gemm_q_mma_s8_kernel<<<gm, 256, 0, s>>>(xq, xs, qW, bias, y, (int)n,
+                                                (int)in, (int)out, row_bytes, qtype);
+        return;
+    }
+    if (n >= 64 && smem_kernels_enabled()) {
+        // Shared-decode tile kernel: covers all n in one launch (last tile
+        // partial; idle warps keep the barriers uniform).
+        const dim3 g2((unsigned)out, (unsigned)((n + 63) / 64));
+        gemm_q_smem_kernel<I8><<<g2, threads, 0, s>>>(x, xq, xs, qW, bias, y, (int)n,
+                                                      (int)in, (int)out, row_bytes, qtype);
+        return;
+    }
     int64_t t0 = 0;
     while (n - t0 >= 8) {
         gemv_q_kernel<8, I8><<<grid, threads, 0, s>>>(x, xq, xs, qW, bias, y, (int)t0,
@@ -964,6 +1055,344 @@ __global__ void moe_down_q_emajor_kernel(const int* __restrict__ ts_sorted,
     }
 }
 
+// Shared-decode expert-major gate/up: one (expert, output row) per block, the
+// 8 warps split each 64-token tile and share the decoded weight chunk (see
+// gemm_q_smem_kernel). Bitwise-identical accumulation order to the T=8
+// register-tile kernel above.
+template <bool I8>
+__global__ void moe_gate_up_q_emajor_smem_kernel(const float* __restrict__ x,
+                                                 const int8_t* __restrict__ xq,
+                                                 const float* __restrict__ xs,
+                                                 const int* __restrict__ ts_sorted,
+                                                 const int* __restrict__ offsets,
+                                                 const uint8_t* __restrict__ gate_q,
+                                                 const uint8_t* __restrict__ up_q,
+                                                 int topk, int hidden, int moe_inter,
+                                                 int64_t gate_row_bytes, int64_t up_row_bytes,
+                                                 uint32_t gate_type, uint32_t up_type,
+                                                 float* __restrict__ h_act) {
+    constexpr int kChunk = kWarpsPerBlock;
+    constexpr int kTok = 8;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int f = blockIdx.x;
+    const int e = blockIdx.y;
+    const int beg = offsets[e], end = offsets[e + 1];
+    if (beg == end) return;  // block-uniform: safe before any barrier
+    const uint8_t* grow = gate_q + ((size_t)e * moe_inter + f) * gate_row_bytes;
+    const uint8_t* urow = up_q + ((size_t)e * moe_inter + f) * up_row_bytes;
+    const int g_gbytes = qgroup_bytes(gate_type);
+    const int u_gbytes = qgroup_bytes(up_type);
+    const int ngroups = (hidden + 255) >> 8;
+    __shared__ WFrag<I8> shg[kChunk][32];
+    __shared__ WFrag<I8> shu[kChunk][32];
+    for (int base = beg; base < end; base += kChunk * kTok) {
+        const int tb = base + warp * kTok;
+        const int B = min(kTok, end - tb);
+        int ts[kTok];
+        #pragma unroll
+        for (int j = 0; j < kTok; ++j)
+            if (j < B) ts[j] = ts_sorted[tb + j];
+        float g8[kTok], u8[kTok];
+        #pragma unroll
+        for (int j = 0; j < kTok; ++j) { g8[j] = 0.0f; u8[j] = 0.0f; }
+        for (int gc = 0; gc < ngroups; gc += kChunk) {
+            const int gd = gc + warp;
+            if (gd < ngroups && ((gd << 8) + (lane << 3)) < hidden) {
+                shg[warp][lane].decode(gate_type, grow + (size_t)gd * g_gbytes, lane);
+                shu[warp][lane].decode(up_type, urow + (size_t)gd * u_gbytes, lane);
+            }
+            __syncthreads();
+            const int gn = min(kChunk, ngroups - gc);
+            for (int gi = 0; gi < gn; ++gi) {
+                const int idx0 = ((gc + gi) << 8) + (lane << 3);
+                const int rem = hidden - idx0;
+                if (rem <= 0) continue;
+                #pragma unroll
+                for (int j = 0; j < kTok; ++j) {
+                    if (j >= B) continue;
+                    const ActView<I8> a(x, xq, xs, (size_t)(ts[j] / topk), hidden);
+                    g8[j] += shg[gi][lane].dot(a, idx0, rem);
+                    u8[j] += shu[gi][lane].dot(a, idx0, rem);
+                }
+            }
+            __syncthreads();
+        }
+        #pragma unroll
+        for (int j = 0; j < kTok; ++j) {
+            if (j >= B) continue;
+            const float g = warp_reduce_sum(g8[j]);
+            const float u = warp_reduce_sum(u8[j]);
+            if (lane == 0) h_act[(size_t)ts[j] * moe_inter + f] = silu(g) * u;
+        }
+    }
+}
+
+// Shared-decode expert-major down projection (same tiling as gate/up).
+template <bool I8>
+__global__ void moe_down_q_emajor_smem_kernel(const int* __restrict__ ts_sorted,
+                                              const int* __restrict__ offsets,
+                                              const uint8_t* __restrict__ down_q,
+                                              const float* __restrict__ h_act,
+                                              const int8_t* __restrict__ hq,
+                                              const float* __restrict__ hs,
+                                              int hidden, int moe_inter,
+                                              int64_t down_row_bytes, uint32_t down_type,
+                                              float* __restrict__ dpart) {
+    constexpr int kChunk = kWarpsPerBlock;
+    constexpr int kTok = 8;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int o = blockIdx.x;
+    const int e = blockIdx.y;
+    const int beg = offsets[e], end = offsets[e + 1];
+    if (beg == end) return;  // block-uniform
+    const uint8_t* drow = down_q + ((size_t)e * hidden + o) * down_row_bytes;
+    const int gbytes = qgroup_bytes(down_type);
+    const int ngroups = (moe_inter + 255) >> 8;
+    __shared__ WFrag<I8> sh[kChunk][32];
+    for (int base = beg; base < end; base += kChunk * kTok) {
+        const int tb = base + warp * kTok;
+        const int B = min(kTok, end - tb);
+        int ts[kTok];
+        #pragma unroll
+        for (int j = 0; j < kTok; ++j)
+            if (j < B) ts[j] = ts_sorted[tb + j];
+        float a8[kTok];
+        #pragma unroll
+        for (int j = 0; j < kTok; ++j) a8[j] = 0.0f;
+        for (int gc = 0; gc < ngroups; gc += kChunk) {
+            const int gd = gc + warp;
+            if (gd < ngroups && ((gd << 8) + (lane << 3)) < moe_inter)
+                sh[warp][lane].decode(down_type, drow + (size_t)gd * gbytes, lane);
+            __syncthreads();
+            const int gn = min(kChunk, ngroups - gc);
+            for (int gi = 0; gi < gn; ++gi) {
+                const int idx0 = ((gc + gi) << 8) + (lane << 3);
+                const int rem = moe_inter - idx0;
+                if (rem <= 0) continue;
+                #pragma unroll
+                for (int j = 0; j < kTok; ++j)
+                    if (j < B) a8[j] += sh[gi][lane].dot(
+                        ActView<I8>(h_act, hq, hs, (size_t)ts[j], moe_inter), idx0, rem);
+            }
+            __syncthreads();
+        }
+        #pragma unroll
+        for (int j = 0; j < kTok; ++j) {
+            if (j >= B) continue;
+            const float acc = warp_reduce_sum(a8[j]);
+            if (lane == 0)
+                dpart[(size_t)ts[j] * hidden + o] = acc;
+        }
+    }
+}
+
+// ---- int8 tensor-core (mma.m16n8k32) expert-major prefill path -------------
+// The dp4a kernels are instruction-issue-bound at prefill (~6 MACs/instr incl.
+// decode + addressing). One mma.sync.m16n8k32 does 4096 MACs/warp-instr; with
+// the decoded weight chunk staged in shared and reused across a 64-token tile
+// this cuts the instruction budget ~20x. Requirements: int8 activations
+// (quantize_act_q8 layout: per-32 scales) and weight types whose scale is
+// uniform per 32 elements with no affine min — Q8_0 / IQ3_XXS / IQ4_XS, which
+// covers every prefill-hot tensor of the UD-Q3_K_XL GGUF. Falls back to the
+// dp4a kernels per-type otherwise. GLMSERVE_MMA=0 disables.
+
+static bool mma_type_ok(uint32_t type) {
+    switch (type) {
+        case QTYPE_Q8_0: case QTYPE_IQ3_XXS: case QTYPE_IQ4_XS: return true;
+        default: return false;
+    }
+}
+
+static bool mma_kernels_enabled() {
+    static const bool on = [] {
+        const char* v = std::getenv("GLMSERVE_MMA");
+        return !(v && *v && *v == '0');
+    }();
+    return on;
+}
+
+__device__ __forceinline__ void mma_s8_16x8x32(int* d, const int* a, const int* b) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};\n"
+        : "=r"(d[0]), "=r"(d[1]), "=r"(d[2]), "=r"(d[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]),
+          "r"(0), "r"(0), "r"(0), "r"(0));
+}
+
+// dst[slot * dst_stride + f0 + row] = W[e][f0+row] . act(token(slot)) for the
+// expert's dispatched slots. One block = (16-row tile, expert); inside, 64-slot
+// token tiles: 8 warps each own one 8-token mma column subtile. Per 256-elem
+// K-chunk the block decodes the 16 rows into shared once (int8 + per-32
+// scales), then each warp runs 8 mma k-blocks scaled by ws x as.
+// `div` maps slot -> activation row (topk for token-level acts, 1 for h_act).
+__global__ void emajor_mma_s8_kernel(const int8_t* __restrict__ xq,
+                                     const float* __restrict__ xs,
+                                     const int* __restrict__ ts_sorted,
+                                     const int* __restrict__ offsets, int div,
+                                     const uint8_t* __restrict__ Wq,
+                                     int64_t row_bytes, uint32_t type,
+                                     int rows, int K,
+                                     float* __restrict__ dst, int dst_stride) {
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int f0 = blockIdx.x * 16;
+    const int e = blockIdx.y;
+    const int beg = offsets[e], end = offsets[e + 1];
+    if (beg == end) return;  // block-uniform
+    const int gbytes = qgroup_bytes(type);
+    const int nchunks = K >> 8;              // K is a multiple of 256
+    const int kb_scales = K >> 5;            // act scale row stride
+    __shared__ int   shA[16][64];            // decoded chunk: 16 rows x 256 int8
+    __shared__ float shS[16][8];             // per-32 weight scales
+    __shared__ int   shTok[64];              // slot -> activation row
+    __shared__ float shAS[64][8];            // per-32 act scales, tile x chunk
+    const int r = lane >> 2, q = lane & 3;   // mma row group / thread-in-group
+
+    for (int base = beg; base < end; base += 64) {
+        const int nvalid = min(64, end - base);
+        // Stage the tile's activation rows (clamped: lanes past the end
+        // recompute the last slot and never write).
+        if (threadIdx.x < 64)
+            shTok[threadIdx.x] = ts_sorted[min(base + (int)threadIdx.x, end - 1)] / div;
+        __syncthreads();
+        // B loads use this lane's column (lane/4 of the warp subtile)...
+        const int8_t* arow = xq + (size_t)shTok[warp * 8 + r] * K;
+        // ...but the accumulated D fragment holds columns 2q and 2q+1, whose
+        // activation scales differ — they are staged per chunk in shAS.
+        float cf0 = 0.0f, cf1 = 0.0f, cf2 = 0.0f, cf3 = 0.0f;
+        for (int ch = 0; ch < nchunks; ++ch) {
+            __syncthreads();  // previous mma reads done before re-decode
+            // 16 rows x 32 fragments; 512 frags over 256 threads = 2 each.
+            #pragma unroll
+            for (int rep = 0; rep < 2; ++rep) {
+                const int fid = (int)threadIdx.x + rep * 256;
+                const int row = fid >> 5, f = fid & 31;
+                WFrag<true> wf;
+                wf.decode(type, Wq + ((size_t)e * rows + f0 + row) * row_bytes +
+                                    (size_t)ch * gbytes, f);
+                shA[row][f * 2] = wf.w.w0;
+                shA[row][f * 2 + 1] = wf.w.w1;
+                if ((f & 3) == 0) shS[row][f >> 2] = wf.w.ds;
+                // Act scales for the tile: 64 cols x 8 k-blocks = 512 floats.
+                const int col = fid >> 3, kb = fid & 7;
+                shAS[col][kb] = xs[(size_t)shTok[col] * kb_scales + (ch << 3) + kb];
+            }
+            __syncthreads();
+            const int kbase = ch << 8;
+            #pragma unroll
+            for (int kb = 0; kb < 8; ++kb) {
+                int a[4], b[2], d[4];
+                a[0] = shA[r][kb * 8 + q];
+                a[1] = shA[r + 8][kb * 8 + q];
+                a[2] = shA[r][kb * 8 + q + 4];
+                a[3] = shA[r + 8][kb * 8 + q + 4];
+                memcpy(&b[0], arow + kbase + kb * 32 + q * 4, 4);
+                memcpy(&b[1], arow + kbase + kb * 32 + q * 4 + 16, 4);
+                mma_s8_16x8x32(d, a, b);
+                const float ws0 = shS[r][kb], ws1 = shS[r + 8][kb];
+                const float as0 = shAS[warp * 8 + q * 2][kb];
+                const float as1 = shAS[warp * 8 + q * 2 + 1][kb];
+                cf0 += (float)d[0] * ws0 * as0;
+                cf1 += (float)d[1] * ws0 * as1;
+                cf2 += (float)d[2] * ws1 * as0;
+                cf3 += (float)d[3] * ws1 * as1;
+            }
+        }
+        // Write back: c0/c1 -> row r, cols 2q/2q+1; c2/c3 -> row r+8.
+        const int c0 = warp * 8 + q * 2, c1 = c0 + 1;
+        if (c0 < nvalid) {
+            const int slot = ts_sorted[base + c0];
+            dst[(size_t)slot * dst_stride + f0 + r] = cf0;
+            dst[(size_t)slot * dst_stride + f0 + r + 8] = cf2;
+        }
+        if (c1 < nvalid) {
+            const int slot = ts_sorted[base + c1];
+            dst[(size_t)slot * dst_stride + f0 + r] = cf1;
+            dst[(size_t)slot * dst_stride + f0 + r + 8] = cf3;
+        }
+        __syncthreads();
+    }
+}
+
+// h_act[i] = silu(g[i]) * u[i] over the dispatched slot rows.
+__global__ void moe_silu_mul_kernel(const float* __restrict__ g, const float* __restrict__ u,
+                                    float* __restrict__ h, int64_t total) {
+    const int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < total) h[i] = silu(g[i]) * u[i];
+}
+
+// Dense sibling of emajor_mma_s8_kernel: y[t, o] = x[t] . W[o] with one block
+// per (16-row tile, 64-token tile). Same decode-to-shared + mma structure,
+// token rows are just contiguous (no dispatch indirection).
+__global__ void gemm_q_mma_s8_kernel(const int8_t* __restrict__ xq,
+                                     const float* __restrict__ xs,
+                                     const uint8_t* __restrict__ qW,
+                                     const float* __restrict__ bias,
+                                     float* __restrict__ y,
+                                     int n, int K, int out, int64_t row_bytes,
+                                     uint32_t type) {
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int f0 = blockIdx.x * 16;
+    const int tbase = blockIdx.y * 64;
+    const int gbytes = qgroup_bytes(type);
+    const int nchunks = K >> 8;
+    const int kb_scales = K >> 5;
+    __shared__ int   shA[16][64];
+    __shared__ float shS[16][8];
+    __shared__ float shAS[64][8];
+    const int r = lane >> 2, q = lane & 3;
+    const int nvalid = min(64, n - tbase);
+    const int btok = min(tbase + warp * 8 + r, n - 1);  // B-load token (clamped)
+    const int8_t* arow = xq + (size_t)btok * K;
+    float cf0 = 0.0f, cf1 = 0.0f, cf2 = 0.0f, cf3 = 0.0f;
+    for (int ch = 0; ch < nchunks; ++ch) {
+        __syncthreads();
+        #pragma unroll
+        for (int rep = 0; rep < 2; ++rep) {
+            const int fid = (int)threadIdx.x + rep * 256;
+            const int row = fid >> 5, f = fid & 31;
+            WFrag<true> wf;
+            wf.decode(type, qW + (size_t)(f0 + row) * row_bytes + (size_t)ch * gbytes, f);
+            shA[row][f * 2] = wf.w.w0;
+            shA[row][f * 2 + 1] = wf.w.w1;
+            if ((f & 3) == 0) shS[row][f >> 2] = wf.w.ds;
+            const int col = fid >> 3, kb = fid & 7;
+            shAS[col][kb] = xs[(size_t)min(tbase + col, n - 1) * kb_scales + (ch << 3) + kb];
+        }
+        __syncthreads();
+        const int kbase = ch << 8;
+        #pragma unroll
+        for (int kb = 0; kb < 8; ++kb) {
+            int a[4], b[2], d[4];
+            a[0] = shA[r][kb * 8 + q];
+            a[1] = shA[r + 8][kb * 8 + q];
+            a[2] = shA[r][kb * 8 + q + 4];
+            a[3] = shA[r + 8][kb * 8 + q + 4];
+            memcpy(&b[0], arow + kbase + kb * 32 + q * 4, 4);
+            memcpy(&b[1], arow + kbase + kb * 32 + q * 4 + 16, 4);
+            mma_s8_16x8x32(d, a, b);
+            const float ws0 = shS[r][kb], ws1 = shS[r + 8][kb];
+            const float as0 = shAS[warp * 8 + q * 2][kb];
+            const float as1 = shAS[warp * 8 + q * 2 + 1][kb];
+            cf0 += (float)d[0] * ws0 * as0;
+            cf1 += (float)d[1] * ws0 * as1;
+            cf2 += (float)d[2] * ws1 * as0;
+            cf3 += (float)d[3] * ws1 * as1;
+        }
+    }
+    const int c0 = warp * 8 + q * 2, c1 = c0 + 1;
+    const float bs0 = bias ? bias[f0 + r] : 0.0f;
+    const float bs8 = bias ? bias[f0 + r + 8] : 0.0f;
+    if (c0 < nvalid) {
+        y[(size_t)(tbase + c0) * out + f0 + r] = cf0 + bs0;
+        y[(size_t)(tbase + c0) * out + f0 + r + 8] = cf2 + bs8;
+    }
+    if (c1 < nvalid) {
+        y[(size_t)(tbase + c1) * out + f0 + r] = cf1 + bs0;
+        y[(size_t)(tbase + c1) * out + f0 + r + 8] = cf3 + bs8;
+    }
+}
+
 // ---- split-K single/few-token path -----------------------------------------
 // At decode (n=1, topk=8) the token-major gate/up grid is (moe_inter_local/8,
 // 8) blocks — ~192 blocks on a 142-SM part, each warp walking the whole
@@ -1091,6 +1520,48 @@ static void moe_expert_ffn_q_launch(uint32_t gate_type, uint32_t up_type, uint32
         moe_dispatch_scan_kernel<<<1, 32, 0, s>>>(counts, E, offsets);
         moe_dispatch_scatter_kernel<<<db, 256, 0, s>>>(topk_ids, nts, offsets, cursor,
                                                        ts_sorted);
+        if (I8 && nts >= kMoeSmemMinTs && mma_kernels_enabled() &&
+            mma_type_ok(gate_type) && mma_type_ok(up_type) && mma_type_ok(down_type) &&
+            (moe_inter & 255) == 0 && (hidden & 255) == 0 && 2 * moe_inter <= hidden) {
+            // Tensor-core path: gate and up land in the (otherwise still
+            // unused) dpart scratch — 2*moe_inter <= hidden so both fit.
+            float* gbuf = dpart;
+            float* ubuf = dpart + (size_t)nts * moe_inter;
+            dim3 g1((unsigned)(moe_inter / 16), (unsigned)E);
+            emajor_mma_s8_kernel<<<g1, 256, 0, s>>>(
+                xq, xs, ts_sorted, offsets, topk, gate_q, gate_row_bytes, gate_type,
+                moe_inter, hidden, gbuf, moe_inter);
+            emajor_mma_s8_kernel<<<g1, 256, 0, s>>>(
+                xq, xs, ts_sorted, offsets, topk, up_q, up_row_bytes, up_type,
+                moe_inter, hidden, ubuf, moe_inter);
+            const int64_t hcount = (int64_t)nts * moe_inter;
+            moe_silu_mul_kernel<<<(unsigned)((hcount + 255) / 256), 256, 0, s>>>(
+                gbuf, ubuf, h_act, hcount);
+            quantize_h();
+            dim3 g2((unsigned)(hidden / 16), (unsigned)E);
+            emajor_mma_s8_kernel<<<g2, 256, 0, s>>>(
+                hq, hs, ts_sorted, offsets, 1, down_q, down_row_bytes, down_type,
+                hidden, moe_inter, dpart, hidden);
+            reduce_down();
+            return;
+        }
+        if (nts >= kMoeSmemMinTs && smem_kernels_enabled()) {
+            // Shared-decode tiles: at prefill token counts each expert sees
+            // ~nts/E tokens per pass, and the register-tile kernel re-decodes
+            // every weight group per 8 tokens; the smem variants decode per
+            // 64 (bitwise-identical accumulation).
+            dim3 gu((unsigned)moe_inter, (unsigned)E);
+            moe_gate_up_q_emajor_smem_kernel<I8><<<gu, threads, 0, s>>>(
+                x, xq, xs, ts_sorted, offsets, gate_q, up_q, topk, hidden, moe_inter,
+                gate_row_bytes, up_row_bytes, gate_type, up_type, h_act);
+            quantize_h();
+            dim3 dn((unsigned)hidden, (unsigned)E);
+            moe_down_q_emajor_smem_kernel<I8><<<dn, threads, 0, s>>>(
+                ts_sorted, offsets, down_q, h_act, hq, hs, hidden, moe_inter,
+                down_row_bytes, down_type, dpart);
+            reduce_down();
+            return;
+        }
         dim3 gu((unsigned)((moe_inter + kWarpsPerBlock - 1) / kWarpsPerBlock), (unsigned)E);
         moe_gate_up_q_emajor_kernel<8, I8><<<gu, threads, 0, s>>>(
             x, xq, xs, ts_sorted, offsets, gate_q, up_q, topk, hidden, moe_inter,

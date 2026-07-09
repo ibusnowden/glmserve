@@ -347,8 +347,18 @@ int cmd_generate(const Args& a) {
 
 int cmd_tokgen(const Args& a) {
     EngineOptions o = engine_opts(a);
-    std::vector<int> prompt = parse_int_list(a.get("tokens", "3 1 4 1 5 9 2 6"));
-    GLM_CHECK(!prompt.empty(), "tokgen requires --tokens \"id id id\"");
+    std::vector<int> prompt;
+    std::string tokens_file = a.get("tokens-file");
+    if (!tokens_file.empty()) {
+        std::ifstream f(tokens_file);
+        GLM_CHECK(f.good(), "cannot open --tokens-file %s", tokens_file.c_str());
+        std::stringstream ss;
+        ss << f.rdbuf();
+        prompt = parse_int_list(ss.str());
+    } else {
+        prompt = parse_int_list(a.get("tokens", "3 1 4 1 5 9 2 6"));
+    }
+    GLM_CHECK(!prompt.empty(), "tokgen requires --tokens \"id id id\" or --tokens-file");
     SamplingParams p;
     p.temperature = static_cast<float>(a.get_double("temp", 0.0));
     p.top_p = static_cast<float>(a.get_double("top-p", 1.0));

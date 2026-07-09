@@ -153,6 +153,58 @@ int main() {
         }
     }
 
+    // ---- shared-decode (smem) prefill GEMM: n >= 64 engages gemm_q_smem ----
+    // Per (token, row) the accumulation order is identical to the gemv ladder,
+    // so a small-n run over the same leading tokens must match EXACTLY.
+    {
+        const int in = 512, out = 48, nbig = 96;  // 96 = one full + one partial tile
+        const uint32_t type = 18;                 // IQ3_XXS (heaviest decoder)
+        int64_t row_bytes;
+        std::vector<uint8_t> data = make_quant(type, out, in, row_bytes, rng);
+        std::vector<float> xb((size_t)nbig * in);
+        for (auto& v : xb) v = nd(rng);
+        float* dx = nullptr; uint8_t* dq = nullptr; float* dy = nullptr;
+        int8_t* dxq = nullptr; float* dxs = nullptr;
+        CUDA_TEST_CHECK(cudaMalloc(&dx, xb.size() * sizeof(float)));
+        CUDA_TEST_CHECK(cudaMalloc(&dq, data.size()));
+        CUDA_TEST_CHECK(cudaMalloc(&dy, (size_t)nbig * out * sizeof(float)));
+        CUDA_TEST_CHECK(cudaMalloc(&dxq, xb.size()));
+        CUDA_TEST_CHECK(cudaMalloc(&dxs, (xb.size() / 32) * sizeof(float)));
+        CUDA_TEST_CHECK(cudaMemcpy(dx, xb.data(), xb.size() * sizeof(float), cudaMemcpyHostToDevice));
+        CUDA_TEST_CHECK(cudaMemcpy(dq, data.data(), data.size(), cudaMemcpyHostToDevice));
+        quantize_act_q8(dx, nbig, in, dxq, dxs);
+
+        auto run_n = [&](int nn) -> std::vector<float> {
+            cudaMemset(dy, 0, (size_t)nbig * out * sizeof(float));
+            gemm_q_i8(type, dxq, dxs, dq, nullptr, dy, nn, in, out, row_bytes);
+            if (cudaGetLastError() != cudaSuccess || cudaDeviceSynchronize() != cudaSuccess) {
+                std::printf("  gemm_q_i8 smem launch FAILED\n");
+                rc = 1;
+            }
+            std::vector<float> r((size_t)nn * out);
+            cudaMemcpy(r.data(), dy, r.size() * sizeof(float), cudaMemcpyDeviceToHost);
+            return r;
+        };
+        std::vector<float> big = run_n(nbig);          // mma (or smem) path
+        std::vector<float> small = run_n(8);           // gemv ladder path
+        big.resize(small.size());
+        // mma sums int32 exactly per 32-block where the gemv path accumulates
+        // fp per 8-fragment — same int8 inputs, fp-rounding-level difference.
+        std::printf("  IQ3_XXS gemm_q_i8 big-n[96] vs gemv[n=8] leading rows:");
+        rc |= check(big, small, 1e-4f);
+        // fp32-activation variant of the same gate.
+        std::vector<float> ref32 = cpu_gemm_q(type, data.data(), row_bytes, xb.data(), nullptr, nbig, in, out);
+        CUDA_TEST_CHECK(cudaMemset(dy, 0, (size_t)nbig * out * sizeof(float)));
+        gemm_q(type, dx, dq, nullptr, dy, nbig, in, out, row_bytes);
+        CUDA_TEST_CHECK(cudaGetLastError());
+        CUDA_TEST_CHECK(cudaDeviceSynchronize());
+        std::vector<float> got32((size_t)nbig * out);
+        CUDA_TEST_CHECK(cudaMemcpy(got32.data(), dy, got32.size() * sizeof(float), cudaMemcpyDeviceToHost));
+        std::printf("  IQ3_XXS gemm_q smem fp32 [n=96] vs CPU ref:");
+        rc |= check(got32, ref32, 1e-3f);
+        cudaFree(dx); cudaFree(dq); cudaFree(dy); cudaFree(dxq); cudaFree(dxs);
+    }
+
     // ---- MoE expert FFN (merged per-expert quant tensors) -----------------
     // gate/up: IQ3_XXS [E, moe_inter, hidden]; down: IQ4_XS [E, hidden, moe_inter].
     {
@@ -305,6 +357,63 @@ int main() {
             rc |= check(sk8, tm8_s, 1e-3f);
             cudaFree(dxq); cudaFree(dxs); cudaFree(dhq); cudaFree(dhs);
             cudaFree(ddisp); cudaFree(dgu);
+        }
+
+        // Shared-decode expert-major tiles (nts >= 2048): per (token, row) the
+        // accumulation is independent of dispatch grouping and identical in
+        // order to the register-tile emajor kernel, so the leading-48-token
+        // rows must EXACTLY equal the small-nts emajor run above.
+        {
+            const int nb = 1024;  // nts = 2048 engages the smem kernels
+            std::vector<int> ids_b(nb * topk);
+            std::copy(topk_ids.begin(), topk_ids.end(), ids_b.begin());
+            for (size_t i = topk_ids.size(); i < ids_b.size(); ++i)
+                ids_b[i] = (int)(rng() % E);
+            std::vector<float> xb((size_t)nb * hidden);
+            std::copy(xin.begin(), xin.end(), xb.begin());
+            for (size_t i = xin.size(); i < xb.size(); ++i) xb[i] = nd(rng);
+            std::vector<float> wb((size_t)nb * topk, 0.5f);
+            float *dxb = nullptr, *dtwb = nullptr, *dhb = nullptr, *ddpb = nullptr, *dyb = nullptr;
+            int* dtib = nullptr; int* ddispb = nullptr;
+            int8_t *dxqb = nullptr, *dhqb = nullptr;
+            float *dxsb = nullptr, *dhsb = nullptr;
+            CUDA_TEST_CHECK(cudaMalloc(&dxb, xb.size() * sizeof(float)));
+            CUDA_TEST_CHECK(cudaMalloc(&dtib, ids_b.size() * sizeof(int)));
+            CUDA_TEST_CHECK(cudaMalloc(&dtwb, wb.size() * sizeof(float)));
+            CUDA_TEST_CHECK(cudaMalloc(&dhb, (size_t)nb * topk * moe_inter * sizeof(float)));
+            CUDA_TEST_CHECK(cudaMalloc(&ddpb, (size_t)nb * topk * hidden * sizeof(float)));
+            CUDA_TEST_CHECK(cudaMalloc(&dyb, (size_t)nb * hidden * sizeof(float)));
+            CUDA_TEST_CHECK(cudaMalloc(&ddispb, (3 * E + 1 + nb * topk) * sizeof(int)));
+            CUDA_TEST_CHECK(cudaMalloc(&dxqb, xb.size()));
+            CUDA_TEST_CHECK(cudaMalloc(&dxsb, (xb.size() / 32) * sizeof(float)));
+            CUDA_TEST_CHECK(cudaMalloc(&dhqb, (size_t)nb * topk * moe_inter));
+            CUDA_TEST_CHECK(cudaMalloc(&dhsb, ((size_t)nb * topk * moe_inter / 32) * sizeof(float)));
+            CUDA_TEST_CHECK(cudaMemcpy(dxb, xb.data(), xb.size() * sizeof(float), cudaMemcpyHostToDevice));
+            CUDA_TEST_CHECK(cudaMemcpy(dtib, ids_b.data(), ids_b.size() * sizeof(int), cudaMemcpyHostToDevice));
+            CUDA_TEST_CHECK(cudaMemcpy(dtwb, wb.data(), wb.size() * sizeof(float), cudaMemcpyHostToDevice));
+            quantize_act_q8(dxb, nb, hidden, dxqb, dxsb);
+            moe_expert_ffn_q_i8(gtype, utype, dtype, dxqb, dxsb, dtib, dtwb, dg, du, dd,
+                                nb, topk, hidden, moe_inter, E, g_rb, u_rb, d_rb,
+                                dhb, dhqb, dhsb, ddpb, dyb, ddispb, nullptr);
+            CUDA_TEST_CHECK(cudaGetLastError());
+            CUDA_TEST_CHECK(cudaDeviceSynchronize());
+            std::vector<float> big((size_t)nb * hidden);
+            CUDA_TEST_CHECK(cudaMemcpy(big.data(), dyb, big.size() * sizeof(float), cudaMemcpyDeviceToHost));
+            // Reference: the same 1024 tokens through the register-tile emajor
+            // path (GLMSERVE_SMEM=0 would flip the whole process; instead
+            // token-major over the same big activations is the against-path).
+            moe_expert_ffn_q_i8(gtype, utype, dtype, dxqb, dxsb, dtib, dtwb, dg, du, dd,
+                                nb, topk, hidden, moe_inter, E, g_rb, u_rb, d_rb,
+                                dhb, dhqb, dhsb, ddpb, dyb, nullptr, nullptr);
+            CUDA_TEST_CHECK(cudaGetLastError());
+            CUDA_TEST_CHECK(cudaDeviceSynchronize());
+            std::vector<float> tm_big((size_t)nb * hidden);
+            CUDA_TEST_CHECK(cudaMemcpy(tm_big.data(), dyb, tm_big.size() * sizeof(float), cudaMemcpyDeviceToHost));
+            std::printf("  moe_expert_ffn_q_i8 smem emajor [nts=2048] vs token-major:");
+            rc |= check(big, tm_big, 1e-4f);
+            cudaFree(dxb); cudaFree(dtib); cudaFree(dtwb); cudaFree(dhb); cudaFree(ddpb);
+            cudaFree(dyb); cudaFree(ddispb); cudaFree(dxqb); cudaFree(dxsb);
+            cudaFree(dhqb); cudaFree(dhsb);
         }
         cudaFree(dx); cudaFree(dti); cudaFree(dtw); cudaFree(dg); cudaFree(du); cudaFree(dd); cudaFree(dh); cudaFree(dy); cudaFree(ddp);
     }

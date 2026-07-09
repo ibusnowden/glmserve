@@ -236,6 +236,36 @@ if [[ "$PHASES" == *R* ]]; then
     done
 fi
 
+if [[ "$PHASES" == *M* ]]; then
+    # mma real-model correctness gate: greedy continuation of a real
+    # 1024-token prompt with the tensor-core prefill on vs off must produce
+    # the same tokens (phases D/F use 6-token prompts and never reach the
+    # n>=64 mma engagement, so they don't cover it). Tolerance-free: mma
+    # changes fp accumulation, so we gate on the greedy TOKEN stream, which
+    # should survive rounding-level logit shifts; a mismatch beyond the last
+    # few tokens means a real bug.
+    PF_M="${GLMSERVE_MMA_GATE_PROMPT:-bench/prompts/diverse_1024.ids}"
+    TOKS_M0="/tmp/glmserve_phaseM0_${SLURM_JOB_ID}.tokens"
+    TOKS_M1="/tmp/glmserve_phaseM1_${SLURM_JOB_ID}.tokens"
+    echo "=== phase M: TP=8 mma-vs-dp4a real-prompt token gate ($PF_M) ==="
+    run_tp8 env GLMSERVE_MMA=0 GLMSERVE_SMEM=0 "$BIN" tokgen --model "$GGUF" --gpu \
+        --ctx 1280 --tokens-file "$PF_M" --max-tokens 64 --temp 0 \
+        | tee "$TOKS_M0.full"
+    grep -m1 "tokens:" "$TOKS_M0.full" > "$TOKS_M0" || true
+    run_tp8 env GLMSERVE_MMA=1 "$BIN" tokgen --model "$GGUF" --gpu \
+        --ctx 1280 --tokens-file "$PF_M" --max-tokens 64 --temp 0 \
+        | tee "$TOKS_M1.full"
+    grep -m1 "tokens:" "$TOKS_M1.full" > "$TOKS_M1" || true
+    if [ -s "$TOKS_M0" ] && [ -s "$TOKS_M1" ]; then
+        if diff -q "$TOKS_M0" "$TOKS_M1" >/dev/null; then
+            echo "phase M mma token gate: PASS"
+        else
+            echo "phase M mma token gate: FAIL"
+            echo "M0: $(cat "$TOKS_M0")"; echo "M1: $(cat "$TOKS_M1")"
+        fi
+    fi
+fi
+
 if [[ "$PHASES" == *E* ]]; then
     # Long-context decode-at-depth probe: the fp16 latent cache + fp16 indexer
     # cache keep 16K ctx at ~1.7 GiB/rank; decode beyond index_topk=2048 runs
