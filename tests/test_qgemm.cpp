@@ -153,12 +153,14 @@ int main() {
         }
     }
 
-    // ---- shared-decode (smem) prefill GEMM: n >= 64 engages gemm_q_smem ----
-    // Per (token, row) the accumulation order is identical to the gemv ladder,
-    // so a small-n run over the same leading tokens must match EXACTLY.
-    {
+    // ---- big-n prefill GEMM: n >= 64 engages the mma tensor-core path ------
+    // Same int8 inputs as the gemv ladder; mma sums int32 exactly per 32-block
+    // where the ladder accumulates fp per 8-fragment, so the gate is a tight
+    // relative tolerance. Covers the dense prefill types of the real GGUF
+    // (Q8_0 attn/shared/dense) plus the heaviest decoder (IQ3_XXS).
+    for (const uint32_t type : {18u, 8u}) {
+        const char* tname = type == 18 ? "IQ3_XXS" : "Q8_0";
         const int in = 512, out = 48, nbig = 96;  // 96 = one full + one partial tile
-        const uint32_t type = 18;                 // IQ3_XXS (heaviest decoder)
         int64_t row_bytes;
         std::vector<uint8_t> data = make_quant(type, out, in, row_bytes, rng);
         std::vector<float> xb((size_t)nbig * in);
@@ -190,7 +192,7 @@ int main() {
         big.resize(small.size());
         // mma sums int32 exactly per 32-block where the gemv path accumulates
         // fp per 8-fragment — same int8 inputs, fp-rounding-level difference.
-        std::printf("  IQ3_XXS gemm_q_i8 big-n[96] vs gemv[n=8] leading rows:");
+        std::printf("  %s gemm_q_i8 big-n[96] vs gemv[n=8] leading rows:", tname);
         rc |= check(big, small, 1e-4f);
         // fp32-activation variant of the same gate.
         std::vector<float> ref32 = cpu_gemm_q(type, data.data(), row_bytes, xb.data(), nullptr, nbig, in, out);
@@ -200,7 +202,7 @@ int main() {
         CUDA_TEST_CHECK(cudaDeviceSynchronize());
         std::vector<float> got32((size_t)nbig * out);
         CUDA_TEST_CHECK(cudaMemcpy(got32.data(), dy, got32.size() * sizeof(float), cudaMemcpyDeviceToHost));
-        std::printf("  IQ3_XXS gemm_q smem fp32 [n=96] vs CPU ref:");
+        std::printf("  %s gemm_q fp32 big-n[96] vs CPU ref:", tname);
         rc |= check(got32, ref32, 1e-3f);
         cudaFree(dx); cudaFree(dq); cudaFree(dy); cudaFree(dxq); cudaFree(dxs);
     }
