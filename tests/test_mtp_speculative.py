@@ -17,6 +17,8 @@ def main():
     ap.add_argument("--python", default=sys.executable)
     ap.add_argument("--gen", type=int, default=12)
     ap.add_argument("--draft-k", type=int, default=5)
+    ap.add_argument("--gpu", action="store_true",
+                    help="run the GPU speculative loop (gates spec == plain greedy)")
     args = ap.parse_args()
 
     if not os.path.exists(args.bin):
@@ -38,6 +40,8 @@ def main():
             "--gen", str(args.gen),
             "--draft-k", str(args.draft_k),
         ]
+        if args.gpu:
+            cmd.append("--gpu")
         run = subprocess.run(cmd, capture_output=True, text=True,
                              env=dict(os.environ, GLMSERVE_LOG="error"))
         if run.returncode != 0:
@@ -48,7 +52,7 @@ def main():
         print(run.stdout.strip())
 
         m = re.search(
-            r"mtpcheck: steps=(\d+) draft_k=(\d+) groups=(\d+) accepted=(\d+) rejected=(\d+)",
+            r"mtpcheck: backend=\S+ steps=(\d+) draft_k=(\d+) groups=(\d+) accepted=(\d+) rejected=(\d+)",
             run.stdout)
         if not m:
             print("FAIL: missing mtpcheck summary")

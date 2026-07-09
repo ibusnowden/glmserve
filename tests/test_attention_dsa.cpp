@@ -173,18 +173,23 @@ int main() {
         for (int k = 0; k < count; ++k) ref_idx[t * topk + k] = ids[k];
     }
 
-    float *diq = nullptr, *dik = nullptr, *diw = nullptr, *dscore = nullptr, *dout_idx = nullptr;
+    float *diq = nullptr, *dikf = nullptr, *diw = nullptr, *dscore = nullptr, *dout_idx = nullptr;
+    float* dscratch = nullptr;
+    __half* dik = nullptr;
     int* didx = nullptr;
     CUDA_TEST_CHECK(cudaMalloc(&diq, iq.size() * sizeof(float)));
-    CUDA_TEST_CHECK(cudaMalloc(&dik, ik.size() * sizeof(float)));
+    CUDA_TEST_CHECK(cudaMalloc(&dikf, ik.size() * sizeof(float)));
+    CUDA_TEST_CHECK(cudaMalloc(&dik, ik.size() * sizeof(__half)));
     CUDA_TEST_CHECK(cudaMalloc(&diw, iw.size() * sizeof(float)));
     CUDA_TEST_CHECK(cudaMalloc(&didx, ref_idx.size() * sizeof(int)));
     CUDA_TEST_CHECK(cudaMalloc(&dscore, ref_score.size() * sizeof(float)));
+    CUDA_TEST_CHECK(cudaMalloc(&dscratch, (size_t)kDsaScoreChunk * n * sizeof(float)));
     CUDA_TEST_CHECK(cudaMalloc(&dout_idx, q.size() * sizeof(float)));
     CUDA_TEST_CHECK(cudaMemcpy(diq, iq.data(), iq.size() * sizeof(float), cudaMemcpyHostToDevice));
-    CUDA_TEST_CHECK(cudaMemcpy(dik, ik.data(), ik.size() * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_TEST_CHECK(cudaMemcpy(dikf, ik.data(), ik.size() * sizeof(float), cudaMemcpyHostToDevice));
+    convert_f32_f16(dikf, (int64_t)ik.size(), dik);
     CUDA_TEST_CHECK(cudaMemcpy(diw, iw.data(), iw.size() * sizeof(float), cudaMemcpyHostToDevice));
-    dsa_select_topk(diq, dik, diw, n, 0, iH, iD, topk, iscale, 1.0f, didx, dscore);
+    dsa_select_topk(diq, dik, diw, n, 0, iH, iD, topk, iscale, 1.0f, dscratch, didx, dscore);
     attention_dsa_indexed_paged(dq, dk, dv, dbt, didx, n, 0, H, KVH, hd, block_size,
                                 topk, scale, dout_idx);
     CUDA_TEST_CHECK(cudaGetLastError());
@@ -194,7 +199,8 @@ int main() {
     CUDA_TEST_CHECK(cudaMemcpy(got_idx.data(), didx, got_idx.size() * sizeof(int), cudaMemcpyDeviceToHost));
     CUDA_TEST_CHECK(cudaMemcpy(got_idx_attn.data(), dout_idx, got_idx_attn.size() * sizeof(float),
                                cudaMemcpyDeviceToHost));
-    cudaFree(diq); cudaFree(dik); cudaFree(diw); cudaFree(didx); cudaFree(dscore); cudaFree(dout_idx);
+    cudaFree(diq); cudaFree(dikf); cudaFree(dik); cudaFree(diw); cudaFree(didx);
+    cudaFree(dscore); cudaFree(dscratch); cudaFree(dout_idx);
 
     cudaFree(dq); cudaFree(dq1); cudaFree(dk); cudaFree(dv); cudaFree(dout); cudaFree(dout1);
     cudaFree(part_acc); cudaFree(part_m); cudaFree(part_l); cudaFree(dbt);

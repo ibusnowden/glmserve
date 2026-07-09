@@ -50,6 +50,35 @@ static size_t utf8_trunc(const std::string& s, size_t L) {
 
 static int64_t now_unix() { return static_cast<int64_t>(std::time(nullptr)); }
 
+// Verify-chunk cap for GPU speculative decode (matches model_gpu.cpp's
+// kVerifyMax per-row logits buffer).
+static constexpr int kSpecGroupMax = 8;
+
+static int env_int(const char* name, int fallback) {
+    const char* v = std::getenv(name);
+    if (!v || !*v) return fallback;
+    return std::atoi(v);
+}
+
+static double env_double(const char* name, double fallback) {
+    const char* v = std::getenv(name);
+    if (!v || !*v) return fallback;
+    return std::atof(v);
+}
+
+static bool gpu_spec_adaptive_enabled() {
+    const char* v = std::getenv("GLMSERVE_SPEC_ADAPTIVE");
+    return !(v && *v && *v == '0');
+}
+
+static bool gpu_spec_should_fallback(int groups, int accepted) {
+    if (!gpu_spec_adaptive_enabled()) return false;
+    const int probe = std::max(1, env_int("GLMSERVE_SPEC_PROBE_GROUPS", 16));
+    if (groups < probe) return false;
+    const double min_accept = env_double("GLMSERVE_SPEC_MIN_ACCEPT", 2.0);
+    return static_cast<double>(accepted) / groups < min_accept;
+}
+
 static std::string gen_id(const char* prefix) {
     static std::atomic<uint64_t> ctr{0};
     return std::string(prefix) + std::to_string(now_unix()) + "-" +
@@ -178,15 +207,27 @@ Completion Engine::run(const std::vector<int>& prompt_in, const SamplingParams& 
                                                 : model_->forward(prompt, 0, kv);
         Sampler sampler(p.seed);
         const bool mtp_enabled = p.mtp_draft_k > 0;
+        const bool mtp_gpu = mtp_enabled && gpu_active_;
         if (mtp_enabled) {
-            GLM_CHECK(!gpu_active_, "MTP speculative generation currently validates the CPU path only");
-            GLM_CHECK(model_->mtp_ready(), "MTP speculative generation requested but MTP weights are not loaded");
+            if (gpu_active_)
+                GLM_CHECK(model_->mtp_gpu_ready(),
+                          "MTP speculative decode requested but the MTP block is not GPU-resident");
+            else
+                GLM_CHECK(model_->mtp_ready(), "MTP speculative generation requested but MTP weights are not loaded");
             GLM_CHECK(p.temperature <= 0.0f && p.top_k == 0 && p.top_p >= 1.0f,
                       "MTP speculative generation currently supports greedy sampling only");
             GLM_CHECK(p.repetition_penalty == 1.0f && p.frequency_penalty == 0.0f &&
                       p.presence_penalty == 0.0f,
                       "MTP speculative generation currently does not support sampling penalties");
             c.mtp_used = true;
+        }
+        // GPU spec decode: seed the MTP cache from the prompt's trunk hiddens
+        // (a chunked long prefill leaves only its last chunk in scratch, so
+        // absorb from there; earlier MTP cache rows stay zero).
+        if (mtp_gpu) {
+            const int64_t row0 = model_->gpu_chunk_row0();
+            model_->mtp_gpu_absorb(
+                std::vector<int>(prompt.begin() + row0 + 1, prompt.end()), row0);
         }
 
         size_t emitted = 0;  // bytes of c.text already streamed
@@ -247,7 +288,58 @@ Completion Engine::run(const std::vector<int>& prompt_in, const SamplingParams& 
         };
 
         c.finish_reason = "length";
+        int gpu_seed = mtp_gpu ? argmax_logits(logits) : -1;
+        bool mtp_gpu_active = mtp_gpu;
         while (c.completion_tokens < p.max_tokens) {
+            if (mtp_gpu && !mtp_gpu_active) {
+                const int tok = gpu_seed;
+                if (is_stop_token(tok)) { c.finish_reason = "stop"; break; }
+                if (!record_token(tok)) break;
+                const int64_t pos = static_cast<int64_t>(all_tokens.size()) - 1;
+                if (pos >= model_->gpu_kv_ctx()) { c.finish_reason = "length"; break; }
+                logits = model_->forward_gpu_decode(tok, pos);
+                gpu_seed = argmax_logits(logits);
+                continue;
+            }
+            if (mtp_gpu_active) {
+                // Groups: chunk = [committed next token | k-1 MTP drafts],
+                // one trunk verify pass, longest matching prefix accepted, the
+                // rejected tail rewound. The corrected token after a mismatch
+                // is simply the next group's seed (argmax of the last accepted
+                // row), so the emitted stream equals plain greedy decode.
+                const int remaining = p.max_tokens - c.completion_tokens;
+                const int group_k = std::min({p.mtp_draft_k, remaining, kSpecGroupMax});
+                const int64_t L = static_cast<int64_t>(all_tokens.size());
+                if (L + group_k > model_->gpu_kv_ctx()) { c.finish_reason = "length"; break; }
+                std::vector<int> chunk;
+                chunk.push_back(gpu_seed);
+                if (group_k > 1) {
+                    std::vector<int> ds = model_->mtp_gpu_draft(chunk[0], group_k - 1);
+                    chunk.insert(chunk.end(), ds.begin(), ds.end());
+                }
+                ++c.mtp_groups;
+                std::vector<int> am;
+                model_->forward_gpu_chunk_greedy(chunk, L, &am);
+                int a = 1;
+                while (a < group_k && chunk[a] == am[a - 1]) ++a;
+                c.mtp_accepted += a;
+                if (a < group_k) ++c.mtp_rejected;
+                model_->gpu_rewind(L + a);
+                bool finish_generation = false;
+                for (int i = 0; i < a; ++i) {
+                    const int tok = chunk[i];
+                    if (is_stop_token(tok)) { c.finish_reason = "stop"; finish_generation = true; break; }
+                    if (!record_token(tok)) { finish_generation = true; break; }
+                }
+                if (finish_generation) break;
+                gpu_seed = am[a - 1];
+                if (gpu_spec_should_fallback(c.mtp_groups, c.mtp_accepted)) {
+                    mtp_gpu_active = false;
+                    continue;
+                }
+                model_->mtp_gpu_absorb(std::vector<int>(chunk.begin() + 1, chunk.begin() + a), L);
+                continue;
+            }
             if (mtp_enabled) {
                 const int remaining = p.max_tokens - c.completion_tokens;
                 const int group_k = std::min(p.mtp_draft_k, remaining);
@@ -368,7 +460,13 @@ static int host_argmax(const std::vector<float>& v) {
     return a;
 }
 
-Engine::BenchResult Engine::profile(int prompt_len, int gen_len) {
+static int host_argmax_row(const float* v, int64_t n) {
+    int a = 0;
+    for (int64_t i = 1; i < n; ++i) if (v[i] > v[a]) a = static_cast<int>(i);
+    return a;
+}
+
+Engine::BenchResult Engine::profile(int prompt_len, int gen_len, int draft_k) {
     std::lock_guard<std::mutex> guard(gen_mu_);
     ensure_gpu();
 
@@ -391,6 +489,56 @@ Engine::BenchResult Engine::profile(int prompt_len, int gen_len) {
         std::vector<float> logits = model_->forward_gpu_prefill(prompt);
         r.prefill_ms = tp.ms();
         gpu_prof_report("prefill", is_root());
+
+        if (draft_k > 0) {
+            // Speculative decode: MTP drafts + trunk verify chunks (greedy).
+            GLM_CHECK(model_->mtp_gpu_ready(),
+                      "bench --mtp-draft-k requires a GPU-resident MTP block");
+            const int64_t row0 = model_->gpu_chunk_row0();
+            model_->mtp_gpu_absorb(
+                std::vector<int>(prompt.begin() + row0 + 1, prompt.end()), row0);
+            int seed = host_argmax(logits);
+            int64_t L = prompt_len;
+            int gen = 0;
+            Timer td;
+            while (gen < gen_len) {
+                if (r.spec_fallback) {
+                    if (L >= model_->gpu_kv_ctx()) break;
+                    logits = model_->forward_gpu_decode(seed, L);
+                    seed = host_argmax(logits);
+                    ++L;
+                    ++gen;
+                    continue;
+                }
+                const int group_k = std::min({draft_k, gen_len - gen, kSpecGroupMax});
+                if (L + group_k > model_->gpu_kv_ctx()) break;
+                std::vector<int> chunk;
+                chunk.push_back(seed);
+                if (group_k > 1) {
+                    std::vector<int> ds = model_->mtp_gpu_draft(chunk[0], group_k - 1);
+                    chunk.insert(chunk.end(), ds.begin(), ds.end());
+                }
+                std::vector<int> am;
+                model_->forward_gpu_chunk_greedy(chunk, L, &am);
+                int a = 1;
+                while (a < group_k && chunk[a] == am[a - 1]) ++a;
+                model_->gpu_rewind(L + a);
+                seed = am[a - 1];
+                L += a;
+                gen += a;
+                ++r.spec_groups;
+                r.spec_accepted += a;
+                if (gpu_spec_should_fallback(r.spec_groups, r.spec_accepted)) {
+                    r.spec_fallback = true;
+                    continue;
+                }
+                model_->mtp_gpu_absorb(std::vector<int>(chunk.begin() + 1, chunk.begin() + a), L - a);
+            }
+            r.decode_ms = td.ms();
+            r.gen_len = gen;
+            gpu_prof_report("decode", is_root());
+            return r;
+        }
 
         int next = host_argmax(logits);
         int64_t pos = prompt_len;
@@ -482,17 +630,122 @@ Engine::DecodeCheck Engine::check_decode(const std::vector<int>& prompt, int ste
     return r;
 }
 
+Engine::ChunkCheck Engine::check_chunk_parity(const std::vector<int>& prompt, int k) {
+    std::lock_guard<std::mutex> guard(gen_mu_);
+    ensure_gpu();
+
+    ChunkCheck r;
+    r.k = k;
+    r.gpu = gpu_active_;
+    GLM_CHECK(!prompt.empty(), "check_chunk_parity: empty prompt");
+    GLM_CHECK(k >= 2, "check_chunk_parity: k must be >= 2 (k == 1 is plain decode)");
+
+    if (!gpu_active_) {
+        GLM_WARN("check_chunk_parity: GPU inactive; the CPU path has no chunk variant");
+        return r;
+    }
+
+    const int64_t P = static_cast<int64_t>(prompt.size());
+
+    // Plain decode: token i's logits row (the reference a verify chunk re-checks).
+    std::vector<float> logits = model_->forward_gpu_prefill(prompt);
+    std::vector<int> chunk;
+    chunk.push_back(host_argmax(logits));
+    std::vector<std::vector<float>> dec_rows;
+    for (int i = 0; i < k; ++i) {
+        dec_rows.push_back(model_->forward_gpu_decode(chunk.back(), P + i));
+        const int t = host_argmax(dec_rows.back());
+        r.dec_tokens.push_back(t);
+        if (i + 1 < k) chunk.push_back(t);
+    }
+
+    // Same tokens as one verify chunk over the rewound cache. Row i holds the
+    // logits after chunk[0..i] — the decode step i's row above.
+    model_->gpu_rewind(P);
+    std::vector<float> rows;
+    model_->forward_gpu_chunk(chunk, P, &rows);
+    const int64_t V = static_cast<int64_t>(dec_rows[0].size());
+    GLM_CHECK(static_cast<int64_t>(rows.size()) == static_cast<int64_t>(k) * V,
+              "check_chunk_parity: chunk returned %zu logits, want %lld",
+              rows.size(), (long long)(static_cast<int64_t>(k) * V));
+    for (int i = 0; i < k; ++i) {
+        const float* row = rows.data() + static_cast<int64_t>(i) * V;
+        r.chunk_tokens.push_back(host_argmax_row(row, V));
+        double md = 0;
+        for (int64_t j = 0; j < V; ++j)
+            md = std::max(md, static_cast<double>(std::fabs(row[j] - dec_rows[i][j])));
+        r.row_diff.push_back(md);
+        if (md > r.max_abs_diff) { r.max_abs_diff = md; r.worst_row = i; }
+        if (r.chunk_tokens[i] != r.dec_tokens[i]) r.argmax_match = false;
+    }
+    return r;
+}
+
 Engine::MTPCheck Engine::check_mtp_speculative(const std::vector<int>& prompt, int steps,
                                                int draft_k) {
     std::lock_guard<std::mutex> guard(gen_mu_);
+    ensure_gpu();
     GLM_CHECK(!prompt.empty(), "check_mtp_speculative: empty prompt");
     GLM_CHECK(steps > 0 && draft_k > 0, "check_mtp_speculative: steps/draft_k must be positive");
-    GLM_CHECK(!gpu_active_, "check_mtp_speculative currently validates the CPU MTP path");
-    GLM_CHECK(model_->mtp_ready(), "check_mtp_speculative: MTP weights are not loaded");
 
     MTPCheck r;
     r.steps = steps;
     r.draft_k = draft_k;
+    r.gpu = gpu_active_;
+
+    if (gpu_active_) {
+        // GPU gate: the speculative stream must equal plain greedy decode.
+        GLM_CHECK(model_->mtp_gpu_ready(),
+                  "check_mtp_speculative: MTP block is not GPU-resident");
+        // Plain greedy reference (incremental decode).
+        std::vector<float> logits = model_->forward_gpu_prefill(prompt);
+        int64_t pos = static_cast<int64_t>(prompt.size());
+        for (int s = 0; s < steps; ++s) {
+            const int t = host_argmax(logits);
+            r.ref_tokens.push_back(t);
+            if (s + 1 < steps) logits = model_->forward_gpu_decode(t, pos++);
+        }
+        // Speculative run (re-prefill resets the trunk cache).
+        logits = model_->forward_gpu_prefill(prompt);
+        {
+            const int64_t row0 = model_->gpu_chunk_row0();
+            model_->mtp_gpu_absorb(
+                std::vector<int>(prompt.begin() + row0 + 1, prompt.end()), row0);
+        }
+        int64_t L = static_cast<int64_t>(prompt.size());
+        int seed = host_argmax(logits);
+        while (static_cast<int>(r.output_tokens.size()) < steps) {
+            const int remaining = steps - static_cast<int>(r.output_tokens.size());
+            const int group_k = std::min({draft_k, remaining, kSpecGroupMax});
+            std::vector<int> chunk;
+            chunk.push_back(seed);
+            if (group_k > 1) {
+                std::vector<int> ds = model_->mtp_gpu_draft(chunk[0], group_k - 1);
+                chunk.insert(chunk.end(), ds.begin(), ds.end());
+            }
+            ++r.groups;
+            std::vector<int> am;
+            model_->forward_gpu_chunk_greedy(chunk, L, &am);
+            int a = 1;
+            for (int i = 1; i < group_k; ++i) {
+                r.proposed_tokens.push_back(chunk[i]);
+                r.target_tokens.push_back(am[i - 1]);
+            }
+            while (a < group_k && chunk[a] == am[a - 1]) ++a;
+            r.accepted += a;
+            if (a < group_k) ++r.rejected;
+            model_->gpu_rewind(L + a);
+            model_->mtp_gpu_absorb(std::vector<int>(chunk.begin() + 1, chunk.begin() + a), L);
+            for (int i = 0; i < a && static_cast<int>(r.output_tokens.size()) < steps; ++i)
+                r.output_tokens.push_back(chunk[i]);
+            seed = am[a - 1];
+            L += a;
+        }
+        r.match = r.output_tokens == r.ref_tokens;
+        return r;
+    }
+
+    GLM_CHECK(model_->mtp_ready(), "check_mtp_speculative: MTP weights are not loaded");
 
     int64_t id = sched_->admit();
     SequenceKV kv = kv_->make_sequence(id);

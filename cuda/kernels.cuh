@@ -59,6 +59,23 @@ void gemm_q(uint32_t qtype, const float* x, const uint8_t* qW, const float* bias
             float* y, int64_t n, int64_t in, int64_t out, int64_t row_bytes,
             cudaStream_t s = 0);
 
+// ---- int8 MMQ (dp4a) activations ------------------------------------------
+// The fp32 gemm_q/moe kernels are ALU-bound in dequant + fp32 FMAs. The MMQ
+// twin quantizes activations to int8 per 32-element block and dots INTEGER
+// weight fragments with two dp4a's per 8 elements (llama.cpp MMVQ-style).
+// True for every GGUF type in the real checkpoint (Q8_0/Q3_K/Q4_K/Q5_K/Q6_K/
+// IQ3_XXS/IQ4_XS); F16/F32 fall back to the fp32 path.
+bool qtype_has_i8(uint32_t qtype);
+
+// xq[n, in] int8 + xs[n, in/32] scales; `in` must be a multiple of 32.
+void quantize_act_q8(const float* x, int64_t n, int64_t in, int8_t* xq, float* xs,
+                     cudaStream_t s = 0);
+
+// gemm_q with pre-quantized activations.
+void gemm_q_i8(uint32_t qtype, const int8_t* xq, const float* xs, const uint8_t* qW,
+               const float* bias, float* y, int64_t n, int64_t in, int64_t out,
+               int64_t row_bytes, cudaStream_t s = 0);
+
 // Dequantize a single row (in elements) of a quant weight into fp32 dst (used
 // for the embedding gather, where one row per token is needed).
 void dequant_row_q(uint32_t qtype, const uint8_t* qW, float* dst, int64_t in,
@@ -86,30 +103,55 @@ void embed_gather_q(uint32_t qtype, const uint8_t* qtable, const int* tokens,
 constexpr int kMoeSplitK = 8;
 constexpr int kMoeSplitKMaxTs = 64;
 
+// `dpart` is caller scratch [n*topk, hidden]: the down phase writes unweighted
+// per-slot partial rows there and a fixed-slot-order reduce applies the gate
+// weights into `out` — deterministic across grid shapes (an atomicAdd
+// accumulation broke speculative verify/decode parity).
 void moe_expert_ffn_q(uint32_t gate_type, uint32_t up_type, uint32_t down_type,
                       const float* x, const int* topk_ids, const float* topk_w,
                       const uint8_t* gate_q, const uint8_t* up_q, const uint8_t* down_q,
                       int n, int topk, int hidden, int moe_inter, int E,
                       int64_t gate_row_bytes, int64_t up_row_bytes, int64_t down_row_bytes,
-                      float* h_act, float* out, int* dispatch = nullptr,
+                      float* h_act, float* dpart, float* out, int* dispatch = nullptr,
                       float* gu_part = nullptr, cudaStream_t s = 0);
+
+// int8-activation MoE FFN: x pre-quantized by the caller (shared with other
+// consumers of the same normed activations); h_act is re-quantized into
+// (hq [n*topk, moe_inter], hs) between the gate_up and down phases. Requires
+// qtype_has_i8 on all three types and hidden/moe_inter multiples of 32.
+void moe_expert_ffn_q_i8(uint32_t gate_type, uint32_t up_type, uint32_t down_type,
+                         const int8_t* xq, const float* xs,
+                         const int* topk_ids, const float* topk_w,
+                         const uint8_t* gate_q, const uint8_t* up_q, const uint8_t* down_q,
+                         int n, int topk, int hidden, int moe_inter, int E,
+                         int64_t gate_row_bytes, int64_t up_row_bytes, int64_t down_row_bytes,
+                         float* h_act, int8_t* hq, float* hs, float* dpart, float* out,
+                         int* dispatch = nullptr, float* gu_part = nullptr,
+                         cudaStream_t s = 0);
 
 // ---- absorbed-MLA latent KV (cuda/mla_absorb.cu, fp16 dequant in qgemm.cu) --
 // Latent cache row = [normed c_kv (kvlat) | roped k_pe (rope)] in fp16, shared
 // by every head; decode attention runs absorbed (MQA over latents).
 void latent_store(const float* ckv, const float* kpe, __half* latent, int64_t start_pos,
                   int64_t n, int64_t kvlat, int64_t rope, cudaStream_t s = 0);
-void mla_absorb_q(const float* q, const __half* kvb_f16, int64_t n_heads, int64_t qk,
-                  int64_t nope, int64_t vd, int64_t kvlat, int64_t rope, float* qhat,
-                  cudaStream_t s = 0);
-void mla_expand_o(const float* ohat, const __half* kvb_f16, int64_t n_heads, int64_t nope,
-                  int64_t vd, int64_t kvlat, float* out, cudaStream_t s = 0);
-// Key modes: indices != nullptr -> DSA top-k gather (negatives skipped);
-// else keys [j0, j0+n_keys) (j0=0 dense, j0>0 recent window). part_acc must
-// hold n_heads * max_splits * kvlat floats.
+// Absorb nq queries' q_nope through W_UK: qhat[nq, heads, kvlat+rope].
+void mla_absorb_q(const float* q, const __half* kvb_f16, int64_t nq, int64_t n_heads,
+                  int64_t qk, int64_t nope, int64_t vd, int64_t kvlat, int64_t rope,
+                  float* qhat, cudaStream_t s = 0);
+// Absorbed MQA over the latent cache for nq queries at positions
+// [qpos0, qpos0+nq), each attending its own causal prefix. Key modes:
+// indices != nullptr -> per-query DSA top-k rows indices[qi*index_topk ..]
+// (count clamped to the prefix); win > 0 -> recent window; else dense [0,qpos].
+// Pass 2 is fused with the W_UV expansion: out[nq, heads, vd] directly.
+// Split geometry is per query and, for nq <= kMlaParityMaxQ, identical to the
+// nq == 1 launch — a verify chunk merges bit-identically to the decode steps
+// it re-checks (speculative parity). part_acc must hold
+// kMlaParityMaxQ * max_splits * n_heads * kvlat floats.
+constexpr int64_t kMlaParityMaxQ = 8;
 void mla_attention_decode(const float* qhat, const __half* latent, const int* indices,
-                          int64_t j0, int64_t n_keys, int64_t qpos, int64_t n_heads,
-                          int64_t kvlat, int64_t rope, float scale, float* ohat,
+                          int64_t index_topk, int64_t win, int64_t qpos0, int64_t nq,
+                          int64_t n_heads, int64_t kvlat, int64_t rope, float scale,
+                          const __half* kvb_f16, int64_t nope, int64_t vd, float* out,
                           float* part_acc, float* part_m, float* part_l,
                           int64_t max_splits, cudaStream_t s = 0);
 void convert_f32_f16(const float* src, int64_t n, __half* dst, cudaStream_t s = 0);
@@ -147,13 +189,18 @@ void attention_dsa_paged(const float* q, const float* k_cache, const float* v_ca
                          float* part_acc = nullptr, float* part_m = nullptr,
                          float* part_l = nullptr, int64_t max_splits = 0);
 
-// Learned GLM DSA selector and indexed sparse attention. index_q[n,index_heads,index_dim],
-// index_k_cache[ctx,index_dim], index_w[n,index_heads]. topk_indices[n,index_topk].
-void dsa_select_topk(const float* index_q, const float* index_k_cache,
+// Learned GLM DSA selector (parallel scores + exact radix top-k) and indexed
+// sparse attention. index_q[n,index_heads,index_dim], index_k_cache[ctx,
+// index_dim] fp16, index_w[n,index_heads]. topk_indices[n,index_topk], sorted
+// ascending; ties resolve to the smaller index (CPU reference parity).
+// Queries are processed in chunks of kDsaScoreChunk; score_scratch must hold
+// kDsaScoreChunk * (start_pos + n_query) floats.
+constexpr int64_t kDsaScoreChunk = 64;
+void dsa_select_topk(const float* index_q, const __half* index_k_cache,
                      const float* index_w, int64_t n_query, int64_t start_pos,
                      int64_t index_heads, int64_t index_dim, int64_t index_topk,
-                     float score_scale, float weight_scale, int* topk_indices,
-                     float* topk_scores, cudaStream_t s = 0);
+                     float score_scale, float weight_scale, float* score_scratch,
+                     int* topk_indices, float* topk_scores, cudaStream_t s = 0);
 void attention_dsa_indexed_paged(const float* q, const float* k_cache, const float* v_cache,
                                  const int* block_table, const int* topk_indices,
                                  int64_t n_query, int64_t start_pos, int64_t n_heads,
@@ -193,6 +240,9 @@ void moe_expert_ffn_w4a16(const float* x, const int* topk_ids, const float* topk
 
 // ---- sampling ------------------------------------------------------------
 void argmax(const float* logits, int vocab, int* out_id, cudaStream_t s = 0);
+// Per-row first-max argmax over y[nrows, ld] (ncols valid); out float2{val, idx}.
+void argmax_rows(const float* y, int nrows, int ncols, int64_t ld, float2* out_pairs,
+                 cudaStream_t s = 0);
 void softmax_inplace(float* logits, int vocab, float temperature, cudaStream_t s = 0);
 
 // ---- glue (GPU forward path) ---------------------------------------------

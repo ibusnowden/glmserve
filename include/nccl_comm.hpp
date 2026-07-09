@@ -50,6 +50,14 @@ public:
     // Tensor-parallel all-reduce (sum) over the TP group, in place.
     void all_reduce_sum(float* data, int64_t count);
 
+    // Row-wise variant: reduces each of the `rows` contiguous rows as its own
+    // NCCL call (grouped, so they pipeline). A ring all-reduce's per-element
+    // summation order depends on the total message size, so reducing an
+    // [n, row_elems] chunk in one call gives bitwise-different sums than the
+    // n [1, row_elems] calls a plain decode step issues. Verify/absorb chunks
+    // use this so speculative decode stays bit-identical to plain greedy.
+    void all_reduce_sum_rows(float* data, int64_t rows, int64_t row_elems);
+
     // Pipeline send/recv of a hidden-state buffer to the next/prev stage.
     void pipeline_send_next(const float* data, int64_t count);
     void pipeline_recv_prev(float* data, int64_t count);

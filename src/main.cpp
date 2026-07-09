@@ -427,6 +427,7 @@ int cmd_bench(const Args& a) {
     EngineOptions o = engine_opts(a);
     int prompt_len = static_cast<int>(a.get_int("prompt-len", 512));
     int gen_len    = static_cast<int>(a.get_int("gen-len", 128));
+    int draft_k    = static_cast<int>(a.get_int("mtp-draft-k", 0));
     // Make sure the device KV cache spans prompt + generation.
     if (o.max_model_len < prompt_len + gen_len + 1)
         o.max_model_len = prompt_len + gen_len + 1;
@@ -434,10 +435,10 @@ int cmd_bench(const Args& a) {
     const bool root = engine.is_root();
 
     if (root)
-        std::fprintf(stderr, "--- benchmark: prompt_len=%d gen_len=%d (world=%d tp=%d pp=%d rank=%d) ---\n",
-                     prompt_len, gen_len, engine.dist().world_size, engine.dist().tp_size,
-                     engine.dist().pp_size, engine.dist().rank);
-    Engine::BenchResult r = engine.profile(prompt_len, gen_len);
+        std::fprintf(stderr, "--- benchmark: prompt_len=%d gen_len=%d draft_k=%d (world=%d tp=%d pp=%d rank=%d) ---\n",
+                     prompt_len, gen_len, draft_k, engine.dist().world_size,
+                     engine.dist().tp_size, engine.dist().pp_size, engine.dist().rank);
+    Engine::BenchResult r = engine.profile(prompt_len, gen_len, draft_k);
     engine.barrier();
 
     if (root) {
@@ -446,6 +447,10 @@ int cmd_bench(const Args& a) {
                     r.prompt_len, r.prefill_ms, r.prefill_tps());
         std::printf("decode         : %d tok in %.2f ms  = %.1f tok/s  (%.3f ms/tok)\n",
                     r.gen_len, r.decode_ms, r.decode_tps(), r.decode_ms_per_tok());
+        if (r.spec_groups > 0)
+            std::printf("speculative    : %d groups, %.2f tok/group accepted (draft_k=%d)%s\n",
+                        r.spec_groups, (double)r.spec_accepted / r.spec_groups, draft_k,
+                        r.spec_fallback ? " adaptive-fallback" : "");
         std::printf("target         : 1300 tok/s  (prefill %.0f%%, decode %.0f%%)\n",
                     100.0 * r.prefill_tps() / 1300.0, 100.0 * r.decode_tps() / 1.0);
     }
@@ -537,8 +542,32 @@ int cmd_mtp(const Args& a) {
     return 0;
 }
 
+int cmd_chunkcheck(const Args& a) {
+    EngineOptions o = engine_opts(a);
+    std::vector<int> prompt = parse_int_list(a.get("tokens", "3 1 4 1 5 9 2 6"));
+    int k = static_cast<int>(a.get_int("k", 5));
+    GLM_CHECK(!prompt.empty(), "chunkcheck requires --tokens \"id id id\"");
+    if (o.max_model_len < static_cast<int64_t>(prompt.size()) + k + 1)
+        o.max_model_len = static_cast<int64_t>(prompt.size()) + k + 1;
+
+    Engine engine(o);
+    Engine::ChunkCheck c = engine.check_chunk_parity(prompt, k);
+    std::printf("chunkcheck: backend=%s k=%d max_abs_diff=%.3e worst_row=%d argmax_match=%s\n",
+                c.gpu ? "CUDA" : "CPU", c.k, c.max_abs_diff, c.worst_row,
+                c.argmax_match ? "YES" : "NO");
+    std::printf("  row_diff: ");
+    for (double d : c.row_diff) std::printf("%.3e ", d);
+    std::printf("\n  decode : ");
+    for (int t : c.dec_tokens) std::printf("%d ", t);
+    std::printf("\n  chunk  : ");
+    for (int t : c.chunk_tokens) std::printf("%d ", t);
+    const bool exact = c.argmax_match && c.max_abs_diff == 0.0;
+    std::printf("\n  RESULT: %s (exact parity %s)\n",
+                c.argmax_match ? "PASS" : "FAIL", exact ? "YES" : "NO");
+    return c.argmax_match ? 0 : 1;
+}
+
 int cmd_mtpcheck(const Args& a) {
-    GLM_CHECK(!a.has("gpu"), "mtpcheck currently validates the CPU MTP path; omit --gpu");
     EngineOptions o = engine_opts(a);
     std::vector<int> prompt = parse_int_list(a.get("tokens", "3 1 4 1 5 9 2 6"));
     int steps = static_cast<int>(a.get_int("gen", 16));
@@ -550,16 +579,21 @@ int cmd_mtpcheck(const Args& a) {
 
     Engine engine(o);
     Engine::MTPCheck c = engine.check_mtp_speculative(prompt, steps, draft_k);
-    std::printf("mtpcheck: steps=%d draft_k=%d groups=%d accepted=%d rejected=%d\n",
-                c.steps, c.draft_k, c.groups, c.accepted, c.rejected);
+    std::printf("mtpcheck: backend=%s steps=%d draft_k=%d groups=%d accepted=%d rejected=%d\n",
+                c.gpu ? "CUDA" : "CPU", c.steps, c.draft_k, c.groups, c.accepted, c.rejected);
     std::printf("  proposed: ");
     for (int t : c.proposed_tokens) std::printf("%d ", t);
     std::printf("\n  target  : ");
     for (int t : c.target_tokens) std::printf("%d ", t);
     std::printf("\n  output  : ");
     for (int t : c.output_tokens) std::printf("%d ", t);
-    std::printf("\n  RESULT: PASS\n");
-    return 0;
+    if (c.gpu) {
+        std::printf("\n  greedy  : ");
+        for (int t : c.ref_tokens) std::printf("%d ", t);
+        std::printf("\n  spec==greedy: %s", c.match ? "YES" : "NO");
+    }
+    std::printf("\n  RESULT: %s\n", c.match ? "PASS" : "FAIL");
+    return c.match ? 0 : 1;
 }
 
 void usage() {
@@ -599,6 +633,7 @@ int main(int argc, char** argv) {
         if (cmd == "gencheck") return cmd_gencheck(a);
         if (cmd == "mtp")      return cmd_mtp(a);
         if (cmd == "mtpcheck") return cmd_mtpcheck(a);
+        if (cmd == "chunkcheck") return cmd_chunkcheck(a);
         usage();
         return 1;
     } catch (const std::exception& e) {

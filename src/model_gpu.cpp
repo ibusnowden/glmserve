@@ -335,6 +335,50 @@ inline void gemm_linear(const float* x, const DLinear& d, const float* bias,
         glmserve::cuda::gemm_fp32(x, d.w, bias, y, n, d.in, d.out, s);
     }
 }
+// Row-wise TP all-reduce in verify/absorb chunks (GLMSERVE_AR_ROWWISE=0
+// restores the wide [n, hidden] reduce, which drifts from plain decode —
+// A/B lever for the spec==greedy gate).
+inline bool ar_rowwise_enabled() {
+    static const bool on = [] {
+        const char* e = std::getenv("GLMSERVE_AR_ROWWISE");
+        return !(e && std::atoi(e) == 0);
+    }();
+    return on;
+}
+// int8 MMQ activation path (GLMSERVE_MMQ=0 restores fp32 activations).
+inline bool mmq_enabled() {
+    static const bool on = [] {
+        const char* e = std::getenv("GLMSERVE_MMQ");
+        return !(e && std::atoi(e) == 0);
+    }();
+    return on;
+}
+inline bool lin_i8_ok(const DLinear& d) {
+    return mmq_enabled() && d.has_q() && glmserve::cuda::qtype_has_i8(d.qtype) &&
+           (d.in % 32) == 0;
+}
+// Quantize x into the given slot and run the int8 gemv (fp32 fallback for
+// types/dims without an integer form).
+inline void gemm_linear_q8(const float* x, const DLinear& d, const float* bias, float* y,
+                           int64_t n, int8_t* xq, float* xs) {
+    if (lin_i8_ok(d)) {
+        glmserve::cuda::quantize_act_q8(x, n, d.in, xq, xs);
+        glmserve::cuda::gemm_q_i8(d.qtype, xq, xs, d.qdata, bias, y, n, d.in, d.out,
+                                  d.row_bytes);
+    } else {
+        gemm_linear(x, d, bias, y, n);
+    }
+}
+// Same with the activations already quantized (multi-consumer inputs). Pass
+// xq == nullptr when the shared slot was not filled for this row block.
+inline void gemm_linear_q8_pre(const float* x, const int8_t* xq, const float* xs,
+                               const DLinear& d, const float* bias, float* y, int64_t n) {
+    if (xq && lin_i8_ok(d))
+        glmserve::cuda::gemm_q_i8(d.qtype, xq, xs, d.qdata, bias, y, n, d.in, d.out,
+                                  d.row_bytes);
+    else
+        gemm_linear(x, d, bias, y, n);
+}
 }  // namespace
 
 struct DLayer {
@@ -364,6 +408,12 @@ struct DLayer {
     DLinear sh_gate, sh_up, sh_down;        // shared expert
 };
 
+// Widest suffix chunk the absorbed-MQA path accepts (MTP verify chunks are a
+// handful of tokens; MTP catch-up absorbs longer histories in these chunks).
+static constexpr int64_t kAbsorbMax = 64;
+// Widest verify chunk (bounds the per-row logits buffer: kVerifyMax * vocab).
+static constexpr int64_t kVerifyMax = 8;
+
 // Per-forward activation buffers, allocated once and grown on demand. Decode
 // (n=1) reuses the same arena every token, so there is no per-token cudaMalloc.
 struct Scratch {
@@ -380,16 +430,25 @@ struct Scratch {
     float* moe_h_act = nullptr;   // [n, topk, moe_inter] scratch for quant MoE
     int*   moe_dispatch = nullptr; // [3E+1 + n*topk] expert-major dispatch scratch
     float* moe_gu_part = nullptr;  // [2, kMoeSplitK, kMoeSplitKMaxTs, moe_inter] split-K partials
+    float* moe_dpart = nullptr;    // [n*topk, hidden] down-phase per-slot partials
+    // int8 MMQ activation slots: `a` holds the current normed row block (the
+    // multi-consumer input: q_a/kv_a/indexer at the attention stage, then
+    // router-side gate/up/experts/shared after the post-norm re-quantize);
+    // `b` is re-quantized per single-consumer input (qa, ckv, attn, gu, ...).
+    int8_t *xq8a = nullptr, *xq8b = nullptr, *hq8 = nullptr;
+    float  *xs8a = nullptr, *xs8b = nullptr, *hs8 = nullptr;
     // Latent-KV mode: prefill-scratch per-head K/V (the cache holds latents
-    // only) + absorbed-decode q/o buffers.
+    // only) + absorbed-MQA query buffer (decode + suffix chunks).
     float *kscr = nullptr, *vscr = nullptr;   // [cap, local_heads, hc]
-    float *qhat = nullptr, *ohat = nullptr;   // [heads, kvlat+rope] / [heads, kvlat]
+    float *qhat = nullptr;                    // [kAbsorbMax, heads, kvlat+rope]
 
     void free_all() {
         for (float* p : {hidden_d, normed, qa, q, kva, ckv, kpe, kvb, attn,
                          attn_proj, mlp, gbuf, ubuf, gu, rlogits, shbuf,
                          index_q, index_k, index_w, dsa_scores, topk_w, moe_h_act,
-                         moe_gu_part, kscr, vscr, qhat, ohat})
+                         moe_gu_part, moe_dpart, kscr, vscr, qhat, xs8a, xs8b, hs8})
+            if (p) cudaFree(p);
+        for (int8_t* p : {xq8a, xq8b, hq8})
             if (p) cudaFree(p);
         if (d_tokens) cudaFree(d_tokens);
         if (topk_ids) cudaFree(topk_ids);
@@ -442,28 +501,50 @@ struct Scratch {
         moe_gu_part = dmalloc(2ll * glmserve::cuda::kMoeSplitK *
                               glmserve::cuda::kMoeSplitKMaxTs *
                               std::max<int64_t>(1, max_moe_inter));
+        moe_dpart = dmalloc(n * topk * hidden);
         const int64_t hc = c.kv_cache_head_dim();
         kscr = dmalloc(n * nheads * hc);
         vscr = dmalloc(n * nheads * hc);
-        qhat = dmalloc(nheads * (kvlat + rope));
-        ohat = dmalloc(nheads * kvlat);
+        qhat = dmalloc(kAbsorbMax * nheads * (kvlat + rope));
+        // int8 MMQ activation buffers, sized for the widest quant-gemm input.
+        const int64_t qin = std::max({2 * hidden, ffmax, qlat, nheads * vd, kvlat});
+        auto i8malloc = [](int64_t bytes) {
+            int8_t* p = nullptr;
+            if (cudaMalloc(&p, static_cast<size_t>(bytes)) != cudaSuccess)
+                throw std::runtime_error("cudaMalloc failed");
+            return p;
+        };
+        xq8a = i8malloc(n * qin);
+        xq8b = i8malloc(n * qin);
+        xs8a = dmalloc(n * ((qin + 31) / 32));
+        xs8b = dmalloc(n * ((qin + 31) / 32));
+        hq8  = i8malloc(n * topk * ffmax);
+        hs8  = dmalloc(n * topk * ((ffmax + 31) / 32));
         cap = n;
     }
 };
 
-// Device-resident MTP/NextN block (single-rank draft path): the NextN glue
-// (enorm/hnorm/eh_proj/shared_head_norm), the full decoder layer, and a
-// dedicated single-layer draft KV cache with the same g->max_ctx block size
-// the attention kernels expect.
+// Device-resident MTP/NextN block: the NextN glue (enorm/hnorm/eh_proj/
+// shared_head_norm), the full decoder layer, and a dedicated single-layer
+// cache with the same g->max_ctx block size the attention kernels expect.
+// For speculative decode the cache spans ABSOLUTE positions: `len` counts the
+// committed prefix; draft steps extend it speculatively and rewind. The
+// single-rank mtp_draft_logits_gpu reference reuses the same block with its
+// own draft-local positions.
 struct GpuMTP {
     bool ready = false;
     DLayer layer;
     DLinear eh_proj;
     float *enorm = nullptr, *hnorm = nullptr, *shared_head_norm = nullptr;
-    float *Kc = nullptr, *Vc = nullptr, *Ic = nullptr;
-    float *emb = nullptr;    // [H] draft-token embedding
-    float *prev = nullptr;   // [H] previous pre-norm hidden state
-    float *fused = nullptr;  // [2H] concat(enorm(emb), hnorm(prev))
+    float *Kc = nullptr, *Vc = nullptr;      // non-latent draft cache
+    __half* Ic = nullptr;
+    __half* Lc = nullptr;                    // latent-mode draft cache
+    float *emb = nullptr;    // [kAbsorbMax, H] draft/absorb token embeddings
+    float *prev = nullptr;   // [H] draft seed: trunk hidden at the last position
+    float *fused = nullptr;  // [kAbsorbMax, 2H] concat(enorm(emb), hnorm(prev))
+    float *hstage = nullptr; // [kAbsorbMax, H] staged trunk hiddens (absorb)
+    float *tmp = nullptr;    // [kAbsorbMax, H] norm staging before the concat
+    int64_t len = 0;         // committed MTP cache positions
 };
 
 struct GpuState {
@@ -479,6 +560,12 @@ struct GpuState {
     int64_t lm_head_off = 0;         // first vocab row of this rank's TP shard
     std::vector<DLayer> layers;
     GpuMTP mtp;
+    // Verify/absorb chunks set this so TP all-reduces run row-by-row: a ring
+    // all-reduce's per-element summation order depends on the total message
+    // size, so reducing [n, hidden] in one call drifts (last-bit) from the n
+    // single-row reduces plain decode issues — enough to flip a near-tie
+    // argmax and break the spec==greedy gate. Prefill keeps the wide reduce.
+    bool ar_rowwise = false;
     int64_t local_heads = 0;
     int64_t max_dense_inter = 0;
     int64_t max_moe_inter = 0;
@@ -487,7 +574,11 @@ struct GpuState {
     // laid out [max_ctx, local_heads, hc]. A single-entry block_table (=0) maps the
     // sequence's one logical block to it, so the paged-attention kernel runs
     // unchanged with block_size = max_ctx.
-    std::vector<float*> Kc, Vc, Ic;
+    std::vector<float*> Kc, Vc;
+    // DSA indexer key cache, fp16 (the indexer scores read it once per key;
+    // fp32 was the per-token memory hog once the trunk cache went latent).
+    std::vector<__half*> Ic;
+    float* dsa_scorebuf = nullptr;   // [kDsaScoreChunk, max_ctx] selector scratch
     // Absorbed-MLA latent cache (GLMSERVE_LATENT_KV, default on): one fp16 row
     // [kvlat + rope] per token per layer, shared by all local heads — replaces
     // Kc/Vc for the trunk. Prefill materializes its own per-head K/V into
@@ -496,9 +587,12 @@ struct GpuState {
     std::vector<__half*> Lc;
     int64_t max_ctx = 0;
     int*   block_table = nullptr;    // single entry, value 0
-    float* logits_d = nullptr;       // [vocab]
+    float* logits_d = nullptr;       // [kVerifyMax, vocab]
+    float* vshard = nullptr;         // [kVerifyMax, lm_head.out] compact shard rows
+    float2* am_pairs = nullptr;      // [kVerifyMax] per-row shard argmax {val, idx}
     Scratch sc;
     int64_t cur_len = 0;             // positions currently valid in the cache
+    int64_t chunk_row0 = 0;          // absolute position of scratch row 0 (last pass)
 
     // Flash-decoding partials: per (head, split) accumulator + softmax stats.
     float *part_acc = nullptr, *part_m = nullptr, *part_l = nullptr;
@@ -838,8 +932,12 @@ bool GLM52Model::upload_to_gpu(int64_t max_ctx) {
             g->Kc[i] = dmalloc(g->max_ctx * nheads * hc);
             g->Vc[i] = dmalloc(g->max_ctx * nheads * hc);
         }
-        g->Ic[i] = dmalloc(g->max_ctx * c.index_head_dim);
+        if (cudaMalloc(&g->Ic[i], static_cast<size_t>(g->max_ctx) *
+                       c.index_head_dim * sizeof(__half)) != cudaSuccess)
+            throw std::runtime_error("cudaMalloc for indexer cache failed");
     }
+    if (c.use_dsa)
+        g->dsa_scorebuf = dmalloc(glmserve::cuda::kDsaScoreChunk * g->max_ctx);
     if (g->latent) {
         // fp16 kv_b residency for the absorbed q/o projections.
         for (size_t i = 0; i < layers_.size(); ++i) {
@@ -867,19 +965,24 @@ bool GLM52Model::upload_to_gpu(int64_t max_ctx) {
     cudaMalloc(&g->block_table, sizeof(int));
     int zero = 0;
     cudaMemcpy(g->block_table, &zero, sizeof(int), cudaMemcpyHostToDevice);
-    if (dist_.is_last_stage())
-        g->logits_d = dmalloc(c.vocab_size);
+    if (dist_.is_last_stage()) {
+        g->logits_d = dmalloc(kVerifyMax * c.vocab_size);
+        g->vshard   = dmalloc(kVerifyMax * g->lm_head.out);
+        cudaMalloc(&g->am_pairs, kVerifyMax * sizeof(float2));
+    }
 
-    // Flash-decoding partials: [n_heads, kMaxSplits, hc|kvlat] + [n_heads, kMaxSplits].
-    g->part_acc = dmalloc(nheads * kMaxSplits * std::max(hc, kvlat));
-    g->part_m   = dmalloc(nheads * kMaxSplits);
-    g->part_l   = dmalloc(nheads * kMaxSplits);
+    // Flash-decoding partials: [kMlaParityMaxQ, n_heads, kMaxSplits, hc|kvlat]
+    // (verify chunks keep the full per-query split budget for decode parity).
+    g->part_acc = dmalloc(glmserve::cuda::kMlaParityMaxQ * nheads * kMaxSplits *
+                          std::max(hc, kvlat));
+    g->part_m   = dmalloc(glmserve::cuda::kMlaParityMaxQ * nheads * kMaxSplits);
+    g->part_l   = dmalloc(glmserve::cuda::kMlaParityMaxQ * nheads * kMaxSplits);
 
-    // MTP/NextN draft block (single-rank only: the draft path needs embeddings
-    // and the lm_head co-resident, and mtp_draft_logits_gpu mirrors the CPU
-    // reference which is single-rank). Not wired for the latent cache yet —
-    // its draft step is a suffix prefill, which the absorbed path rejects.
-    if (mtp_ready() && dist_.world_size == 1 && !g->latent) {
+    // MTP/NextN block (pipeline-stage-local: the draft path needs the
+    // embeddings and lm_head co-resident, so PP > 1 stays unsupported; TP is
+    // fine — the MTP layer arrives pre-sharded and its all-reduces run inside
+    // run_layer_step like any trunk layer).
+    if (mtp_ready() && dist_.pp_size == 1) {
         const MTPBlock& m = mtp_blocks_[0];
         GpuMTP& gm = g->mtp;
         DLayer& d = gm.layer;
@@ -971,12 +1074,41 @@ bool GLM52Model::upload_to_gpu(int64_t max_ctx) {
         gm.enorm = upload(m.enorm.w);
         gm.hnorm = upload(m.hnorm.w);
         gm.shared_head_norm = upload(m.shared_head_norm.w);
-        gm.Kc = dmalloc(g->max_ctx * nheads * hc);
-        gm.Vc = dmalloc(g->max_ctx * nheads * hc);
-        gm.Ic = dmalloc(g->max_ctx * c.index_head_dim);
-        gm.emb   = dmalloc(hidden);
-        gm.prev  = dmalloc(hidden);
-        gm.fused = dmalloc(2 * hidden);
+        if (g->latent) {
+            if (cudaMalloc(&gm.Lc, static_cast<size_t>(g->max_ctx) *
+                           (kvlat + rope) * sizeof(__half)) != cudaSuccess)
+                throw std::runtime_error("cudaMalloc for MTP latent cache failed");
+            const int64_t rows = d.kv_b.out, in = d.kv_b.in;
+            if (cudaMalloc(&d.mla_kvb, static_cast<size_t>(rows) * in *
+                           sizeof(__half)) != cudaSuccess)
+                throw std::runtime_error("cudaMalloc for MTP fp16 kv_b failed");
+            if (d.kv_b.has_q())
+                glmserve::cuda::dequant_rows_f16(d.kv_b.qtype, d.kv_b.qdata, rows, in,
+                                                 d.kv_b.row_bytes, d.mla_kvb);
+            else if (d.kv_b.w)
+                glmserve::cuda::convert_f32_f16(d.kv_b.w, rows * in, d.mla_kvb);
+            else
+                GLM_CHECK(false, "latent KV requires a GGUF-quant or fp32 MTP kv_b");
+        } else {
+            gm.Kc = dmalloc(g->max_ctx * nheads * hc);
+            gm.Vc = dmalloc(g->max_ctx * nheads * hc);
+        }
+        if (cudaMalloc(&gm.Ic, static_cast<size_t>(g->max_ctx) *
+                       c.index_head_dim * sizeof(__half)) != cudaSuccess)
+            throw std::runtime_error("cudaMalloc for MTP indexer cache failed");
+        gm.emb    = dmalloc(kAbsorbMax * hidden);
+        gm.prev   = dmalloc(hidden);
+        gm.fused  = dmalloc(kAbsorbMax * 2 * hidden);
+        gm.hstage = dmalloc(kAbsorbMax * hidden);
+        gm.tmp    = dmalloc(kAbsorbMax * hidden);
+        // Zero the draft caches: a chunked long prefill absorbs only its last
+        // chunk into the MTP cache, so earlier positions must read as zeros
+        // (harmless for drafting; verification guarantees the output stream).
+        if (gm.Lc) cudaMemset(gm.Lc, 0, static_cast<size_t>(g->max_ctx) *
+                              (kvlat + rope) * sizeof(__half));
+        if (gm.Kc) cudaMemset(gm.Kc, 0, static_cast<size_t>(g->max_ctx) * nheads * hc * sizeof(float));
+        if (gm.Vc) cudaMemset(gm.Vc, 0, static_cast<size_t>(g->max_ctx) * nheads * hc * sizeof(float));
+        cudaMemset(gm.Ic, 0, static_cast<size_t>(g->max_ctx) * c.index_head_dim * sizeof(__half));
         gm.ready = true;
     }
 
@@ -999,10 +1131,16 @@ namespace {
 // With a latent cache (Lc != nullptr) the layer stores fp16 latents instead of
 // per-head K/V; prefill materializes its own K/V into Scratch and decode runs
 // the absorbed path. Returns the updated have_shared_dsa_indices flag.
+// `rope_pos0` decouples the RoPE angle from the cache slot: trunk layers pass
+// start_pos, the incremental MTP path passes start_pos + 1 — the NextN block
+// is trained on the SHIFTED stream, so the pair (h_p, token_{p+1}) rotates at
+// the shifted token's position p+1 (llama.cpp draft-mtp parity; slot indices
+// stay dense from 0, which only relabels the same attention set).
 bool run_layer_step(GpuState* g, const GLM52Config& c, Communicator* comm,
                     const DistConfig& dist, const DLayer& d,
-                    float* Kc, float* Vc, float* Ic, __half* Lc,
-                    int64_t n, int64_t start_pos, bool have_shared_dsa_indices) {
+                    float* Kc, float* Vc, __half* Ic, __half* Lc,
+                    int64_t n, int64_t start_pos, int64_t rope_pos0,
+                    bool have_shared_dsa_indices) {
     using namespace glmserve::cuda;
     Scratch& s = g->sc;
     const int64_t hidden = c.hidden_size, nheads = g->local_heads;
@@ -1014,36 +1152,46 @@ bool run_layer_step(GpuState* g, const GLM52Config& c, Communicator* comm,
     const float scale = 1.0f / std::sqrt(static_cast<float>(qk));
     const bool il = c.rope_interleave;
     const bool tp = dist.tp_size > 1;
+    // Absorbed MQA covers decode (n == 1) AND suffix chunks (start_pos > 0,
+    // n <= kAbsorbMax): MTP verify/absorb passes and multi-turn suffix prefill.
+    const bool absorbed = Lc != nullptr && !(n > 1 && start_pos == 0);
+    GLM_CHECK(!absorbed || n <= kAbsorbMax,
+              "latent KV: suffix chunk of %lld tokens exceeds the absorbed-MQA cap %lld",
+              (long long)n, (long long)kAbsorbMax);
 
     // attention sub-block
     g_prof.mark("gap");
     rmsnorm(s.hidden_d, d.input_norm, s.normed, n, hidden, eps);
     dbg_csum("normed", s.normed, n * hidden);
-    gemm_linear(s.normed, d.q_a, nullptr, s.qa, n);
+    // Shared int8 slot `a` <- normed (consumed by q_a/kv_a and the indexer).
+    const bool i8n = lin_i8_ok(d.q_a) || lin_i8_ok(d.kv_a) ||
+                     lin_i8_ok(d.index_wk) || lin_i8_ok(d.index_weights);
+    if (i8n) quantize_act_q8(s.normed, n, hidden, s.xq8a, s.xs8a);
+    const int8_t* nq8 = i8n ? s.xq8a : nullptr;
+    gemm_linear_q8_pre(s.normed, nq8, s.xs8a, d.q_a, nullptr, s.qa, n);
     rmsnorm(s.qa, d.q_a_norm, s.qa, n, qlat, eps);
     dbg_csum("qa", s.qa, n * qlat);
-    gemm_linear(s.qa, d.q_b, nullptr, s.q, n);
+    gemm_linear_q8(s.qa, d.q_b, nullptr, s.q, n, s.xq8b, s.xs8b);
     dbg_csum("q(local)", s.q, n * nheads * qk);
     g_prof.mark("attn.q_proj");
-    gemm_linear(s.normed, d.kv_a, nullptr, s.kva, n);
+    gemm_linear_q8_pre(s.normed, nq8, s.xs8a, d.kv_a, nullptr, s.kva, n);
     slice_rows(s.kva, s.ckv, n, kvlat + rope, 0, kvlat);
     rmsnorm(s.ckv, d.kv_a_norm, s.ckv, n, kvlat, eps);
-    gemm_linear(s.ckv, d.kv_b, nullptr, s.kvb, n);
+    // Absorbed attention never reads the per-head kv_b expansion — skip its gemv.
+    if (!absorbed)
+        gemm_linear_q8(s.ckv, d.kv_b, nullptr, s.kvb, n, s.xq8b, s.xs8b);
     slice_rows(s.kva, s.kpe, n, kvlat + rope, kvlat, rope);
-    rope_k(s.kpe, n, rope, start_pos, c.rope_theta, il);
-    rope_q(s.q, n, nheads, qk, nope, rope, start_pos, c.rope_theta, il);
+    rope_k(s.kpe, n, rope, rope_pos0, c.rope_theta, il);
+    rope_q(s.q, n, nheads, qk, nope, rope, rope_pos0, c.rope_theta, il);
 
     // Per-head K/V for this call's tokens: into the persistent cache normally,
-    // or (latent mode) into Scratch for prefill only — the persistent record
-    // is the fp16 latent row, written for every token either way.
+    // or (latent mode) into Scratch for the full prefill only — the persistent
+    // record is the fp16 latent row, written for every token either way.
     const float* Katt = Kc;
     const float* Vatt = Vc;
     if (Lc) {
         latent_store(s.ckv, s.kpe, Lc, start_pos, n, kvlat, rope);
-        GLM_CHECK(n == 1 || start_pos == 0,
-                  "latent KV: suffix prefill (start_pos>0, n>1) is not supported "
-                  "(set GLMSERVE_LATENT_KV=0)");
-        if (n > 1) {
+        if (!absorbed) {
             assemble_kv(s.kvb, s.kpe, s.kscr, s.vscr, n, nheads, nope, rope, vd, hc);
             Katt = s.kscr;
             Vatt = s.vscr;
@@ -1059,45 +1207,43 @@ bool run_layer_step(GpuState* g, const GLM52Config& c, Communicator* comm,
     const bool sparse_dsa = c.use_dsa && ctx_after > c.index_topk;
     const bool learned_dsa = sparse_dsa && d.index_wq_b.out > 0;
     const bool shared_dsa = sparse_dsa && !learned_dsa && have_shared_dsa_indices;
-    // Absorbed decode over latents (n == 1): score/value both read the shared
-    // fp16 latent rows once for all local heads; the DSA index selection above
-    // is unchanged (the indexer has its own fp32 Ic cache).
-    const bool absorbed = Lc != nullptr && n == 1;
-    auto latent_attn = [&](const int* idx, int64_t j0, int64_t n_keys) {
-        mla_absorb_q(s.q, d.mla_kvb, nheads, qk, nope, vd, kvlat, rope, s.qhat);
-        mla_attention_decode(s.qhat, Lc, idx, j0, n_keys, start_pos, nheads,
-                             kvlat, rope, scale, s.ohat,
+    // Absorbed MQA over latents: score/value both read the shared fp16 latent
+    // rows once for all local heads; pass 2 merges and expands through W_UV in
+    // one fused kernel. The DSA index selection above is unchanged (the
+    // indexer has its own Ic cache).
+    auto latent_attn = [&](const int* idx, int64_t win) {
+        mla_absorb_q(s.q, d.mla_kvb, n, nheads, qk, nope, vd, kvlat, rope, s.qhat);
+        mla_attention_decode(s.qhat, Lc, idx, c.index_topk, win, start_pos, n, nheads,
+                             kvlat, rope, scale, d.mla_kvb, nope, vd, s.attn,
                              g->part_acc, g->part_m, g->part_l, kMaxSplits);
-        mla_expand_o(s.ohat, d.mla_kvb, nheads, nope, vd, kvlat, s.attn);
     };
     if (learned_dsa) {
-        gemm_linear(s.qa, d.index_wq_b, nullptr, s.index_q, n);
-        gemm_linear(s.normed, d.index_wk, nullptr, s.index_k, n);
+        gemm_linear_q8(s.qa, d.index_wq_b, nullptr, s.index_q, n, s.xq8b, s.xs8b);
+        gemm_linear_q8_pre(s.normed, nq8, s.xs8a, d.index_wk, nullptr, s.index_k, n);
         layernorm(s.index_k, d.index_k_norm, d.index_k_bias, s.index_k, n,
                   c.index_head_dim, 1e-6f);
         rope_index_q(s.index_q, n, c.index_n_heads, c.index_head_dim, rope,
-                     start_pos, c.rope_theta, false);
+                     rope_pos0, c.rope_theta, false);
         rope_index_q(s.index_k, n, 1, c.index_head_dim, rope,
-                     start_pos, c.rope_theta, false);
-        cudaMemcpy(Ic + start_pos * c.index_head_dim, s.index_k,
-                   n * c.index_head_dim * sizeof(float), cudaMemcpyDeviceToDevice);
-        gemm_linear(s.normed, d.index_weights, nullptr, s.index_w, n);
+                     rope_pos0, c.rope_theta, false);
+        convert_f32_f16(s.index_k, n * c.index_head_dim, Ic + start_pos * c.index_head_dim);
+        gemm_linear_q8_pre(s.normed, nq8, s.xs8a, d.index_weights, nullptr, s.index_w, n);
         dsa_select_topk(s.index_q, Ic, s.index_w, n, start_pos,
                         c.index_n_heads, c.index_head_dim, c.index_topk,
                         1.0f / std::sqrt(static_cast<float>(c.index_head_dim)),
                         1.0f / std::sqrt(static_cast<float>(c.index_n_heads)),
-                        s.dsa_indices, s.dsa_scores);
+                        g->dsa_scorebuf, s.dsa_indices, s.dsa_scores);
         have_shared_dsa_indices = true;
         g_prof.mark("dsa.index");
         if (absorbed)
-            latent_attn(s.dsa_indices, 0, c.index_topk);
+            latent_attn(s.dsa_indices, 0);
         else
             attention_dsa_indexed_paged(s.q, Katt, Vatt, g->block_table,
                                         s.dsa_indices, n, start_pos, nheads, nheads, qk,
                                         g->max_ctx, c.index_topk, scale, s.attn);
     } else if (shared_dsa) {
         if (absorbed)
-            latent_attn(s.dsa_indices, 0, c.index_topk);
+            latent_attn(s.dsa_indices, 0);
         else
             attention_dsa_indexed_paged(s.q, Katt, Vatt, g->block_table,
                                         s.dsa_indices, n, start_pos, nheads, nheads, qk,
@@ -1105,31 +1251,30 @@ bool run_layer_step(GpuState* g, const GLM52Config& c, Communicator* comm,
     } else if (sparse_dsa) {
         if (absorbed) {
             // Recent-window fallback (mirrors attention_dsa_paged).
-            const int64_t lo = ctx_after > c.index_topk ? ctx_after - c.index_topk : 0;
-            latent_attn(nullptr, lo, ctx_after - lo);
+            latent_attn(nullptr, c.index_topk);
         } else {
             attention_dsa_paged(s.q, Katt, Vatt, g->block_table, n, start_pos,
                                 nheads, nheads, qk, g->max_ctx, c.index_topk, scale, s.attn, 0,
                                 g->part_acc, g->part_m, g->part_l, kMaxSplits);
         }
+    } else if (absorbed) {
+        latent_attn(nullptr, 0);
     } else if (n == 1) {
-        if (absorbed)
-            latent_attn(nullptr, 0, ctx_after);
-        else
-            attention_decode_paged(s.q, Katt, Vatt, g->block_table, start_pos,
-                                   nheads, nheads, qk, g->max_ctx, scale, s.attn,
-                                   g->part_acc, g->part_m, g->part_l, kMaxSplits);
+        attention_decode_paged(s.q, Katt, Vatt, g->block_table, start_pos,
+                               nheads, nheads, qk, g->max_ctx, scale, s.attn,
+                               g->part_acc, g->part_m, g->part_l, kMaxSplits);
     } else {
         attention_dense_paged(s.q, Katt, Vatt, g->block_table, n, start_pos,
                               nheads, nheads, qk, g->max_ctx, scale, s.attn);
     }
     dbg_csum("attn(local)", s.attn, n * nheads * vd);
     g_prof.mark("attn.core");
-    gemm_linear(s.attn, d.o, nullptr, s.attn_proj, n);
+    gemm_linear_q8(s.attn, d.o, nullptr, s.attn_proj, n, s.xq8b, s.xs8b);
     g_prof.mark("attn.o_proj");
     if (tp) {
         GLM_CHECK(comm, "tensor-parallel GPU forward requires a communicator");
-        comm->all_reduce_sum(s.attn_proj, n * hidden);
+        if (g->ar_rowwise) comm->all_reduce_sum_rows(s.attn_proj, n, hidden);
+        else comm->all_reduce_sum(s.attn_proj, n * hidden);
         g_prof.mark("ar.attn");
     }
     dbg_csum("attn_proj", s.attn_proj, n * hidden);
@@ -1140,13 +1285,16 @@ bool run_layer_step(GpuState* g, const GLM52Config& c, Communicator* comm,
     g_prof.mark("resid.norm");
     if (d.is_dense) {
         const int64_t inter = d.gate.out;
-        gemm_linear(s.normed, d.gate, nullptr, s.gbuf, n);
+        const bool i8m = lin_i8_ok(d.gate) || lin_i8_ok(d.up);
+        if (i8m) quantize_act_q8(s.normed, n, hidden, s.xq8a, s.xs8a);
+        const int8_t* mq8 = i8m ? s.xq8a : nullptr;
+        gemm_linear_q8_pre(s.normed, mq8, s.xs8a, d.gate, nullptr, s.gbuf, n);
         dbg_csum("gbuf(local)", s.gbuf, n * inter);
-        gemm_linear(s.normed, d.up,   nullptr, s.ubuf, n);
+        gemm_linear_q8_pre(s.normed, mq8, s.xs8a, d.up, nullptr, s.ubuf, n);
         dbg_csum("ubuf(local)", s.ubuf, n * inter);
         silu_mul(s.gbuf, s.ubuf, s.gu, n * inter);
         dbg_csum("gu(local)", s.gu, n * inter);
-        gemm_linear(s.gu, d.down, nullptr, s.mlp, n);
+        gemm_linear_q8(s.gu, d.down, nullptr, s.mlp, n, s.xq8b, s.xs8b);
         dbg_csum("mlp_pre(local)", s.mlp, n * hidden);
         g_prof.mark("mlp.dense");
     } else {
@@ -1155,14 +1303,30 @@ bool run_layer_step(GpuState* g, const GLM52Config& c, Communicator* comm,
         moe_router(s.rlogits, d.e_bias, n, E, topk, c.norm_topk_prob,
                    static_cast<float>(c.routed_scaling_factor), s.topk_ids, s.topk_w);
         g_prof.mark("moe.router");
+        const bool moe_i8 = mmq_enabled() && d.quant_experts_gguf &&
+                            qtype_has_i8(d.qexp_gate_type) && qtype_has_i8(d.qexp_up_type) &&
+                            qtype_has_i8(d.qexp_down_type) &&
+                            hidden % 32 == 0 && moei % 32 == 0;
+        const bool i8m = moe_i8 || lin_i8_ok(d.sh_gate) || lin_i8_ok(d.sh_up);
+        if (i8m) quantize_act_q8(s.normed, n, hidden, s.xq8a, s.xs8a);
+        const int8_t* mq8 = i8m ? s.xq8a : nullptr;
         cudaMemset(s.mlp, 0, n * hidden * sizeof(float));
-        if (d.quant_experts_gguf) {
+        if (moe_i8) {
+            moe_expert_ffn_q_i8(d.qexp_gate_type, d.qexp_up_type, d.qexp_down_type,
+                                s.xq8a, s.xs8a, s.topk_ids, s.topk_w,
+                                d.qexp_gate_q, d.qexp_up_q, d.qexp_down_q,
+                                n, topk, hidden, moei, E,
+                                d.qexp_gate_rb, d.qexp_up_rb, d.qexp_down_rb,
+                                s.moe_h_act, s.hq8, s.hs8, s.moe_dpart, s.mlp,
+                                s.moe_dispatch, s.moe_gu_part);
+        } else if (d.quant_experts_gguf) {
             moe_expert_ffn_q(d.qexp_gate_type, d.qexp_up_type, d.qexp_down_type,
                              s.normed, s.topk_ids, s.topk_w,
                              d.qexp_gate_q, d.qexp_up_q, d.qexp_down_q,
                              n, topk, hidden, moei, E,
                              d.qexp_gate_rb, d.qexp_up_rb, d.qexp_down_rb,
-                             s.moe_h_act, s.mlp, s.moe_dispatch, s.moe_gu_part);
+                             s.moe_h_act, s.moe_dpart, s.mlp,
+                             s.moe_dispatch, s.moe_gu_part);
         } else if (d.quantized_experts) {
             moe_expert_ffn_w4a16(s.normed, s.topk_ids, s.topk_w,
                                  d.qexp_gate, d.sexp_gate, d.qexp_up, d.sexp_up,
@@ -1175,16 +1339,17 @@ bool run_layer_step(GpuState* g, const GLM52Config& c, Communicator* comm,
         g_prof.mark("moe.experts");
         if (d.sh_gate.out > 0) {
             const int64_t sh_inter = d.sh_gate.out;
-            gemm_linear(s.normed, d.sh_gate, nullptr, s.gbuf, n);
-            gemm_linear(s.normed, d.sh_up,   nullptr, s.ubuf, n);
+            gemm_linear_q8_pre(s.normed, mq8, s.xs8a, d.sh_gate, nullptr, s.gbuf, n);
+            gemm_linear_q8_pre(s.normed, mq8, s.xs8a, d.sh_up,   nullptr, s.ubuf, n);
             silu_mul(s.gbuf, s.ubuf, s.gu, n * sh_inter);
-            gemm_linear(s.gu, d.sh_down, nullptr, s.shbuf, n);
+            gemm_linear_q8(s.gu, d.sh_down, nullptr, s.shbuf, n, s.xq8b, s.xs8b);
             add_inplace(s.mlp, s.shbuf, n * hidden);
             g_prof.mark("moe.shared");
         }
     }
     if (tp) {
-        comm->all_reduce_sum(s.mlp, n * hidden);
+        if (g->ar_rowwise) comm->all_reduce_sum_rows(s.mlp, n, hidden);
+        else comm->all_reduce_sum(s.mlp, n * hidden);
         g_prof.mark("ar.mlp");
     }
     dbg_csum("mlp", s.mlp, n * hidden);
@@ -1205,7 +1370,8 @@ bool run_block_stack(GpuState* g, const GLM52Config& c, Communicator* comm,
             run_layer_step(g, c, comm, dist, g->layers[l],
                            g->Kc[l], g->Vc[l], g->Ic[l],
                            g->latent ? g->Lc[l] : nullptr,
-                           n, start_pos, have_shared_dsa_indices);
+                           n, start_pos, /*rope_pos0=*/start_pos,
+                           have_shared_dsa_indices);
     }
     return have_shared_dsa_indices;
 }
@@ -1227,8 +1393,9 @@ std::vector<float> finish_logits(GpuState* g, const GLM52Config& c, int64_t n,
                   "lm_head shard exceeds vocab");
         cudaMemset(g->logits_d, 0, c.vocab_size * sizeof(float));
     }
-    gemm_linear(g->sc.normed + (n - 1) * c.hidden_size, g->lm_head, nullptr,
-                g->logits_d + (sharded ? g->lm_head_off : 0), 1);
+    gemm_linear_q8(g->sc.normed + (n - 1) * c.hidden_size, g->lm_head, nullptr,
+                   g->logits_d + (sharded ? g->lm_head_off : 0), 1,
+                   g->sc.xq8b, g->sc.xs8b);
     if (sharded) {
         GLM_CHECK(comm, "sharded lm_head requires a communicator");
         if (std::getenv("GLMSERVE_DEBUG_CSUM")) {
@@ -1246,6 +1413,137 @@ std::vector<float> finish_logits(GpuState* g, const GLM52Config& c, int64_t n,
     cudaDeviceSynchronize();
     return logits;
 }
+
+// lm_head over `n` already-normed device rows -> host [n, vocab]. Rows go
+// through the T-tiled quant gemv into a compact [n, out_shard] buffer (the
+// weights are read once for all rows), are scattered into the [n, vocab]
+// logits layout, and combined with one all-reduce under a column-parallel
+// shard — every rank returns identical full logits.
+std::vector<float> lm_head_rows(GpuState* g, const GLM52Config& c, const float* normed_rows,
+                                int64_t n, Communicator* comm) {
+    using namespace glmserve::cuda;
+    GLM_CHECK(g->logits_d && g->vshard && g->lm_head.out > 0,
+              "lm_head_rows called on a non-final or incompletely uploaded GPU stage");
+    GLM_CHECK(n >= 1 && n <= kVerifyMax, "lm_head_rows: %lld rows > kVerifyMax %lld",
+              (long long)n, (long long)kVerifyMax);
+    const DLinear& lm = g->lm_head;
+    const bool sharded = lm.out < c.vocab_size;
+    float* y = sharded ? g->vshard : g->logits_d;
+    if (lin_i8_ok(lm)) {
+        quantize_act_q8(normed_rows, n, lm.in, g->sc.xq8b, g->sc.xs8b);
+        gemm_q_i8(lm.qtype, g->sc.xq8b, g->sc.xs8b, lm.qdata, nullptr, y,
+                  n, lm.in, lm.out, lm.row_bytes);
+    } else {
+        gemm_linear(normed_rows, lm, nullptr, y, n);
+    }
+    if (sharded) {
+        GLM_CHECK(comm, "sharded lm_head requires a communicator");
+        GLM_CHECK(g->lm_head_off + lm.out <= c.vocab_size, "lm_head shard exceeds vocab");
+        cudaMemset(g->logits_d, 0, static_cast<size_t>(n) * c.vocab_size * sizeof(float));
+        cudaMemcpy2D(g->logits_d + g->lm_head_off, c.vocab_size * sizeof(float),
+                     y, lm.out * sizeof(float), lm.out * sizeof(float),
+                     static_cast<size_t>(n), cudaMemcpyDeviceToDevice);
+        comm->all_reduce_sum(g->logits_d, n * c.vocab_size);
+    }
+    std::vector<float> out(static_cast<size_t>(n) * c.vocab_size);
+    cudaMemcpy(out.data(), g->logits_d, out.size() * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaDeviceSynchronize();
+    return out;
+}
+
+// Greedy twin of lm_head_rows: per-row argmax token ids without materializing
+// (or all-reducing, or copying out) the full vocab logits. Each rank argmaxes
+// its lm_head shard on-device; shard winners {val, global idx} are then
+// concatenated with one tiny all-reduce (disjoint slots, sum == gather) and
+// resolved host-side with first-max tie semantics — exactly matching a serial
+// host argmax over the combined logits.
+std::vector<int> lm_head_greedy_rows(GpuState* g, const GLM52Config& c,
+                                     const float* normed_rows, int64_t n,
+                                     Communicator* comm, const DistConfig& dist) {
+    using namespace glmserve::cuda;
+    GLM_CHECK(g->am_pairs && g->lm_head.out > 0,
+              "lm_head_greedy_rows called on a non-final or incompletely uploaded GPU stage");
+    GLM_CHECK(n >= 1 && n <= kVerifyMax, "lm_head_greedy_rows: %lld rows > kVerifyMax %lld",
+              (long long)n, (long long)kVerifyMax);
+    const DLinear& lm = g->lm_head;
+    const bool sharded = lm.out < c.vocab_size;
+    float* y = sharded ? g->vshard : g->logits_d;
+    if (lin_i8_ok(lm)) {
+        quantize_act_q8(normed_rows, n, lm.in, g->sc.xq8b, g->sc.xs8b);
+        gemm_q_i8(lm.qtype, g->sc.xq8b, g->sc.xs8b, lm.qdata, nullptr, y,
+                  n, lm.in, lm.out, lm.row_bytes);
+    } else {
+        gemm_linear(normed_rows, lm, nullptr, y, n);
+    }
+    argmax_rows(y, static_cast<int>(n), static_cast<int>(lm.out), lm.out, g->am_pairs);
+    std::vector<float2> pairs(static_cast<size_t>(n));
+    cudaMemcpy(pairs.data(), g->am_pairs, n * sizeof(float2), cudaMemcpyDeviceToHost);
+    cudaDeviceSynchronize();
+
+    std::vector<int> out(static_cast<size_t>(n));
+    if (!sharded) {
+        for (int64_t r = 0; r < n; ++r)
+            out[static_cast<size_t>(r)] = static_cast<int>(pairs[static_cast<size_t>(r)].y);
+        return out;
+    }
+    GLM_CHECK(comm, "sharded lm_head requires a communicator");
+    const int world = dist.tp_size;
+    const int rank = dist.tp_rank();
+    std::vector<float> combine(static_cast<size_t>(n) * 2 * world, 0.0f);
+    for (int64_t r = 0; r < n; ++r) {
+        combine[static_cast<size_t>(r * 2 * world + 2 * rank)] = pairs[static_cast<size_t>(r)].x;
+        combine[static_cast<size_t>(r * 2 * world + 2 * rank + 1)] =
+            static_cast<float>(g->lm_head_off + static_cast<int64_t>(pairs[static_cast<size_t>(r)].y));
+    }
+    comm->all_reduce_sum(combine.data(), static_cast<int64_t>(combine.size()));
+    for (int64_t r = 0; r < n; ++r) {
+        const float* p = combine.data() + r * 2 * world;
+        float best = p[0];
+        int64_t best_i = static_cast<int64_t>(p[1]);
+        for (int w = 1; w < world; ++w) {
+            const float v = p[2 * w];
+            const int64_t i = static_cast<int64_t>(p[2 * w + 1]);
+            if (v > best || (v == best && i < best_i)) { best = v; best_i = i; }
+        }
+        out[static_cast<size_t>(r)] = static_cast<int>(best_i);
+    }
+    return out;
+}
+
+// Gather `n` token embeddings into a device buffer (host-resident quant table,
+// device quant table, or fp32 table — mirrors the forward embed stage).
+void gather_embeds(GpuState* g, const GLM52Config& c, const Linear& embed_lin,
+                   const int* toks, int64_t n, float* dst) {
+    using namespace glmserve::cuda;
+    const int64_t H = c.hidden_size;
+    if (g->embed_host) {
+        std::vector<float> h(static_cast<size_t>(n) * H);
+        for (int64_t t = 0; t < n; ++t) {
+            std::vector<float> row = gguf_dequantize_row(
+                embed_lin.qtype, embed_lin.qdata, static_cast<uint64_t>(H),
+                static_cast<uint64_t>(toks[t]));
+            std::copy(row.begin(), row.end(), h.begin() + t * H);
+        }
+        cudaMemcpy(dst, h.data(), h.size() * sizeof(float), cudaMemcpyHostToDevice);
+        return;
+    }
+    cudaMemcpy(g->sc.d_tokens, toks, n * sizeof(int), cudaMemcpyHostToDevice);
+    if (g->embed_q)
+        embed_gather_q(g->embed_type, g->embed_q, g->sc.d_tokens, dst, n, H,
+                       g->embed_row_bytes);
+    else
+        embed_gather(g->embed, g->sc.d_tokens, dst, n, H);
+}
+
+// Prefill chunk cap: bounds the scratch arena (which scales with the widest
+// chunk — ~5 GiB at 16K tokens, versus ~1.8 GiB free per TP=8 rank).
+int64_t prefill_chunk_cap() {
+    static const int64_t cap = [] {
+        const char* e = std::getenv("GLMSERVE_PREFILL_CHUNK");
+        return e ? std::atoll(e) : 2048ll;
+    }();
+    return cap;
+}
 }  // namespace
 
 std::vector<float> GLM52Model::forward_gpu_prefill(const std::vector<int>& tokens) {
@@ -1256,6 +1554,35 @@ std::vector<float> GLM52Model::forward_gpu_prefill(const std::vector<int>& token
     GLM_CHECK(n > 0, "forward_gpu_prefill: empty prompt");
     GLM_CHECK(n <= g->max_ctx, "forward_gpu_prefill: prompt %lld > GPU KV ctx %lld",
               (long long)n, (long long)g->max_ctx);
+
+    // Long prompts run chunked so the scratch arena stays bounded: the first
+    // chunk takes the one-shot path below, later chunks are suffix passes
+    // (absorbed MQA under the latent cache, so they are kAbsorbMax wide).
+    const int64_t chunk0 = prefill_chunk_cap();
+    if (n > chunk0 && dist_.pp_size == 1) {
+        g->sc.ensure(chunk0, cfg_, g->local_heads, g->max_dense_inter, g->max_moe_inter);
+        g_prof.mark("fwd.start");
+        gather_embeds(g, cfg_, embed_lin_, tokens.data(), chunk0, g->sc.hidden_d);
+        g_prof.mark("embed");
+        run_block_stack(g, cfg_, comm_, dist_, chunk0, /*start_pos=*/0, false);
+        int64_t pos = chunk0;
+        int64_t last = chunk0;
+        const int64_t step = g->latent ? std::min(kAbsorbMax, chunk0) : chunk0;
+        while (pos < n) {
+            const int64_t nc = std::min(step, n - pos);
+            gather_embeds(g, cfg_, embed_lin_, tokens.data() + pos, nc, g->sc.hidden_d);
+            run_block_stack(g, cfg_, comm_, dist_, nc, pos, false);
+            last = nc;
+            pos += nc;
+        }
+        g->cur_len = n;
+        g->chunk_row0 = n - last;
+        std::vector<float> logits = finish_logits(g, cfg_, last, comm_);
+        g_prof.mark("lm_head");
+        cuda_check("forward_gpu_prefill");
+        g_prof.flush();
+        return logits;
+    }
 
     g->sc.ensure(n, cfg_, g->local_heads, g->max_dense_inter, g->max_moe_inter);
     g_prof.mark("fwd.start");
@@ -1303,6 +1630,7 @@ std::vector<float> GLM52Model::forward_gpu_prefill(const std::vector<int>& token
     bool have_shared_dsa = run_block_stack(g, cfg_, comm_, dist_, n, /*start_pos=*/0,
                                            recv_shared_dsa);
     g->cur_len = n;
+    g->chunk_row0 = 0;
     if (!dist_.is_last_stage()) {
         GLM_CHECK(comm_, "forward_gpu_prefill: non-last pipeline stage requires a communicator");
         comm_->pipeline_send_next(g->sc.hidden_d, n * cfg_.hidden_size);
@@ -1364,6 +1692,7 @@ std::vector<float> GLM52Model::forward_gpu_decode(int token, int64_t pos) {
     bool have_shared_dsa = run_block_stack(g, cfg_, comm_, dist_, /*n=*/1, /*start_pos=*/pos,
                                            recv_shared_dsa);
     g->cur_len = pos + 1;
+    g->chunk_row0 = pos;
     if (!dist_.is_last_stage()) {
         GLM_CHECK(comm_, "forward_gpu_decode: non-last pipeline stage requires a communicator");
         comm_->pipeline_send_next(g->sc.hidden_d, cfg_.hidden_size);
@@ -1432,8 +1761,10 @@ std::vector<float> GLM52Model::mtp_draft_logits_gpu(const std::vector<int>& cont
         rmsnorm(gm.prev, gm.hnorm, gm.fused + H, 1, H, eps);
         gemm_linear(gm.fused, gm.eh_proj, nullptr, g->sc.hidden_d, 1);
 
+        // Draft-local positions: the numpy/CPU reference ropes at the raw
+        // step index, so this gate path keeps rope_pos0 == slot.
         run_layer_step(g, cfg_, comm_, dist_, gm.layer, gm.Kc, gm.Vc, gm.Ic,
-                       /*Lc=*/nullptr, /*n=*/1, /*start_pos=*/s, false);
+                       gm.Lc, /*n=*/1, /*start_pos=*/s, /*rope_pos0=*/s, false);
         cudaMemcpy(gm.prev, g->sc.hidden_d, H * sizeof(float), cudaMemcpyDeviceToDevice);
 
         rmsnorm(g->sc.hidden_d, gm.shared_head_norm, g->sc.normed, 1, H, eps);
@@ -1444,6 +1775,161 @@ std::vector<float> GLM52Model::mtp_draft_logits_gpu(const std::vector<int>& cont
     cudaDeviceSynchronize();
     cuda_check("mtp_draft_logits_gpu");
     return logits;
+}
+
+// ---- GPU speculative decode (incremental MTP over absolute positions) ------
+
+bool GLM52Model::mtp_gpu_ready() const {
+    return gpu_state_ != nullptr && static_cast<GpuState*>(gpu_state_)->mtp.ready;
+}
+
+void GLM52Model::gpu_rewind(int64_t len) {
+    GLM_CHECK(gpu_state_ != nullptr, "gpu_rewind: call upload_to_gpu() first");
+    auto* g = static_cast<GpuState*>(gpu_state_);
+    GLM_CHECK(len >= 0 && len <= g->cur_len, "gpu_rewind: %lld outside [0, %lld]",
+              (long long)len, (long long)g->cur_len);
+    g->cur_len = len;   // caches are append-only; the tail is overwritten later
+}
+
+int64_t GLM52Model::gpu_chunk_row0() const {
+    return gpu_state_ ? static_cast<GpuState*>(gpu_state_)->chunk_row0 : 0;
+}
+
+void GLM52Model::forward_gpu_chunk(const std::vector<int>& tokens, int64_t start_pos,
+                                   std::vector<float>* all_logits) {
+    GLM_CHECK(gpu_state_ != nullptr, "forward_gpu_chunk: call upload_to_gpu() first");
+    using namespace glmserve::cuda;
+    auto* g = static_cast<GpuState*>(gpu_state_);
+    const int64_t n = static_cast<int64_t>(tokens.size());
+    GLM_CHECK(n >= 1 && n <= kVerifyMax, "forward_gpu_chunk: %lld tokens > kVerifyMax %lld",
+              (long long)n, (long long)kVerifyMax);
+    GLM_CHECK(start_pos + n <= g->max_ctx, "forward_gpu_chunk: %lld+%lld > GPU KV ctx %lld",
+              (long long)start_pos, (long long)n, (long long)g->max_ctx);
+    GLM_CHECK(dist_.pp_size == 1, "forward_gpu_chunk supports TP-only ranks");
+    GLM_CHECK(all_logits != nullptr, "forward_gpu_chunk requires an all_logits sink");
+
+    g->sc.ensure(n, cfg_, g->local_heads, g->max_dense_inter, g->max_moe_inter);
+    g_prof.mark("fwd.start");
+    gather_embeds(g, cfg_, embed_lin_, tokens.data(), n, g->sc.hidden_d);
+    g_prof.mark("embed");
+    g->ar_rowwise = ar_rowwise_enabled();
+    run_block_stack(g, cfg_, comm_, dist_, n, start_pos, false);
+    g->ar_rowwise = false;
+    g->cur_len = start_pos + n;
+    g->chunk_row0 = start_pos;
+    rmsnorm(g->sc.hidden_d, g->final_norm, g->sc.normed, n, cfg_.hidden_size,
+            static_cast<float>(cfg_.rms_norm_eps));
+    *all_logits = lm_head_rows(g, cfg_, g->sc.normed, n, comm_);
+    g_prof.mark("lm_head");
+    cuda_check("forward_gpu_chunk");
+    g_prof.flush();
+}
+
+// Greedy verify pass: identical trunk forward to forward_gpu_chunk, but only
+// the per-row argmax token ids leave the device (greedy spec decode never
+// consumes full logits — this skips the [n, vocab] zero-fill, all-reduce and
+// D2H copy on every verify group).
+void GLM52Model::forward_gpu_chunk_greedy(const std::vector<int>& tokens, int64_t start_pos,
+                                          std::vector<int>* row_argmax) {
+    GLM_CHECK(gpu_state_ != nullptr, "forward_gpu_chunk_greedy: call upload_to_gpu() first");
+    using namespace glmserve::cuda;
+    auto* g = static_cast<GpuState*>(gpu_state_);
+    const int64_t n = static_cast<int64_t>(tokens.size());
+    GLM_CHECK(n >= 1 && n <= kVerifyMax, "forward_gpu_chunk_greedy: %lld tokens > kVerifyMax %lld",
+              (long long)n, (long long)kVerifyMax);
+    GLM_CHECK(start_pos + n <= g->max_ctx, "forward_gpu_chunk_greedy: %lld+%lld > GPU KV ctx %lld",
+              (long long)start_pos, (long long)n, (long long)g->max_ctx);
+    GLM_CHECK(dist_.pp_size == 1, "forward_gpu_chunk_greedy supports TP-only ranks");
+    GLM_CHECK(row_argmax != nullptr, "forward_gpu_chunk_greedy requires a row_argmax sink");
+
+    g->sc.ensure(n, cfg_, g->local_heads, g->max_dense_inter, g->max_moe_inter);
+    g_prof.mark("fwd.start");
+    gather_embeds(g, cfg_, embed_lin_, tokens.data(), n, g->sc.hidden_d);
+    g_prof.mark("embed");
+    g->ar_rowwise = ar_rowwise_enabled();
+    run_block_stack(g, cfg_, comm_, dist_, n, start_pos, false);
+    g->ar_rowwise = false;
+    g->cur_len = start_pos + n;
+    g->chunk_row0 = start_pos;
+    rmsnorm(g->sc.hidden_d, g->final_norm, g->sc.normed, n, cfg_.hidden_size,
+            static_cast<float>(cfg_.rms_norm_eps));
+    *row_argmax = lm_head_greedy_rows(g, cfg_, g->sc.normed, n, comm_, dist_);
+    g_prof.mark("lm_head");
+    cuda_check("forward_gpu_chunk_greedy");
+    g_prof.flush();
+}
+
+void GLM52Model::mtp_gpu_absorb(const std::vector<int>& next_tokens, int64_t pos0) {
+    GLM_CHECK(mtp_gpu_ready(), "mtp_gpu_absorb: MTP block not resident");
+    using namespace glmserve::cuda;
+    auto* g = static_cast<GpuState*>(gpu_state_);
+    GpuMTP& gm = g->mtp;
+    const int64_t H = cfg_.hidden_size;
+    const int64_t count = static_cast<int64_t>(next_tokens.size());
+    const float eps = static_cast<float>(cfg_.rms_norm_eps);
+    GLM_CHECK(pos0 + count <= g->max_ctx, "mtp_gpu_absorb: positions exceed GPU KV ctx");
+
+    // Draft seed: the trunk hidden one past the absorbed prefix (still in the
+    // last chunk's scratch rows — this call must directly follow that pass).
+    cudaMemcpy(gm.prev, g->sc.hidden_d + count * H, H * sizeof(float),
+               cudaMemcpyDeviceToDevice);
+    for (int64_t c0 = 0; c0 < count; c0 += kAbsorbMax) {
+        const int64_t nc = std::min(kAbsorbMax, count - c0);
+        // Stage this chunk's trunk hiddens: the MTP layer pass below reuses
+        // the scratch rows [0, nc) that hold them for c0 == 0.
+        cudaMemcpy(gm.hstage, g->sc.hidden_d + c0 * H, nc * H * sizeof(float),
+                   cudaMemcpyDeviceToDevice);
+        gather_embeds(g, cfg_, embed_lin_, next_tokens.data() + c0,
+                      nc, gm.emb);
+        // fused rows = [enorm(embed(token_{p+1})) | hnorm(h_p)]
+        rmsnorm(gm.emb, gm.enorm, gm.tmp, nc, H, eps);
+        cudaMemcpy2D(gm.fused, 2 * H * sizeof(float), gm.tmp, H * sizeof(float),
+                     H * sizeof(float), static_cast<size_t>(nc), cudaMemcpyDeviceToDevice);
+        rmsnorm(gm.hstage, gm.hnorm, gm.tmp, nc, H, eps);
+        cudaMemcpy2D(gm.fused + H, 2 * H * sizeof(float), gm.tmp, H * sizeof(float),
+                     H * sizeof(float), static_cast<size_t>(nc), cudaMemcpyDeviceToDevice);
+        gemm_linear_q8(gm.fused, gm.eh_proj, nullptr, g->sc.hidden_d, nc,
+                       g->sc.xq8b, g->sc.xs8b);
+        run_layer_step(g, cfg_, comm_, dist_, gm.layer, gm.Kc, gm.Vc, gm.Ic, gm.Lc,
+                       nc, pos0 + c0, /*rope_pos0=*/pos0 + c0 + 1, false);
+    }
+    gm.len = pos0 + count;
+    cuda_check("mtp_gpu_absorb");
+}
+
+std::vector<int> GLM52Model::mtp_gpu_draft(int next_token, int k) {
+    GLM_CHECK(mtp_gpu_ready(), "mtp_gpu_draft: MTP block not resident");
+    using namespace glmserve::cuda;
+    auto* g = static_cast<GpuState*>(gpu_state_);
+    GpuMTP& gm = g->mtp;
+    const int64_t H = cfg_.hidden_size;
+    const float eps = static_cast<float>(cfg_.rms_norm_eps);
+    GLM_CHECK(k >= 1, "mtp_gpu_draft: k must be positive");
+    GLM_CHECK(gm.len + k <= g->max_ctx, "mtp_gpu_draft: draft exceeds GPU KV ctx");
+
+    std::vector<int> out;
+    out.reserve(static_cast<size_t>(k));
+    int tok = next_token;
+    for (int i = 0; i < k; ++i) {
+        gather_embeds(g, cfg_, embed_lin_, &tok, 1, gm.emb);
+        rmsnorm(gm.emb, gm.enorm, gm.fused, 1, H, eps);
+        rmsnorm(i == 0 ? gm.prev : gm.tmp, gm.hnorm, gm.fused + H, 1, H, eps);
+        gemm_linear_q8(gm.fused, gm.eh_proj, nullptr, g->sc.hidden_d, 1,
+                       g->sc.xq8b, g->sc.xs8b);
+        run_layer_step(g, cfg_, comm_, dist_, gm.layer, gm.Kc, gm.Vc, gm.Ic, gm.Lc,
+                       1, gm.len + i, /*rope_pos0=*/gm.len + i + 1, false);
+        // This step's MTP hidden feeds the next step's hnorm.
+        cudaMemcpy(gm.tmp, g->sc.hidden_d, H * sizeof(float), cudaMemcpyDeviceToDevice);
+        rmsnorm(g->sc.hidden_d, gm.shared_head_norm, g->sc.normed, 1, H, eps);
+        const int best = lm_head_greedy_rows(g, cfg_, g->sc.normed, 1, comm_, dist_)[0];
+        out.push_back(best);
+        tok = best;
+    }
+    // Step 0 consumed committed inputs (the verified next token + the trunk
+    // hidden), so its cache entry stays; later entries are speculative.
+    gm.len += 1;
+    cuda_check("mtp_gpu_draft");
+    return out;
 }
 
 GLM52Model::~GLM52Model() {
@@ -1482,17 +1968,24 @@ GLM52Model::~GLM52Model() {
                              &d.gate, &d.up, &d.down, &d.router,
                              &d.sh_gate, &d.sh_up, &d.sh_down})
             free_lin(*lin);
+        if (d.mla_kvb) cudaFree(d.mla_kvb);
         free_lin(gm.eh_proj);
         for (float* p : {gm.enorm, gm.hnorm, gm.shared_head_norm,
-                         gm.Kc, gm.Vc, gm.Ic, gm.emb, gm.prev, gm.fused})
+                         gm.Kc, gm.Vc, gm.emb, gm.prev, gm.fused,
+                         gm.hstage, gm.tmp})
             if (p) cudaFree(p);
+        if (gm.Ic) cudaFree(gm.Ic);
+        if (gm.Lc) cudaFree(gm.Lc);
     }
     for (float* p : g->Kc) if (p) cudaFree(p);
     for (float* p : g->Vc) if (p) cudaFree(p);
-    for (float* p : g->Ic) if (p) cudaFree(p);
+    for (__half* p : g->Ic) if (p) cudaFree(p);
     for (__half* p : g->Lc) if (p) cudaFree(p);
+    if (g->dsa_scorebuf) cudaFree(g->dsa_scorebuf);
     if (g->block_table) cudaFree(g->block_table);
     if (g->logits_d) cudaFree(g->logits_d);
+    if (g->vshard) cudaFree(g->vshard);
+    if (g->am_pairs) cudaFree(g->am_pairs);
     if (g->part_acc) cudaFree(g->part_acc);
     if (g->part_m) cudaFree(g->part_m);
     if (g->part_l) cudaFree(g->part_l);

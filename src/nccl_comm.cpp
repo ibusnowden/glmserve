@@ -13,6 +13,7 @@
 #ifdef GLMSERVE_CUDA
 #include <cuda_runtime.h>
 #include <nccl.h>
+#include "../cuda/custom_ar.h"
 #endif
 
 namespace glmserve {
@@ -51,6 +52,10 @@ struct NcclState {
     // skip it entirely.
     float* bounce = nullptr;
     int64_t bounce_count = 0;
+    // Custom one-shot P2P all-reduce for decode-sized messages (custom_ar.h).
+    // 0 = untried, 1 = active, -1 = unavailable (fall back to NCCL forever).
+    glmserve::cuda::CustomAr* car = nullptr;
+    int car_state = 0;
 };
 
 // True if `p` is a CUDA device (or managed) allocation. Unregistered host
@@ -204,6 +209,7 @@ Communicator::~Communicator() {
 #ifdef GLMSERVE_CUDA
     auto* s = static_cast<NcclState*>(state_);
     if (!s) return;
+    if (s->car) glmserve::cuda::custom_ar_destroy(s->car);
     if (s->tp && s->tp != s->world) ncclCommDestroy(s->tp);
     if (s->world) ncclCommDestroy(s->world);
     if (s->bounce) cudaFree(s->bounce);
@@ -213,12 +219,79 @@ Communicator::~Communicator() {
 #endif
 }
 
+#ifdef GLMSERVE_CUDA
+namespace {
+
+// All-or-none lazy init of the custom P2P all-reduce: create local staging,
+// allgather the IPC handles over the TP communicator, open peers, then agree
+// group-wide (NCCL min) so no rank ever takes the custom path alone.
+void init_custom_ar(NcclState* s, const DistConfig& cfg) {
+    using glmserve::cuda::kCustomArHandleBytes;
+    s->car_state = -1;
+    const char* e = std::getenv("GLMSERVE_CUSTOM_AR");
+    if (!e || !*e || *e == '0') return;
+    if (cfg.tp_size != cfg.world_size || cfg.world_size < 2 || cfg.world_size > 8)
+        return;
+
+    char handle[kCustomArHandleBytes] = {};
+    s->car = glmserve::cuda::custom_ar_create(cfg.rank, cfg.world_size, handle);
+    float ok = s->car ? 1.0f : 0.0f;
+
+    // Exchange handles (all ranks participate even after a local failure so
+    // the collectives stay matched).
+    char* d_handles = nullptr;
+    cuda_ok(cudaMalloc(&d_handles,
+                       static_cast<size_t>(cfg.world_size) * kCustomArHandleBytes),
+            "cudaMalloc(custom_ar handles)");
+    cuda_ok(cudaMemcpyAsync(d_handles + cfg.rank * kCustomArHandleBytes, handle,
+                            kCustomArHandleBytes, cudaMemcpyHostToDevice, s->stream),
+            "cudaMemcpyAsync(custom_ar handle H2D)");
+    nccl_ok(ncclAllGather(d_handles + cfg.rank * kCustomArHandleBytes, d_handles,
+                          kCustomArHandleBytes, ncclChar, s->tp, s->stream),
+            "ncclAllGather(custom_ar handles)");
+    std::vector<char> handles(static_cast<size_t>(cfg.world_size) * kCustomArHandleBytes);
+    cuda_ok(cudaMemcpyAsync(handles.data(), d_handles, handles.size(),
+                            cudaMemcpyDeviceToHost, s->stream),
+            "cudaMemcpyAsync(custom_ar handles D2H)");
+    cuda_ok(cudaStreamSynchronize(s->stream), "cudaStreamSynchronize(custom_ar handles)");
+
+    if (s->car && !glmserve::cuda::custom_ar_open(s->car, handles.data())) ok = 0.0f;
+
+    float* d_ok = reinterpret_cast<float*>(d_handles);  // reuse as the vote slot
+    cuda_ok(cudaMemcpyAsync(d_ok, &ok, sizeof(float), cudaMemcpyHostToDevice, s->stream),
+            "cudaMemcpyAsync(custom_ar vote H2D)");
+    nccl_ok(ncclAllReduce(d_ok, d_ok, 1, ncclFloat, ncclMin, s->tp, s->stream),
+            "ncclAllReduce(custom_ar vote)");
+    cuda_ok(cudaMemcpyAsync(&ok, d_ok, sizeof(float), cudaMemcpyDeviceToHost, s->stream),
+            "cudaMemcpyAsync(custom_ar vote D2H)");
+    cuda_ok(cudaStreamSynchronize(s->stream), "cudaStreamSynchronize(custom_ar vote)");
+    cudaFree(d_handles);
+
+    if (ok < 1.0f) {
+        if (s->car) { glmserve::cuda::custom_ar_destroy(s->car); s->car = nullptr; }
+        GLM_WARN("custom all-reduce unavailable on some rank; using NCCL");
+        return;
+    }
+    s->car_state = 1;
+    GLM_INFO("custom P2P all-reduce active (<= %lld floats, world %d)",
+             (long long)glmserve::cuda::custom_ar_max_count(), cfg.world_size);
+}
+
+}  // namespace
+#endif
+
 void Communicator::all_reduce_sum(float* data, int64_t count) {
     if (cfg_.tp_size <= 1) return;  // nothing to reduce
 #ifdef GLMSERVE_CUDA
     auto* s = static_cast<NcclState*>(state_);
     GLM_CHECK(s && s->tp, "NCCL communicator is not active");
     if (is_device_ptr(data)) {
+        if (s->car_state == 0) init_custom_ar(s, cfg_);
+        if (s->car_state == 1 && (count & 3) == 0 &&
+            count <= glmserve::cuda::custom_ar_max_count()) {
+            glmserve::cuda::custom_ar_run(s->car, data, count, s->stream);
+            return;
+        }
         // No host sync needed: the blocking stream orders this against both
         // the producer kernels and any later default-stream consumers.
         nccl_ok(ncclAllReduce(data, data, count, ncclFloat, ncclSum, s->tp, s->stream),
@@ -237,6 +310,42 @@ void Communicator::all_reduce_sum(float* data, int64_t count) {
     }
 #else
     (void)data; (void)count;
+#endif
+}
+
+void Communicator::all_reduce_sum_rows(float* data, int64_t rows, int64_t row_elems) {
+    if (cfg_.tp_size <= 1) return;
+    if (rows == 1) { all_reduce_sum(data, row_elems); return; }
+#ifdef GLMSERVE_CUDA
+    auto* s = static_cast<NcclState*>(state_);
+    GLM_CHECK(s && s->tp, "NCCL communicator is not active");
+    if (is_device_ptr(data)) {
+        if (s->car_state == 0) init_custom_ar(s, cfg_);
+        if (s->car_state == 1 && (row_elems & 3) == 0 &&
+            row_elems <= glmserve::cuda::custom_ar_max_count()) {
+            // Decode routes single rows through the custom AR; take the same
+            // per-row path so verify sums match plain decode exactly.
+            for (int64_t r = 0; r < rows; ++r)
+                glmserve::cuda::custom_ar_run(s->car, data + r * row_elems, row_elems,
+                                              s->stream);
+            return;
+        }
+        // One ncclAllReduce per row, NOT wrapped in ncclGroupStart/End: group
+        // aggregation batches the ops into one launch whose internal chunk
+        // scheduling differs from a solo call (tests/test_nccl_comm.cpp
+        // rows-parity caught grouped != individual at the last bit). Solo
+        // calls on the shared stream still overlap launch/transfer, and each
+        // is bitwise-identical to the decode-step reduce it re-checks.
+        for (int64_t r = 0; r < rows; ++r)
+            nccl_ok(ncclAllReduce(data + r * row_elems, data + r * row_elems,
+                                  row_elems, ncclFloat, ncclSum, s->tp, s->stream),
+                    "ncclAllReduce(tp row)");
+    } else {
+        for (int64_t r = 0; r < rows; ++r)
+            all_reduce_sum(data + r * row_elems, row_elems);
+    }
+#else
+    (void)data; (void)rows; (void)row_elems;
 #endif
 }
 

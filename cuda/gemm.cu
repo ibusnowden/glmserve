@@ -34,8 +34,39 @@ static void maybe_bias(float* y, const float* bias, int64_t n, int64_t out, cuda
     add_bias_kernel<<<(unsigned)((total + 255) / 256), 256, 0, s>>>(y, bias, n, out);
 }
 
+// n-invariant fp32 gemv: one warp per output row, lane-strided K with a fixed
+// warp-shuffle reduce, the token loop just repeating the identical per-token
+// order. cuBLAS picks different kernels (and thus summation orders) for
+// different n, so a verify chunk's rows would drift (last-bit) from the n=1
+// decode steps they re-check — the F32 MoE router gemv was the residual
+// ulp-level source of spec-vs-greedy divergence after the all-reduce fix.
+// Decode and verify-sized calls (n <= kMlaParityMaxQ) take this kernel;
+// prefill stays on cuBLAS.
+__global__ void gemv_fp32_kernel(const float* __restrict__ x, const float* __restrict__ W,
+                                 const float* __restrict__ bias, float* __restrict__ y,
+                                 int64_t n, int64_t in, int64_t out) {
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int64_t o = (int64_t)blockIdx.x * (blockDim.x >> 5) + warp;
+    if (o >= out) return;
+    const float* wrow = W + o * in;
+    for (int64_t t = 0; t < n; ++t) {
+        const float* xt = x + t * in;
+        float acc = 0.0f;
+        for (int64_t i = lane; i < in; i += 32) acc += wrow[i] * xt[i];
+        for (int off = 16; off > 0; off >>= 1)
+            acc += __shfl_xor_sync(0xffffffffu, acc, off);
+        if (lane == 0) y[t * out + o] = bias ? acc + bias[o] : acc;
+    }
+}
+
 void gemm_fp32(const float* x, const float* W, const float* bias, float* y,
                int64_t n, int64_t in, int64_t out, cudaStream_t s) {
+    if (n <= kMlaParityMaxQ) {
+        const int warps = 8;
+        const unsigned blocks = (unsigned)((out + warps - 1) / warps);
+        gemv_fp32_kernel<<<blocks, warps * 32, 0, s>>>(x, W, bias, y, n, in, out);
+        return;
+    }
     cublasSetStream(handle(), s);
     const float alpha = 1.0f, beta = 0.0f;
     // C(out x n) = W^T(out x in) * X(in x n)

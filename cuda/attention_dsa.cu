@@ -11,6 +11,8 @@
 #include "common.cuh"
 #include "kernels.cuh"
 
+#include <algorithm>
+
 namespace glmserve {
 namespace cuda {
 
@@ -62,79 +64,159 @@ __global__ void attn_dsa_window_kernel(const float* __restrict__ q, const float*
     out[(qi * n_heads + h) * head_dim + d] = (l > 0.0f) ? acc / l : 0.0f;
 }
 
-__global__ void dsa_select_topk_kernel(const float* __restrict__ index_q,
-                                       const float* __restrict__ index_k_cache,
-                                       const float* __restrict__ index_w,
-                                       int64_t start_pos, int64_t index_heads,
-                                       int64_t index_dim, int64_t index_topk,
-                                       float score_scale, float weight_scale,
-                                       int* __restrict__ topk_indices,
-                                       float* __restrict__ topk_scores) {
-    int64_t t = blockIdx.x;
-    if (threadIdx.x != 0) return;
-    int64_t qpos = start_pos + t;
-    int64_t topk = (qpos + 1 < index_topk) ? (qpos + 1) : index_topk;
+// ---- learned top-k indexer (parallel) --------------------------------------
+// The selector runs in two stages per query chunk:
+//   1. dsa_score_kernel — one WARP per (key, query): lane h owns head h's
+//      128-dim dot against the shared fp16 key row, warp-reduces the
+//      relu-weighted head sum into scores[tq, j].
+//   2. dsa_radix_select_kernel — one block per query: exact top-k by radix
+//      descent over a UNIQUE 64-bit ordering key (score bits | ~index), so
+//      ties resolve to the smallest index — the same winner the CPU
+//      reference's strict replace-min scan keeps — then a smem bitonic sort
+//      emits the selected indices ascending (the deterministic attention
+//      accumulation order).
+// A serial single-thread predecessor walked ctx*heads*dim per query on one
+// thread — unusable beyond the 2048-key dense window.
+
+__global__ void dsa_score_kernel(const float* __restrict__ index_q,
+                                 const __half* __restrict__ index_k_cache,
+                                 const float* __restrict__ index_w,
+                                 int64_t t0, int64_t start_pos, int64_t index_heads,
+                                 int64_t index_dim, float score_scale, float weight_scale,
+                                 int64_t n_keys, float* __restrict__ scores) {
+    const int64_t j = (int64_t)blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    const int64_t tq = blockIdx.y;
+    const int lane = threadIdx.x & 31;
+    if (j >= n_keys) return;
+    const int64_t t = t0 + tq;
+    const int64_t qpos = start_pos + t;
+    if (j > qpos) return;
+    const __half* kj = index_k_cache + j * index_dim;
+    float total = 0.0f;
+    for (int64_t h = lane; h < index_heads; h += 32) {
+        const float* qh = index_q + (t * index_heads + h) * index_dim;
+        float dot = 0.0f;
+        for (int64_t d = 0; d < index_dim; ++d)
+            dot += qh[d] * __half2float(kj[d]);
+        total += index_w[t * index_heads + h] * weight_scale * fmaxf(0.0f, dot * score_scale);
+    }
+    total = warp_reduce_sum(total);
+    if (lane == 0) scores[tq * n_keys + j] = total;
+}
+
+// Unique ordering key: flipped score bits (ascending uint == ascending float)
+// over ~index — descending key == (score desc, index asc), no duplicates.
+__device__ __forceinline__ uint64_t dsa_key(float s, uint32_t j) {
+    uint32_t u = __float_as_uint(s);
+    u = (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+    return ((uint64_t)u << 32) | (uint64_t)(0xFFFFFFFFu - j);
+}
+
+__global__ void dsa_radix_select_kernel(const float* __restrict__ scores, int64_t row_stride,
+                                        int64_t t0, int64_t start_pos, int64_t index_topk,
+                                        int* __restrict__ topk_indices,
+                                        float* __restrict__ topk_scores) {
+    extern __shared__ int sel[];   // [next_pow2(index_topk)]
+    __shared__ int hist[256];
+    __shared__ int sh_scal[2];     // [0] remaining k at this level, [1] compact cursor
+    const int64_t tq = blockIdx.x;
+    const int64_t t = t0 + tq;
+    const int64_t qpos = start_pos + t;
+    const int64_t count = qpos + 1;
+    const float* sc = scores + tq * row_stride;
     int* ids = topk_indices + t * index_topk;
-    float* best = topk_scores + t * index_topk;
-    for (int64_t k = 0; k < index_topk; ++k) {
-        ids[k] = 0;
-        best[k] = -1e30f;
+    float* out_s = topk_scores + t * index_topk;
+    const int tid = threadIdx.x;
+
+    if (count <= index_topk) {
+        // Causal prefix fits: every key is selected, already ascending.
+        for (int64_t j = tid; j < index_topk; j += blockDim.x) {
+            ids[j] = j < count ? (int)j : 0;
+            out_s[j] = j < count ? sc[j] : -1e30f;
+        }
+        return;
     }
-    int64_t filled = 0;
-    const float* q = index_q + t * index_heads * index_dim;
-    const float* wt = index_w + t * index_heads;
-    for (int64_t j = 0; j <= qpos; ++j) {
-        const float* kj = index_k_cache + j * index_dim;
-        float score = 0.0f;
-        for (int64_t h = 0; h < index_heads; ++h) {
-            const float* qh = q + h * index_dim;
-            float dot = 0.0f;
-            for (int64_t d = 0; d < index_dim; ++d) dot += qh[d] * kj[d];
-            float relu_score = fmaxf(0.0f, dot * score_scale);
-            score += wt[h] * weight_scale * relu_score;
+
+    // Radix descent, one byte per level, to the exact index_topk-th largest key.
+    uint64_t prefix = 0;
+    int remain = (int)index_topk;
+    for (int level = 7; level >= 0; --level) {
+        const int shift = 8 * level;
+        const uint64_t mask_hi = level == 7 ? 0ull : ~((1ull << (shift + 8)) - 1ull);
+        for (int b = tid; b < 256; b += blockDim.x) hist[b] = 0;
+        __syncthreads();
+        for (int64_t j = tid; j < count; j += blockDim.x) {
+            const uint64_t key = dsa_key(sc[j], (uint32_t)j);
+            if ((key & mask_hi) == prefix)
+                atomicAdd(&hist[(key >> shift) & 0xFF], 1);
         }
-        if (filled < topk) {
-            ids[filled] = (int)j;
-            best[filled] = score;
-            ++filled;
-            continue;
-        }
-        int64_t min_i = 0;
-        float min_v = best[0];
-        for (int64_t k = 1; k < topk; ++k) {
-            if (best[k] < min_v) {
-                min_v = best[k];
-                min_i = k;
+        __syncthreads();
+        if (tid == 0) {
+            int rem = remain;
+            int b = 255;
+            for (; b > 0; --b) {
+                if (hist[b] >= rem) break;
+                rem -= hist[b];
             }
+            sh_scal[0] = rem;
+            hist[0] = b;   // reuse as broadcast slot (histogram is consumed)
         }
-        if (score > min_v) {
-            ids[min_i] = (int)j;
-            best[min_i] = score;
+        __syncthreads();
+        remain = sh_scal[0];
+        prefix |= (uint64_t)(unsigned)hist[0] << shift;
+        __syncthreads();
+    }
+    // prefix is now the exact threshold key; keys are unique, so >= selects
+    // exactly index_topk elements.
+    if (tid == 0) sh_scal[1] = 0;
+    __syncthreads();
+    for (int64_t j = tid; j < count; j += blockDim.x) {
+        if (dsa_key(sc[j], (uint32_t)j) >= prefix)
+            sel[atomicAdd(&sh_scal[1], 1)] = (int)j;
+    }
+    __syncthreads();
+    // Bitonic sort ascending over the pow2-padded smem slab.
+    int P = 1;
+    while (P < (int)index_topk) P <<= 1;
+    for (int j = (int)index_topk + tid; j < P; j += blockDim.x) sel[j] = 0x7FFFFFFF;
+    __syncthreads();
+    for (int size = 2; size <= P; size <<= 1) {
+        for (int stride = size >> 1; stride > 0; stride >>= 1) {
+            for (int i = tid; i < P; i += blockDim.x) {
+                const int ixj = i ^ stride;
+                if (ixj > i) {
+                    const bool up = (i & size) == 0;
+                    const int a = sel[i], b = sel[ixj];
+                    if ((a > b) == up) { sel[i] = b; sel[ixj] = a; }
+                }
+            }
+            __syncthreads();
         }
     }
-    // Match the CPU reference's deterministic attention accumulation order.
-    for (int64_t a = 1; a < topk; ++a) {
-        int id = ids[a];
-        float sc = best[a];
-        int64_t b = a - 1;
-        while (b >= 0 && ids[b] > id) {
-            ids[b + 1] = ids[b];
-            best[b + 1] = best[b];
-            --b;
-        }
-        ids[b + 1] = id;
-        best[b + 1] = sc;
+    for (int i = tid; i < (int)index_topk; i += blockDim.x) {
+        ids[i] = sel[i];
+        out_s[i] = sc[sel[i]];
     }
 }
 
-void dsa_select_topk(const float* index_q, const float* index_k_cache,
+void dsa_select_topk(const float* index_q, const __half* index_k_cache,
                      const float* index_w, int64_t n_query, int64_t start_pos,
                      int64_t index_heads, int64_t index_dim, int64_t index_topk,
-                     float score_scale, float weight_scale, int* topk_indices,
-                     float* topk_scores, cudaStream_t s) {
-    dsa_select_topk_kernel<<<(unsigned)n_query, 32, 0, s>>>(
-        index_q, index_k_cache, index_w, start_pos, index_heads, index_dim, index_topk,
-        score_scale, weight_scale, topk_indices, topk_scores);
+                     float score_scale, float weight_scale, float* score_scratch,
+                     int* topk_indices, float* topk_scores, cudaStream_t s) {
+    int64_t P = 1;
+    while (P < index_topk) P <<= 1;
+    const size_t shmem = (size_t)P * sizeof(int);
+    for (int64_t t0 = 0; t0 < n_query; t0 += kDsaScoreChunk) {
+        const int64_t nc = std::min<int64_t>(kDsaScoreChunk, n_query - t0);
+        const int64_t n_keys = start_pos + t0 + nc;   // longest prefix in the chunk
+        dim3 sg((unsigned)((n_keys + 3) / 4), (unsigned)nc);
+        dsa_score_kernel<<<sg, 128, 0, s>>>(index_q, index_k_cache, index_w, t0, start_pos,
+                                            index_heads, index_dim, score_scale, weight_scale,
+                                            n_keys, score_scratch);
+        dsa_radix_select_kernel<<<(unsigned)nc, 256, shmem, s>>>(
+            score_scratch, n_keys, t0, start_pos, index_topk, topk_indices, topk_scores);
+    }
 }
 
 __global__ void attn_dsa_indexed_kernel(const float* __restrict__ q,

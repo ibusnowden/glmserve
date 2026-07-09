@@ -365,10 +365,55 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--seed", type=int, default=1234)
     ap.add_argument("--prompt", default="3 1 4 1 5 9 2 6")
+    ap.add_argument("--index-topk", type=int, default=None,
+                    help="override cfg index_topk (e.g. 2048 to disable DSA for short prompts)")
+    ap.add_argument("--no-dsa", action="store_true", help="disable DSA (use_dsa=False)")
+    ap.add_argument("--heads", type=int, default=None,
+                    help="override num_attention_heads/num_key_value_heads (for TP>4)")
+    ap.add_argument("--real-dim", action="store_true",
+                    help="use real GLM-5.2 MLA dims (kvlat=512, rope=64, nope=192, vd=256, "
+                         "H=8, hidden=6144, q_lora=2048) with 4 layers, small vocab/MoE "
+                         "to test the absorbed n>1 path at real dimensions without GGUF")
     args = ap.parse_args()
 
     os.makedirs(args.out, exist_ok=True)
     cfg = dict(TINY)
+    if args.real_dim:
+        # Real GLM-5.2 MLA dimensions (per the gguf_8x config log) with a
+        # miniature 4-layer / small-vocab / small-MoE body so the checkpoint
+        # loads in seconds (no GGUF, no slow NFS).  H=8 total -> 8 heads/rank
+        # at TP=1, matching the real model's 8 heads/rank at TP=8.  The
+        # absorbed-MLA n>1 path (mla_absorb_q / mla_attention_decode) is
+        # per-head, so TP=1 H=8 exercises the same kernels as TP=8 H=64.
+        cfg.update(dict(
+            hidden_size=6144,
+            num_attention_heads=8,
+            num_key_value_heads=8,
+            q_lora_rank=2048,
+            kv_lora_rank=512,
+            qk_nope_head_dim=192,
+            qk_rope_head_dim=64,
+            qk_head_dim=256,
+            v_head_dim=256,
+            intermediate_size=2048,
+            moe_intermediate_size=512,
+            n_routed_experts=8,
+            num_experts_per_tok=2,
+            n_shared_experts=1,
+            first_k_dense_replace=3,
+            head_dim=192,               # == qk_nope_head_dim (HF convention)
+        ))
+        # index_topk 2048 with a short prompt disables DSA (ctx < 2048),
+        # matching the real-model phase-F test (no DSA).
+        cfg["index_topk"] = 2048
+        cfg["use_dsa"] = False
+    if args.index_topk is not None:
+        cfg["index_topk"] = args.index_topk
+    if args.no_dsa:
+        cfg["use_dsa"] = False
+    if args.heads is not None:
+        cfg["num_attention_heads"] = args.heads
+        cfg["num_key_value_heads"] = args.heads
     json.dump(cfg, open(os.path.join(args.out, "config.json"), "w"), indent=2)
 
     W = build_weights(cfg, args.seed)

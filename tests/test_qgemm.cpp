@@ -126,6 +126,31 @@ int main() {
         cudaFree(dx); cudaFree(dq); cudaFree(db); cudaFree(dy);
         std::printf("  %s gemm_q [out=%d in=%d n=%d]:", names[ti], out, in, n);
         rc |= check(got, ref, 1e-3f);
+
+        // int8 MMQ path: quantized activations introduce ~0.5% relative error
+        // (llama.cpp Q8_1-equivalent), so the gate is a loose relative tol.
+        if (qtype_has_i8(type)) {
+            float* dx2 = nullptr; uint8_t* dq2 = nullptr; float* db2 = nullptr; float* dy2 = nullptr;
+            int8_t* dxq = nullptr; float* dxs = nullptr;
+            CUDA_TEST_CHECK(cudaMalloc(&dx2, x.size() * sizeof(float)));
+            CUDA_TEST_CHECK(cudaMalloc(&dq2, data.size()));
+            CUDA_TEST_CHECK(cudaMalloc(&db2, bias.size() * sizeof(float)));
+            CUDA_TEST_CHECK(cudaMalloc(&dy2, ref.size() * sizeof(float)));
+            CUDA_TEST_CHECK(cudaMalloc(&dxq, x.size()));
+            CUDA_TEST_CHECK(cudaMalloc(&dxs, (x.size() / 32) * sizeof(float)));
+            CUDA_TEST_CHECK(cudaMemcpy(dx2, x.data(), x.size() * sizeof(float), cudaMemcpyHostToDevice));
+            CUDA_TEST_CHECK(cudaMemcpy(dq2, data.data(), data.size(), cudaMemcpyHostToDevice));
+            CUDA_TEST_CHECK(cudaMemcpy(db2, bias.data(), bias.size() * sizeof(float), cudaMemcpyHostToDevice));
+            quantize_act_q8(dx2, n, in, dxq, dxs);
+            gemm_q_i8(type, dxq, dxs, dq2, db2, dy2, n, in, out, row_bytes);
+            CUDA_TEST_CHECK(cudaGetLastError());
+            CUDA_TEST_CHECK(cudaDeviceSynchronize());
+            std::vector<float> got8(ref.size());
+            CUDA_TEST_CHECK(cudaMemcpy(got8.data(), dy2, got8.size() * sizeof(float), cudaMemcpyDeviceToHost));
+            cudaFree(dx2); cudaFree(dq2); cudaFree(db2); cudaFree(dy2); cudaFree(dxq); cudaFree(dxs);
+            std::printf("  %s gemm_q_i8 vs fp32 ref:", names[ti]);
+            rc |= check(got8, ref, 2e-2f);
+        }
     }
 
     // ---- MoE expert FFN (merged per-expert quant tensors) -----------------
@@ -173,7 +198,8 @@ int main() {
 
         float* dx = nullptr; int* dti = nullptr; float* dtw = nullptr;
         uint8_t *dg = nullptr, *du = nullptr, *dd = nullptr;
-        float* dh = nullptr; float* dy = nullptr;
+        float* dh = nullptr; float* dy = nullptr; float* ddp = nullptr;
+        CUDA_TEST_CHECK(cudaMalloc(&ddp, (size_t)n * topk * hidden * sizeof(float)));
         CUDA_TEST_CHECK(cudaMalloc(&dx, xin.size() * sizeof(float)));
         CUDA_TEST_CHECK(cudaMalloc(&dti, topk_ids.size() * sizeof(int)));
         CUDA_TEST_CHECK(cudaMalloc(&dtw, topk_w.size() * sizeof(float)));
@@ -189,7 +215,7 @@ int main() {
         CUDA_TEST_CHECK(cudaMemcpy(du, up_q.data(), up_q.size(), cudaMemcpyHostToDevice));
         CUDA_TEST_CHECK(cudaMemcpy(dd, down_q.data(), down_q.size(), cudaMemcpyHostToDevice));
         moe_expert_ffn_q(gtype, utype, dtype, dx, dti, dtw, dg, du, dd,
-                         n, topk, hidden, moe_inter, E, g_rb, u_rb, d_rb, dh, dy);
+                         n, topk, hidden, moe_inter, E, g_rb, u_rb, d_rb, dh, ddp, dy);
         CUDA_TEST_CHECK(cudaGetLastError());
         CUDA_TEST_CHECK(cudaDeviceSynchronize());
         std::vector<float> got(ref.size());
@@ -202,7 +228,7 @@ int main() {
         int* ddisp = nullptr;
         CUDA_TEST_CHECK(cudaMalloc(&ddisp, (3 * E + 1 + n * topk) * sizeof(int)));
         moe_expert_ffn_q(gtype, utype, dtype, dx, dti, dtw, dg, du, dd,
-                         n, topk, hidden, moe_inter, E, g_rb, u_rb, d_rb, dh, dy, ddisp);
+                         n, topk, hidden, moe_inter, E, g_rb, u_rb, d_rb, dh, ddp, dy, ddisp);
         CUDA_TEST_CHECK(cudaGetLastError());
         CUDA_TEST_CHECK(cudaDeviceSynchronize());
         std::vector<float> got_em(ref.size());
@@ -223,7 +249,7 @@ int main() {
             CUDA_TEST_CHECK(cudaMalloc(&dgu, (size_t)2 * kMoeSplitK * kMoeSplitKMaxTs *
                                               moe_inter * sizeof(float)));
             moe_expert_ffn_q(gtype, utype, dtype, dx, dti, dtw, dg, du, dd,
-                             ns, topk, hidden, moe_inter, E, g_rb, u_rb, d_rb, dh, dy,
+                             ns, topk, hidden, moe_inter, E, g_rb, u_rb, d_rb, dh, ddp, dy,
                              nullptr, dgu);
             CUDA_TEST_CHECK(cudaGetLastError());
             CUDA_TEST_CHECK(cudaDeviceSynchronize());
@@ -238,7 +264,49 @@ int main() {
             rc |= check(got_sk, got_s, 1e-5f);
             cudaFree(dgu);
         }
-        cudaFree(dx); cudaFree(dti); cudaFree(dtw); cudaFree(dg); cudaFree(du); cudaFree(dd); cudaFree(dh); cudaFree(dy);
+
+        // int8 MMQ MoE: all three paths against the fp32 CPU ref (loose tol —
+        // quantized activations) and against each other (shared int dots, so
+        // only atomic/split accumulation order differs).
+        {
+            int8_t *dxq = nullptr, *dhq = nullptr;
+            float *dxs = nullptr, *dhs = nullptr;
+            int* ddisp = nullptr; float* dgu = nullptr;
+            CUDA_TEST_CHECK(cudaMalloc(&dxq, xin.size()));
+            CUDA_TEST_CHECK(cudaMalloc(&dxs, (xin.size() / 32) * sizeof(float)));
+            CUDA_TEST_CHECK(cudaMalloc(&dhq, (size_t)n * topk * moe_inter));
+            CUDA_TEST_CHECK(cudaMalloc(&dhs, ((size_t)n * topk * moe_inter / 32) * sizeof(float)));
+            CUDA_TEST_CHECK(cudaMalloc(&ddisp, (3 * E + 1 + n * topk) * sizeof(int)));
+            CUDA_TEST_CHECK(cudaMalloc(&dgu, (size_t)2 * kMoeSplitK * kMoeSplitKMaxTs *
+                                              moe_inter * sizeof(float)));
+            quantize_act_q8(dx, n, hidden, dxq, dxs);
+            auto run_i8 = [&](int nn, int* disp, float* gu) {
+                moe_expert_ffn_q_i8(gtype, utype, dtype, dxq, dxs, dti, dtw, dg, du, dd,
+                                    nn, topk, hidden, moe_inter, E, g_rb, u_rb, d_rb,
+                                    dh, dhq, dhs, ddp, dy, disp, gu);
+                if (cudaGetLastError() != cudaSuccess ||
+                    cudaDeviceSynchronize() != cudaSuccess) {
+                    std::printf("  moe_expert_ffn_q_i8 launch FAILED\n");
+                    rc = 1;
+                }
+                std::vector<float> r((size_t)nn * hidden);
+                cudaMemcpy(r.data(), dy, r.size() * sizeof(float), cudaMemcpyDeviceToHost);
+                return r;
+            };
+            std::vector<float> tm8 = run_i8(n, nullptr, nullptr);
+            std::printf("  moe_expert_ffn_q_i8 token-major vs CPU ref:");
+            rc |= check(tm8, ref, 3e-2f);
+            std::vector<float> em8 = run_i8(n, ddisp, nullptr);
+            std::printf("  moe_expert_ffn_q_i8 expert-major vs token-major:");
+            rc |= check(em8, tm8, 1e-4f);
+            std::vector<float> sk8 = run_i8(4, nullptr, dgu);
+            std::vector<float> tm8_s(tm8.begin(), tm8.begin() + (size_t)4 * hidden);
+            std::printf("  moe_expert_ffn_q_i8 split-K vs token-major [n=4]:");
+            rc |= check(sk8, tm8_s, 1e-3f);
+            cudaFree(dxq); cudaFree(dxs); cudaFree(dhq); cudaFree(dhs);
+            cudaFree(ddisp); cudaFree(dgu);
+        }
+        cudaFree(dx); cudaFree(dti); cudaFree(dtw); cudaFree(dg); cudaFree(du); cudaFree(dd); cudaFree(dh); cudaFree(dy); cudaFree(ddp);
     }
 
     // ---- TP shard consistency (col/row slicing + strided 2D repack) --------

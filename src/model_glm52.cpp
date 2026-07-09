@@ -702,7 +702,7 @@ void GLM52Model::load_gguf(const std::string& gguf_path, int64_t max_layers,
     const GGUFGLM52Layout& layout = gguf_weights_->layout();
     const int64_t H = c.hidden_size;
     const int64_t heads = c.num_attention_heads;
-    const int64_t nope = c.qk_nope_head_dim, rope = c.qk_rope_head_dim;
+    const int64_t nope = c.qk_nope_head_dim;
     const int64_t vd = c.v_head_dim, kv_lora = c.kv_lora_rank;
 
     const bool first = dist_.is_first_stage();
@@ -777,7 +777,9 @@ void GLM52Model::load_gguf(const std::string& gguf_path, int64_t max_layers,
             GGUFLinearView uv = gguf_weights_->linear(hf + "mlp.experts.*.up_proj.weight");
             GGUFLinearView dv = gguf_weights_->linear(hf + "mlp.experts.*.down_proj.weight");
             GLM_CHECK(gv.valid() && uv.valid() && dv.valid(), "GGUF missing expert tensors for layer %lld", (long long)gi);
-            GLM_CHECK(gv.out_features == moei * E && gv.in_features == H, "GGUF expert gate shape mismatch");
+            GLM_CHECK(gv.out_features == static_cast<uint64_t>(moei * E) &&
+                      gv.in_features == static_cast<uint64_t>(H),
+                      "GGUF expert gate shape mismatch");
             L.moe.experts.resize(static_cast<size_t>(E));
             for (int64_t e = 0; e < E; ++e) {
                 Expert& E0 = L.moe.experts[static_cast<size_t>(e)];
@@ -1348,6 +1350,24 @@ std::vector<float> GLM52Model::forward_gpu_decode(int, int64_t) {
 std::vector<float> GLM52Model::mtp_draft_logits_gpu(const std::vector<int>&,
                                                     const std::vector<int>&) {
     GLM_CHECK(false, "mtp_draft_logits_gpu: built without CUDA (rebuild with GPU=1)");
+    return {};
+}
+bool GLM52Model::mtp_gpu_ready() const { return false; }
+int64_t GLM52Model::gpu_chunk_row0() const { return 0; }
+void GLM52Model::gpu_rewind(int64_t) {
+    GLM_CHECK(false, "gpu_rewind: built without CUDA (rebuild with GPU=1)");
+}
+void GLM52Model::forward_gpu_chunk(const std::vector<int>&, int64_t, std::vector<float>*) {
+    GLM_CHECK(false, "forward_gpu_chunk: built without CUDA (rebuild with GPU=1)");
+}
+void GLM52Model::forward_gpu_chunk_greedy(const std::vector<int>&, int64_t, std::vector<int>*) {
+    GLM_CHECK(false, "forward_gpu_chunk_greedy: built without CUDA (rebuild with GPU=1)");
+}
+void GLM52Model::mtp_gpu_absorb(const std::vector<int>&, int64_t) {
+    GLM_CHECK(false, "mtp_gpu_absorb: built without CUDA (rebuild with GPU=1)");
+}
+std::vector<int> GLM52Model::mtp_gpu_draft(int, int) {
+    GLM_CHECK(false, "mtp_gpu_draft: built without CUDA (rebuild with GPU=1)");
     return {};
 }
 void gpu_prof_report(const char*, bool) {}

@@ -206,6 +206,43 @@ public:
     // tokens with its own single-layer draft cache. Returns [draft, vocab].
     std::vector<float> mtp_draft_logits_gpu(const std::vector<int>& context_tokens,
                                             const std::vector<int>& draft_tokens);
+
+    // --- GPU speculative decode (MTP draft + trunk verify), TP-aware ---
+    // The MTP block keeps a persistent cache over ABSOLUTE positions: after a
+    // trunk pass over positions [p, p+n) the caller absorbs the committed
+    // prefix (mtp_gpu_absorb), then drafts ahead of the trunk (mtp_gpu_draft),
+    // verifies the chunk in one suffix pass (forward_gpu_chunk) and rewinds
+    // the rejected tail (gpu_rewind). All calls run in TP lockstep; logits are
+    // all-reduced, so every rank takes identical accept/reject decisions.
+    bool mtp_gpu_ready() const;
+    // Suffix trunk pass over `tokens` at absolute start_pos. Fills all_logits
+    // with [n, vocab] (n <= kVerifyMax = 8) and leaves the chunk's pre-norm
+    // hiddens in scratch for mtp_gpu_absorb.
+    void forward_gpu_chunk(const std::vector<int>& tokens, int64_t start_pos,
+                           std::vector<float>* all_logits);
+    // Greedy twin: only the per-row argmax token ids leave the device (skips
+    // the [n, vocab] fill + all-reduce + D2H — greedy spec decode needs no
+    // full logits). Ranks combine shard winners with one tiny all-reduce.
+    void forward_gpu_chunk_greedy(const std::vector<int>& tokens, int64_t start_pos,
+                                  std::vector<int>* row_argmax);
+    // Logical rewind of the trunk KV to `len` positions (caches are
+    // append-only; subsequent passes overwrite the rejected tail).
+    void gpu_rewind(int64_t len);
+    // Absolute position of scratch row 0 after the last trunk pass — the
+    // lowest position mtp_gpu_absorb can read (a chunked long prefill leaves
+    // only its final chunk's hiddens in scratch).
+    int64_t gpu_chunk_row0() const;
+    // Absorb trunk positions [pos0, pos0 + next_tokens.size()) into the MTP
+    // cache: position p pairs the last trunk pass's hidden row (p - pos0) with
+    // the committed token at p+1 (= next_tokens[p - pos0]). Also stashes the
+    // hidden at row next_tokens.size() as the draft seed state. Must run
+    // directly after the trunk pass whose rows it reads.
+    void mtp_gpu_absorb(const std::vector<int>& next_tokens, int64_t pos0);
+    // Greedy-draft k tokens ahead: seeded with `next_token` (the committed
+    // token one past the absorbed prefix) and the stashed hidden state.
+    // Extends the MTP cache by one committed position; speculative draft
+    // entries beyond it are rewound internally.
+    std::vector<int> mtp_gpu_draft(int next_token, int k);
     ~GLM52Model();
 
 private:

@@ -35,6 +35,46 @@ void argmax(const float* logits, int vocab, int* out_id, cudaStream_t s) {
     argmax_kernel<<<1, threads, shmem, s>>>(logits, vocab, out_id);
 }
 
+// Per-row argmax with EXACT first-max (lowest index) tie semantics, matching a
+// serial `if (x[i] > best)` host scan. Emits float2{val, (float)idx} per row so
+// TP ranks can combine shard winners with one tiny all-reduce (idx < 2^24, so
+// the float round-trip is exact). One block per row.
+__global__ void argmax_rows_kernel(const float* __restrict__ y, int ncols, int64_t ld,
+                                   float2* __restrict__ out) {
+    extern __shared__ float smem[];
+    int* sidx = (int*)(smem + blockDim.x);
+    const float* row = y + (int64_t)blockIdx.x * ld;
+    float best = -1e30f;
+    int best_i = 0;
+    for (int i = threadIdx.x; i < ncols; i += blockDim.x) {
+        const float v = row[i];
+        if (v > best) { best = v; best_i = i; }
+    }
+    smem[threadIdx.x] = best;
+    sidx[threadIdx.x] = best_i;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            const float vo = smem[threadIdx.x + stride];
+            const int io = sidx[threadIdx.x + stride];
+            if (vo > smem[threadIdx.x] ||
+                (vo == smem[threadIdx.x] && io < sidx[threadIdx.x])) {
+                smem[threadIdx.x] = vo;
+                sidx[threadIdx.x] = io;
+            }
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) out[blockIdx.x] = make_float2(smem[0], (float)sidx[0]);
+}
+
+void argmax_rows(const float* y, int nrows, int ncols, int64_t ld, float2* out_pairs,
+                 cudaStream_t s) {
+    const int threads = 256;
+    const size_t shmem = threads * (sizeof(float) + sizeof(int));
+    argmax_rows_kernel<<<nrows, threads, shmem, s>>>(y, ncols, ld, out_pairs);
+}
+
 __global__ void softmax_kernel(float* __restrict__ logits, int vocab, float inv_t) {
     extern __shared__ float smem[];
     float m = -1e30f;

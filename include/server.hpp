@@ -86,16 +86,20 @@ public:
                                       std::vector<float>* all_logits = nullptr);
 
     // Throughput probe: time a prefill of `prompt_len` synthetic tokens then a
-    // greedy decode of `gen_len` tokens, on whichever backend is active.
+    // greedy decode of `gen_len` tokens, on whichever backend is active. With
+    // draft_k > 0 (GPU + resident MTP block) the decode runs speculatively:
+    // MTP drafts, one trunk verify chunk per group, longest-prefix accept.
     struct BenchResult {
         int    prompt_len = 0, gen_len = 0;
         double prefill_ms = 0, decode_ms = 0;
         bool   gpu = false;
+        int    spec_groups = 0, spec_accepted = 0;   // draft_k > 0 only
+        bool   spec_fallback = false;                // adaptive GPU spec fallback
         double prefill_tps() const { return prefill_ms > 0 ? prompt_len / (prefill_ms / 1e3) : 0; }
         double decode_tps()  const { return decode_ms  > 0 ? gen_len    / (decode_ms  / 1e3) : 0; }
         double decode_ms_per_tok() const { return gen_len ? decode_ms / gen_len : 0; }
     };
-    BenchResult profile(int prompt_len, int gen_len);
+    BenchResult profile(int prompt_len, int gen_len, int draft_k = 0);
 
     // Correctness probe for the incremental GPU decode: greedily generate `steps`
     // tokens two ways — the incremental KV path (forward_gpu_decode) vs the
@@ -112,15 +116,35 @@ public:
     };
     DecodeCheck check_decode(const std::vector<int>& prompt, int steps);
 
+    // Verify-chunk parity probe: greedily decode `k` tokens one at a time
+    // (saving each step's full logits), rewind, then re-run the same tokens
+    // as one forward_gpu_chunk and compare per-row logits. Speculative decode
+    // is exact iff every row matches bitwise (max_abs_diff == 0): the chunk
+    // pass must reproduce plain decode's numerics, including the TP
+    // all-reduce summation order. GPU-only.
+    struct ChunkCheck {
+        int k = 0;
+        bool gpu = false;
+        bool argmax_match = true;      // per-row argmax vs decode argmax
+        double max_abs_diff = 0;       // over all rows' full logits
+        int worst_row = -1;
+        std::vector<int> dec_tokens, chunk_tokens;
+        std::vector<double> row_diff;  // per-row max |chunk - decode|
+    };
+    ChunkCheck check_chunk_parity(const std::vector<int>& prompt, int k);
+
     struct MTPCheck {
         int steps = 0;
         int draft_k = 0;
         int groups = 0;
         int accepted = 0;
         int rejected = 0;
+        bool gpu = false;
+        bool match = true;   // GPU: spec output == plain greedy decode stream
         std::vector<int> proposed_tokens;
         std::vector<int> target_tokens;
         std::vector<int> output_tokens;
+        std::vector<int> ref_tokens;   // GPU: the plain greedy reference
     };
     MTPCheck check_mtp_speculative(const std::vector<int>& prompt, int steps, int draft_k);
 

@@ -36,10 +36,18 @@ enum : uint32_t {
 };
 
 // Device copies of the host dequant tables (seeded once from gguf_quant.cpp).
-__constant__ uint8_t d_iq3xxs_grid[256 * 4];
-__constant__ uint8_t d_ksigns_iq2xs[128];
+// These are indexed DIVERGENTLY across a warp (every lane decodes a different
+// fragment), so they must live in __device__ global memory: __constant__
+// serializes on distinct addresses (one broadcast per cycle) and was the
+// dominant cost of the IQ3_XXS/IQ4_XS streaming paths. Only kmask (indexed by
+// a compile-time-unrolled loop counter, uniform) stays in constant memory.
+__device__ uint32_t d_iq3xxs_grid[256];
+__device__ uint8_t  d_ksigns_iq2xs[128];
 __constant__ uint8_t d_kmask_iq2xs[8];
-__constant__ int8_t  d_kvalues_iq4nl[16];
+__device__ int8_t   d_kvalues_iq4nl[16];
+// Per-7-bit-sign-code byte masks (0x00/0xFF per element): x = (g ^ m) - m
+// conditionally negates the four packed grid bytes in two instructions.
+__device__ uint2    d_signmask_iq2xs[128];
 static bool g_tables_seeded = false;
 
 static void seed_tables() {
@@ -48,6 +56,18 @@ static void seed_tables() {
     cudaMemcpyToSymbol(d_ksigns_iq2xs, gguf_ksigns_iq2xs_table(), 128);
     cudaMemcpyToSymbol(d_kmask_iq2xs, gguf_kmask_iq2xs_table(), 8);
     cudaMemcpyToSymbol(d_kvalues_iq4nl, gguf_kvalues_iq4nl_table(), 16);
+    const uint8_t* ks = gguf_ksigns_iq2xs_table();
+    uint32_t sm[128][2];
+    for (int c = 0; c < 128; ++c) {
+        uint32_t lo = 0, hi = 0;
+        for (int j = 0; j < 4; ++j) {
+            if ((ks[c] >> j) & 1)       lo |= 0xFFu << (8 * j);
+            if ((ks[c] >> (4 + j)) & 1) hi |= 0xFFu << (8 * j);
+        }
+        sm[c][0] = lo;
+        sm[c][1] = hi;
+    }
+    cudaMemcpyToSymbol(d_signmask_iq2xs, sm, sizeof(sm));
     g_tables_seeded = true;
 }
 
@@ -68,6 +88,207 @@ __device__ __forceinline__ void get_scale_min_k4(int j, const uint8_t* q, uint8_
         *d = (q[j + 4] & 0x0F) | ((q[j - 4] >> 6) << 4);
         *m = (q[j + 4] >> 4) | ((q[j] >> 6) << 4);
     }
+}
+
+// ---- int8 MMQ (dp4a) path --------------------------------------------------
+// The fp32 kernels are ALU-bound in dq8's int->float conversions and fp32 FMAs
+// (decode moe.experts measured ~60 GB/s effective vs ~800 peak). The MMQ path
+// quantizes activations to int8 per 32-element block (llama.cpp Q8_1-style)
+// and keeps the weight fragment as INTEGERS + one affine scale pair, so the
+// 8-element dot is two dp4a instructions:
+//   weight[j] = ds * wq[j] - dm      (dm != 0 only for Q4_K/Q5_K minima)
+//   x[j]      = sx * xq[j]
+//   dot      += sx * (ds * dp4a(wq, xq) - dm * dp4a(1, xq))
+// Every GGUF type in the real checkpoint has an integer fragment form; only
+// F16/F32 tensors fall back to the fp32 kernels (qtype_has_i8 == false).
+
+// Decoded int8 weight fragment: 8 lanes packed into two dp4a operands.
+struct WI8 { int w0, w1; float ds, dm; };
+
+__device__ __forceinline__ int pack4(int a, int b, int c, int d) {
+    return (a & 0xFF) | ((b & 0xFF) << 8) | ((c & 0xFF) << 16) | ((d & 0xFF) << 24);
+}
+
+// Integer twin of dq8(): decode the 8-element fragment [frag*8, frag*8+8) of
+// the 256-element group at `grp` into WI8. Element values and scales mirror
+// dq8 exactly; only the (int, affine) factorization differs.
+__device__ __forceinline__ void dq8i(uint32_t type, const uint8_t* grp, int frag, WI8& w) {
+    const int idx0 = frag << 3;
+    w.dm = 0.0f;
+    switch (type) {
+        case QTYPE_Q8_0: {
+            const uint8_t* blk = grp + (frag >> 2) * 34;
+            w.ds = f16d(blk);
+            memcpy(&w.w0, blk + 2 + ((frag & 3) << 3), 4);
+            memcpy(&w.w1, blk + 6 + ((frag & 3) << 3), 4);
+            return;
+        }
+        case QTYPE_Q3_K: {
+            const uint8_t* hmask = grp;
+            const uint8_t* sb = grp + 96;
+            const float d_all = f16d(sb + 12);
+            const int hn = idx0 >> 7;
+            const int rem = idx0 & 127;
+            const int j = rem >> 5;
+            const int sub16 = (rem & 31) >> 4;
+            const int qi = rem & 31;
+            uint32_t a0, a1, a2;
+            memcpy(&a0, sb + 0, 4); memcpy(&a1, sb + 4, 4); memcpy(&a2, sb + 8, 4);
+            const uint32_t km1 = 0x03030303u, km2 = 0x0f0f0f0fu;
+            uint32_t aux[4];
+            aux[0] = (a0 & km2) | (((a2 >> 0) & km1) << 4);
+            aux[1] = (a1 & km2) | (((a2 >> 2) & km1) << 4);
+            aux[2] = ((a0 >> 4) & km2) | (((a2 >> 4) & km1) << 4);
+            aux[3] = ((a1 >> 4) & km2) | (((a2 >> 6) & km1) << 4);
+            const int is = hn * 8 + j * 2 + sub16;
+            const int8_t sc = ((const int8_t*)aux)[is];
+            w.ds = d_all * (float)(sc - 32);
+            const uint8_t* q = grp + 32 + hn * 32 + qi;
+            const uint8_t* hm = hmask + qi;
+            const int shift = 2 * j;
+            const uint8_t m = (uint8_t)(1u << (hn * 4 + j));
+            int v[8];
+            #pragma unroll
+            for (int j2 = 0; j2 < 8; ++j2)
+                v[j2] = (int)((q[j2] >> shift) & 3) - ((hm[j2] & m) ? 0 : 4);
+            w.w0 = pack4(v[0], v[1], v[2], v[3]);
+            w.w1 = pack4(v[4], v[5], v[6], v[7]);
+            return;
+        }
+        case QTYPE_Q4_K: {
+            const float d = f16d(grp), dmin = f16d(grp + 2);
+            const uint8_t* scales = grp + 4;
+            const int j64 = idx0 >> 6;
+            const int half = (idx0 & 63) >> 5;
+            const int l = idx0 & 31;
+            uint8_t sc, mm;
+            get_scale_min_k4(j64 * 2 + half, scales, &sc, &mm);
+            w.ds = d * (float)sc;
+            w.dm = dmin * (float)mm;
+            const uint8_t* q = grp + 16 + j64 * 32 + l;
+            int v[8];
+            #pragma unroll
+            for (int j2 = 0; j2 < 8; ++j2)
+                v[j2] = half ? (q[j2] >> 4) : (q[j2] & 0x0F);
+            w.w0 = pack4(v[0], v[1], v[2], v[3]);
+            w.w1 = pack4(v[4], v[5], v[6], v[7]);
+            return;
+        }
+        case QTYPE_Q5_K: {
+            const float d = f16d(grp), dmin = f16d(grp + 2);
+            const uint8_t* scales = grp + 4;
+            const uint8_t* qh = grp + 16;
+            const uint8_t* ql = grp + 48;
+            const int j64 = idx0 >> 6;
+            const int half = (idx0 & 63) >> 5;
+            const int l = idx0 & 31;
+            uint8_t sc, mm;
+            get_scale_min_k4(j64 * 2 + half, scales, &sc, &mm);
+            w.ds = d * (float)sc;
+            w.dm = dmin * (float)mm;
+            const uint8_t u = (uint8_t)(1u << (j64 * 2 + half));
+            const uint8_t* qlp = ql + j64 * 32 + l;
+            const uint8_t* qhp = qh + l;
+            int v[8];
+            #pragma unroll
+            for (int j2 = 0; j2 < 8; ++j2) {
+                const uint8_t b = qlp[j2];
+                v[j2] = (half ? (b >> 4) : (b & 0x0F)) + ((qhp[j2] & u) ? 16 : 0);
+            }
+            w.w0 = pack4(v[0], v[1], v[2], v[3]);
+            w.w1 = pack4(v[4], v[5], v[6], v[7]);
+            return;
+        }
+        case QTYPE_Q6_K: {
+            const int hn = idx0 >> 7;
+            const int rem = idx0 & 127;
+            const int k = rem >> 5;
+            const int l = rem & 31;
+            const uint8_t* ql = grp + hn * 64;
+            const uint8_t* qh = grp + 128 + hn * 32;
+            const int8_t* sc = (const int8_t*)(grp + 192) + hn * 8;
+            const float d = f16d(grp + 208);
+            const int is = l >> 4;
+            w.ds = d * (float)sc[is + 2 * k];
+            int v[8];
+            #pragma unroll
+            for (int j2 = 0; j2 < 8; ++j2) {
+                const int ll = l + j2;
+                switch (k) {
+                    case 0:  v[j2] = (int)((ql[ll] & 0x0F) | (((qh[ll] >> 0) & 3) << 4)) - 32; break;
+                    case 1:  v[j2] = (int)((ql[ll + 32] & 0x0F) | (((qh[ll] >> 2) & 3) << 4)) - 32; break;
+                    case 2:  v[j2] = (int)((ql[ll] >> 4) | (((qh[ll] >> 4) & 3) << 4)) - 32; break;
+                    default: v[j2] = (int)((ql[ll + 32] >> 4) | (((qh[ll] >> 6) & 3) << 4)) - 32; break;
+                }
+            }
+            w.w0 = pack4(v[0], v[1], v[2], v[3]);
+            w.w1 = pack4(v[4], v[5], v[6], v[7]);
+            return;
+        }
+        case QTYPE_IQ3_XXS: {
+            const float d = f16d(grp);
+            const uint8_t* qs = grp + 2;
+            const uint8_t* ss = qs + 64;
+            const int ib32 = idx0 >> 5;
+            const int l = (idx0 & 31) >> 3;
+            uint32_t aux32;
+            memcpy(&aux32, ss + 4 * ib32, 4);
+            w.ds = d * (0.5f + (float)(aux32 >> 28)) * 0.5f;
+            // (g ^ m) - m negates exactly the bytes whose sign bit is set
+            // (grid values are <= 62, so the byte negate cannot wrap).
+            const uint2 m = d_signmask_iq2xs[(aux32 >> (7 * l)) & 127];
+            const uint32_t g1 = d_iq3xxs_grid[qs[ib32 * 8 + 2 * l + 0]];
+            const uint32_t g2 = d_iq3xxs_grid[qs[ib32 * 8 + 2 * l + 1]];
+            w.w0 = (int)__vsub4(g1 ^ m.x, m.x);
+            w.w1 = (int)__vsub4(g2 ^ m.y, m.y);
+            return;
+        }
+        case QTYPE_IQ4_XS: {
+            const float d = f16d(grp);
+            const uint16_t scales_h = (uint16_t)grp[2] | ((uint16_t)grp[3] << 8);
+            const uint8_t* scales_l = grp + 4;
+            const uint8_t* qs = grp + 8;
+            const int ib32 = idx0 >> 5;
+            const int within = idx0 & 31;
+            const int half = within >> 4;
+            const int j0 = within & 15;
+            const uint8_t lo4 = (ib32 & 1) ? (scales_l[ib32 / 2] >> 4) : (scales_l[ib32 / 2] & 0x0F);
+            const uint8_t hi2 = (scales_h >> (2 * ib32)) & 0x03;
+            const int8_t scale = (int8_t)(lo4 | (hi2 << 4)) - 32;
+            w.ds = d * (float)scale;
+            const uint8_t* q = qs + ib32 * 16 + j0;
+            uint32_t q0, q1;
+            memcpy(&q0, q, 4);
+            memcpy(&q1, q + 4, 4);
+            const int sh = half * 4;
+            const uint32_t n0 = (q0 >> sh) & 0x0F0F0F0Fu;
+            const uint32_t n1 = (q1 >> sh) & 0x0F0F0F0Fu;
+            w.w0 = pack4(d_kvalues_iq4nl[n0 & 0xFF], d_kvalues_iq4nl[(n0 >> 8) & 0xFF],
+                         d_kvalues_iq4nl[(n0 >> 16) & 0xFF], d_kvalues_iq4nl[n0 >> 24]);
+            w.w1 = pack4(d_kvalues_iq4nl[n1 & 0xFF], d_kvalues_iq4nl[(n1 >> 8) & 0xFF],
+                         d_kvalues_iq4nl[(n1 >> 16) & 0xFF], d_kvalues_iq4nl[n1 >> 24]);
+            return;
+        }
+        default: {
+            w.w0 = w.w1 = 0; w.ds = 0.0f;
+            return;
+        }
+    }
+}
+
+// dot(weight fragment, activation fragment): two dp4a's, one fp32 FMA (plus a
+// correction pair for Q4_K/Q5_K minima). xq must be 8-byte aligned (idx0 is a
+// multiple of 8 and rows are 32-multiples).
+__device__ __forceinline__ float frag_dot_i8(const WI8& w, const int8_t* xq, float sx) {
+    int2 xi;
+    memcpy(&xi, xq, 8);
+    const int sumi = __dp4a(w.w1, xi.y, __dp4a(w.w0, xi.x, 0));
+    float r = w.ds * (float)sumi;
+    if (w.dm != 0.0f) {
+        const int sumx = __dp4a(0x01010101, xi.y, __dp4a(0x01010101, xi.x, 0));
+        r -= w.dm * (float)sumx;
+    }
+    return sx * r;
 }
 
 // Bytes covering one 256-element group of a row (multiple whole blocks for
@@ -218,8 +439,10 @@ __device__ __forceinline__ void dq8(uint32_t type, const uint8_t* grp, int frag,
             memcpy(&aux32, ss + 4 * ib32, 4);
             const float db = d * (0.5f + (float)(aux32 >> 28)) * 0.5f;
             const uint8_t signs = d_ksigns_iq2xs[(aux32 >> (7 * l)) & 127];
-            const uint8_t* g1 = &d_iq3xxs_grid[qs[ib32 * 8 + 2 * l + 0] * 4];
-            const uint8_t* g2 = &d_iq3xxs_grid[qs[ib32 * 8 + 2 * l + 1] * 4];
+            const uint8_t* g1 =
+                reinterpret_cast<const uint8_t*>(&d_iq3xxs_grid[qs[ib32 * 8 + 2 * l + 0]]);
+            const uint8_t* g2 =
+                reinterpret_cast<const uint8_t*>(&d_iq3xxs_grid[qs[ib32 * 8 + 2 * l + 1]]);
             #pragma unroll
             for (int j = 0; j < 4; ++j) {
                 w[j + 0] = db * (float)g1[j] * ((signs & d_kmask_iq2xs[j + 0]) ? -1.0f : 1.0f);
@@ -272,11 +495,86 @@ __device__ __forceinline__ float frag_dot(const float* w, const float* xt, int r
 
 constexpr int kWarpsPerBlock = 8;
 
+bool qtype_has_i8(uint32_t qtype) {
+    switch (qtype) {
+        case QTYPE_Q8_0: case QTYPE_Q3_K: case QTYPE_Q4_K: case QTYPE_Q5_K:
+        case QTYPE_Q6_K: case QTYPE_IQ3_XXS: case QTYPE_IQ4_XS:
+            return true;
+        default:
+            return false;
+    }
+}
+
+// Quantize activations to int8, one scale per 32-element block (Q8_1-style):
+// xq[t, i] = round(x[t, i] / sx),  xs[t, b] = sx = absmax(block b) / 127.
+// One warp per block; `in` must be a multiple of 32 (every GGUF quant row is).
+__global__ void quantize_act_q8_kernel(const float* __restrict__ x, int64_t nblocks,
+                                       int8_t* __restrict__ xq, float* __restrict__ xs) {
+    const int64_t b = (int64_t)blockIdx.x * kWarpsPerBlock + (threadIdx.x >> 5);
+    if (b >= nblocks) return;
+    const int lane = threadIdx.x & 31;
+    const float v = x[b * 32 + lane];
+    const float amax = warp_reduce_max(fabsf(v));
+    const float sx = amax / 127.0f;
+    const float id = sx > 0.0f ? 1.0f / sx : 0.0f;
+    xq[b * 32 + lane] = (int8_t)__float2int_rn(v * id);
+    if (lane == 0) xs[b] = sx;
+}
+
+void quantize_act_q8(const float* x, int64_t n, int64_t in, int8_t* xq, float* xs,
+                     cudaStream_t s) {
+    const int64_t nblocks = n * (in >> 5);
+    const unsigned grid = (unsigned)((nblocks + kWarpsPerBlock - 1) / kWarpsPerBlock);
+    quantize_act_q8_kernel<<<grid, kWarpsPerBlock * 32, 0, s>>>(x, nblocks, xq, xs);
+}
+
+// Per-token activation view, templated fp32 / int8 (the kernels below carry
+// both instantiations; the int8 one replaces dq8+fp32 FMAs with dq8i+dp4a).
+template <bool I8>
+struct ActView;
+template <>
+struct ActView<false> {
+    const float* row;
+    __device__ ActView(const float* x, const int8_t*, const float*, size_t t, int in)
+        : row(x + t * (size_t)in) {}
+};
+template <>
+struct ActView<true> {
+    const int8_t* row;
+    const float* srow;
+    __device__ ActView(const float*, const int8_t* xq, const float* xs, size_t t, int in)
+        : row(xq + t * (size_t)in), srow(xs + t * (size_t)(in >> 5)) {}
+};
+
+template <bool I8>
+struct WFrag;
+template <>
+struct WFrag<false> {
+    float w[8];
+    __device__ void decode(uint32_t type, const uint8_t* grp, int lane) {
+        dq8(type, grp, lane, w);
+    }
+    __device__ float dot(const ActView<false>& a, int idx0, int rem) const {
+        return frag_dot(w, a.row + idx0, rem);
+    }
+};
+template <>
+struct WFrag<true> {
+    WI8 w;
+    __device__ void decode(uint32_t type, const uint8_t* grp, int lane) {
+        dq8i(type, grp, lane, w);
+    }
+    __device__ float dot(const ActView<true>& a, int idx0, int) const {
+        return frag_dot_i8(w, a.row + idx0, a.srow[idx0 >> 5]);
+    }
+};
+
 // y[t0+t, o] = x[t0+t, :] @ W[o, :] (+bias) for t in [0, T). One warp per
 // output row; lanes own disjoint 8-element fragments of each 256-element
 // group. T tokens share each decoded fragment (register reuse for prefill).
-template <int T>
-__global__ void gemv_q_kernel(const float* __restrict__ x, const uint8_t* __restrict__ qW,
+template <int T, bool I8>
+__global__ void gemv_q_kernel(const float* __restrict__ x, const int8_t* __restrict__ xq,
+                              const float* __restrict__ xs, const uint8_t* __restrict__ qW,
                               const float* __restrict__ bias, float* __restrict__ y,
                               int t0, int in, int out, int64_t row_bytes, uint32_t type) {
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
@@ -288,16 +586,17 @@ __global__ void gemv_q_kernel(const float* __restrict__ x, const uint8_t* __rest
     float acc[T];
     #pragma unroll
     for (int t = 0; t < T; ++t) acc[t] = 0.0f;
-    const float* xbase = x + (size_t)t0 * in;
     for (int g = 0; g < ngroups; ++g) {
         const int idx0 = (g << 8) + (lane << 3);
         const int rem = in - idx0;
         if (rem <= 0) continue;
-        float w8[8];
-        dq8(type, wrow + (size_t)g * gbytes, lane, w8);
+        WFrag<I8> wf;
+        wf.decode(type, wrow + (size_t)g * gbytes, lane);
         #pragma unroll
-        for (int t = 0; t < T; ++t)
-            acc[t] += frag_dot(w8, xbase + (size_t)t * in + idx0, rem);
+        for (int t = 0; t < T; ++t) {
+            ActView<I8> a(x, xq, xs, (size_t)(t0 + t), in);
+            acc[t] += wf.dot(a, idx0, rem);
+        }
     }
     #pragma unroll
     for (int t = 0; t < T; ++t) {
@@ -306,33 +605,46 @@ __global__ void gemv_q_kernel(const float* __restrict__ x, const uint8_t* __rest
     }
 }
 
-void gemm_q(uint32_t qtype, const float* x, const uint8_t* qW, const float* bias,
-            float* y, int64_t n, int64_t in, int64_t out, int64_t row_bytes,
-            cudaStream_t s) {
+template <bool I8>
+static void gemm_q_launch(uint32_t qtype, const float* x, const int8_t* xq, const float* xs,
+                          const uint8_t* qW, const float* bias, float* y, int64_t n,
+                          int64_t in, int64_t out, int64_t row_bytes, cudaStream_t s) {
     seed_tables();
     const dim3 grid((unsigned)((out + kWarpsPerBlock - 1) / kWarpsPerBlock));
     const int threads = kWarpsPerBlock * 32;
     int64_t t0 = 0;
     while (n - t0 >= 8) {
-        gemv_q_kernel<8><<<grid, threads, 0, s>>>(x, qW, bias, y, (int)t0, (int)in,
-                                                  (int)out, row_bytes, qtype);
+        gemv_q_kernel<8, I8><<<grid, threads, 0, s>>>(x, xq, xs, qW, bias, y, (int)t0,
+                                                      (int)in, (int)out, row_bytes, qtype);
         t0 += 8;
     }
     if (n - t0 >= 4) {
-        gemv_q_kernel<4><<<grid, threads, 0, s>>>(x, qW, bias, y, (int)t0, (int)in,
-                                                  (int)out, row_bytes, qtype);
+        gemv_q_kernel<4, I8><<<grid, threads, 0, s>>>(x, xq, xs, qW, bias, y, (int)t0,
+                                                      (int)in, (int)out, row_bytes, qtype);
         t0 += 4;
     }
     if (n - t0 >= 2) {
-        gemv_q_kernel<2><<<grid, threads, 0, s>>>(x, qW, bias, y, (int)t0, (int)in,
-                                                  (int)out, row_bytes, qtype);
+        gemv_q_kernel<2, I8><<<grid, threads, 0, s>>>(x, xq, xs, qW, bias, y, (int)t0,
+                                                      (int)in, (int)out, row_bytes, qtype);
         t0 += 2;
     }
     if (n - t0 >= 1) {
-        gemv_q_kernel<1><<<grid, threads, 0, s>>>(x, qW, bias, y, (int)t0, (int)in,
-                                                  (int)out, row_bytes, qtype);
+        gemv_q_kernel<1, I8><<<grid, threads, 0, s>>>(x, xq, xs, qW, bias, y, (int)t0,
+                                                      (int)in, (int)out, row_bytes, qtype);
         t0 += 1;
     }
+}
+
+void gemm_q(uint32_t qtype, const float* x, const uint8_t* qW, const float* bias,
+            float* y, int64_t n, int64_t in, int64_t out, int64_t row_bytes,
+            cudaStream_t s) {
+    gemm_q_launch<false>(qtype, x, nullptr, nullptr, qW, bias, y, n, in, out, row_bytes, s);
+}
+
+void gemm_q_i8(uint32_t qtype, const int8_t* xq, const float* xs, const uint8_t* qW,
+               const float* bias, float* y, int64_t n, int64_t in, int64_t out,
+               int64_t row_bytes, cudaStream_t s) {
+    gemm_q_launch<true>(qtype, nullptr, xq, xs, qW, bias, y, n, in, out, row_bytes, s);
 }
 
 // Gather embeddings from a quant [vocab, H] table: one block per token; the 8
@@ -426,7 +738,9 @@ void dequant_rows_f16(uint32_t qtype, const uint8_t* qW, int64_t rows, int64_t i
 // Phase 2 (down):    grid (hidden/8, n*topk); one warp per (t, slot, o):
 //   out[t, o] += weight * (down_e[o] . h_act[t, slot]).
 
-__global__ void moe_gate_up_q_kernel(const float* __restrict__ x, const int* __restrict__ topk_ids,
+template <bool I8>
+__global__ void moe_gate_up_q_kernel(const float* __restrict__ x, const int8_t* __restrict__ xq,
+                                     const float* __restrict__ xs, const int* __restrict__ topk_ids,
                                      const uint8_t* __restrict__ gate_q, const uint8_t* __restrict__ up_q,
                                      int topk, int hidden, int moe_inter,
                                      int64_t gate_row_bytes, int64_t up_row_bytes,
@@ -438,7 +752,7 @@ __global__ void moe_gate_up_q_kernel(const float* __restrict__ x, const int* __r
     const int ts = blockIdx.y;                  // t * topk + slot
     const int t = ts / topk;
     const int e = topk_ids[ts];
-    const float* xt = x + (size_t)t * hidden;
+    const ActView<I8> xt(x, xq, xs, (size_t)t, hidden);
     const uint8_t* grow = gate_q + ((size_t)e * moe_inter + f) * gate_row_bytes;
     const uint8_t* urow = up_q + ((size_t)e * moe_inter + f) * up_row_bytes;
     const int g_gbytes = qgroup_bytes(gate_type);
@@ -449,11 +763,11 @@ __global__ void moe_gate_up_q_kernel(const float* __restrict__ x, const int* __r
         const int idx0 = (gi << 8) + (lane << 3);
         const int rem = hidden - idx0;
         if (rem <= 0) continue;
-        float w8[8];
-        dq8(gate_type, grow + (size_t)gi * g_gbytes, lane, w8);
-        g += frag_dot(w8, xt + idx0, rem);
-        dq8(up_type, urow + (size_t)gi * u_gbytes, lane, w8);
-        u += frag_dot(w8, xt + idx0, rem);
+        WFrag<I8> wf;
+        wf.decode(gate_type, grow + (size_t)gi * g_gbytes, lane);
+        g += wf.dot(xt, idx0, rem);
+        wf.decode(up_type, urow + (size_t)gi * u_gbytes, lane);
+        u += wf.dot(xt, idx0, rem);
     }
     g = warp_reduce_sum(g);
     u = warp_reduce_sum(u);
@@ -461,20 +775,24 @@ __global__ void moe_gate_up_q_kernel(const float* __restrict__ x, const int* __r
         h_act[(size_t)ts * moe_inter + f] = silu(g) * u;
 }
 
-__global__ void moe_down_q_kernel(const int* __restrict__ topk_ids, const float* __restrict__ topk_w,
+// Down projections write UNWEIGHTED per-slot partial rows dpart[ts, hidden];
+// a fixed-slot-order reduce applies the gate weights. (An atomicAdd
+// accumulation was grid-shape-dependent, so a verify chunk's logits could
+// drift off the decode steps it re-checks — breaking speculative parity.)
+template <bool I8>
+__global__ void moe_down_q_kernel(const int* __restrict__ topk_ids,
                                   const uint8_t* __restrict__ down_q,
-                                  const float* __restrict__ h_act, int topk, int hidden, int moe_inter,
+                                  const float* __restrict__ h_act, const int8_t* __restrict__ hq,
+                                  const float* __restrict__ hs, int topk, int hidden, int moe_inter,
                                   int64_t down_row_bytes, uint32_t down_type,
-                                  float* __restrict__ out) {
+                                  float* __restrict__ dpart) {
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int o = blockIdx.x * kWarpsPerBlock + warp;
     if (o >= hidden) return;
     const int ts = blockIdx.y;
-    const int t = ts / topk;
     const int e = topk_ids[ts];
-    const float weight = topk_w[ts];
     const uint8_t* drow = down_q + ((size_t)e * hidden + o) * down_row_bytes;
-    const float* ha = h_act + (size_t)ts * moe_inter;
+    const ActView<I8> ha(h_act, hq, hs, (size_t)ts, moe_inter);
     const int gbytes = qgroup_bytes(down_type);
     const int ngroups = (moe_inter + 255) >> 8;
     float acc = 0.0f;
@@ -482,13 +800,26 @@ __global__ void moe_down_q_kernel(const int* __restrict__ topk_ids, const float*
         const int idx0 = (gi << 8) + (lane << 3);
         const int rem = moe_inter - idx0;
         if (rem <= 0) continue;
-        float w8[8];
-        dq8(down_type, drow + (size_t)gi * gbytes, lane, w8);
-        acc += frag_dot(w8, ha + idx0, rem);
+        WFrag<I8> wf;
+        wf.decode(down_type, drow + (size_t)gi * gbytes, lane);
+        acc += wf.dot(ha, idx0, rem);
     }
     acc = warp_reduce_sum(acc);
     if (lane == 0)
-        atomicAdd(&out[(size_t)t * hidden + o], weight * acc);
+        dpart[(size_t)ts * hidden + o] = acc;
+}
+
+__global__ void moe_down_reduce_kernel(const float* __restrict__ dpart,
+                                       const float* __restrict__ topk_w,
+                                       int n, int topk, int hidden,
+                                       float* __restrict__ out) {
+    const int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (int64_t)n * hidden) return;
+    const int64_t t = i / hidden, o = i % hidden;
+    float acc = 0.0f;
+    for (int s = 0; s < topk; ++s)
+        acc += topk_w[t * topk + s] * dpart[(size_t)(t * topk + s) * hidden + o];
+    out[i] = acc;
 }
 
 // ---- expert-major prefill path ---------------------------------------------
@@ -526,8 +857,10 @@ __global__ void moe_dispatch_scatter_kernel(const int* __restrict__ topk_ids, in
     ts_sorted[offsets[e] + atomicAdd(&cursor[e], 1)] = i;
 }
 
-template <int T>
+template <int T, bool I8>
 __global__ void moe_gate_up_q_emajor_kernel(const float* __restrict__ x,
+                                            const int8_t* __restrict__ xq,
+                                            const float* __restrict__ xs,
                                             const int* __restrict__ ts_sorted,
                                             const int* __restrict__ offsets,
                                             const uint8_t* __restrict__ gate_q,
@@ -550,14 +883,9 @@ __global__ void moe_gate_up_q_emajor_kernel(const float* __restrict__ x,
     for (int base = beg; base < end; base += T) {
         const int B = min(T, end - base);
         int ts[T];
-        const float* xt[T];
         #pragma unroll
-        for (int j = 0; j < T; ++j) {
-            if (j < B) {
-                ts[j] = ts_sorted[base + j];
-                xt[j] = x + (size_t)(ts[j] / topk) * hidden;
-            }
-        }
+        for (int j = 0; j < T; ++j)
+            if (j < B) ts[j] = ts_sorted[base + j];
         float g8[T], u8[T];
         #pragma unroll
         for (int j = 0; j < T; ++j) { g8[j] = 0.0f; u8[j] = 0.0f; }
@@ -565,15 +893,17 @@ __global__ void moe_gate_up_q_emajor_kernel(const float* __restrict__ x,
             const int idx0 = (gi << 8) + (lane << 3);
             const int rem = hidden - idx0;
             if (rem <= 0) continue;
-            float w8[8];
-            dq8(gate_type, grow + (size_t)gi * g_gbytes, lane, w8);
+            WFrag<I8> wf;
+            wf.decode(gate_type, grow + (size_t)gi * g_gbytes, lane);
             #pragma unroll
             for (int j = 0; j < T; ++j)
-                if (j < B) g8[j] += frag_dot(w8, xt[j] + idx0, rem);
-            dq8(up_type, urow + (size_t)gi * u_gbytes, lane, w8);
+                if (j < B) g8[j] += wf.dot(ActView<I8>(x, xq, xs, (size_t)(ts[j] / topk), hidden),
+                                           idx0, rem);
+            wf.decode(up_type, urow + (size_t)gi * u_gbytes, lane);
             #pragma unroll
             for (int j = 0; j < T; ++j)
-                if (j < B) u8[j] += frag_dot(w8, xt[j] + idx0, rem);
+                if (j < B) u8[j] += wf.dot(ActView<I8>(x, xq, xs, (size_t)(ts[j] / topk), hidden),
+                                           idx0, rem);
         }
         #pragma unroll
         for (int j = 0; j < T; ++j) {
@@ -585,15 +915,16 @@ __global__ void moe_gate_up_q_emajor_kernel(const float* __restrict__ x,
     }
 }
 
-template <int T>
+template <int T, bool I8>
 __global__ void moe_down_q_emajor_kernel(const int* __restrict__ ts_sorted,
                                          const int* __restrict__ offsets,
-                                         const float* __restrict__ topk_w,
                                          const uint8_t* __restrict__ down_q,
                                          const float* __restrict__ h_act,
+                                         const int8_t* __restrict__ hq,
+                                         const float* __restrict__ hs,
                                          int hidden, int moe_inter,
                                          int64_t down_row_bytes, uint32_t down_type,
-                                         float* __restrict__ out, int topk) {
+                                         float* __restrict__ dpart) {
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int o = blockIdx.x * kWarpsPerBlock + warp;
     if (o >= hidden) return;
@@ -606,14 +937,9 @@ __global__ void moe_down_q_emajor_kernel(const int* __restrict__ ts_sorted,
     for (int base = beg; base < end; base += T) {
         const int B = min(T, end - base);
         int ts[T];
-        const float* ha[T];
         #pragma unroll
-        for (int j = 0; j < T; ++j) {
-            if (j < B) {
-                ts[j] = ts_sorted[base + j];
-                ha[j] = h_act + (size_t)ts[j] * moe_inter;
-            }
-        }
+        for (int j = 0; j < T; ++j)
+            if (j < B) ts[j] = ts_sorted[base + j];
         float a8[T];
         #pragma unroll
         for (int j = 0; j < T; ++j) a8[j] = 0.0f;
@@ -621,18 +947,19 @@ __global__ void moe_down_q_emajor_kernel(const int* __restrict__ ts_sorted,
             const int idx0 = (gi << 8) + (lane << 3);
             const int rem = moe_inter - idx0;
             if (rem <= 0) continue;
-            float w8[8];
-            dq8(down_type, drow + (size_t)gi * gbytes, lane, w8);
+            WFrag<I8> wf;
+            wf.decode(down_type, drow + (size_t)gi * gbytes, lane);
             #pragma unroll
             for (int j = 0; j < T; ++j)
-                if (j < B) a8[j] += frag_dot(w8, ha[j] + idx0, rem);
+                if (j < B) a8[j] += wf.dot(ActView<I8>(h_act, hq, hs, (size_t)ts[j], moe_inter),
+                                           idx0, rem);
         }
         #pragma unroll
         for (int j = 0; j < T; ++j) {
             if (j >= B) continue;
             const float acc = warp_reduce_sum(a8[j]);
             if (lane == 0)
-                atomicAdd(&out[(size_t)(ts[j] / topk) * hidden + o], topk_w[ts[j]] * acc);
+                dpart[(size_t)ts[j] * hidden + o] = acc;
         }
     }
 }
@@ -646,7 +973,10 @@ __global__ void moe_down_q_emajor_kernel(const int* __restrict__ ts_sorted,
 // and a small epilogue reduces splits in fixed order (deterministic) and
 // applies silu(g)*u.
 
+template <bool I8>
 __global__ void moe_gate_up_q_splitk_kernel(const float* __restrict__ x,
+                                            const int8_t* __restrict__ xq,
+                                            const float* __restrict__ xs,
                                             const int* __restrict__ topk_ids,
                                             const uint8_t* __restrict__ gate_q,
                                             const uint8_t* __restrict__ up_q,
@@ -660,7 +990,7 @@ __global__ void moe_gate_up_q_splitk_kernel(const float* __restrict__ x,
     const int ts = blockIdx.y;
     const int sp = blockIdx.z;
     const int e = topk_ids[ts];
-    const float* xt = x + (size_t)(ts / topk) * hidden;
+    const ActView<I8> xt(x, xq, xs, (size_t)(ts / topk), hidden);
     const uint8_t* grow = gate_q + ((size_t)e * moe_inter + f) * gate_row_bytes;
     const uint8_t* urow = up_q + ((size_t)e * moe_inter + f) * up_row_bytes;
     const int g_gbytes = qgroup_bytes(gate_type);
@@ -673,11 +1003,11 @@ __global__ void moe_gate_up_q_splitk_kernel(const float* __restrict__ x,
         const int idx0 = (gi << 8) + (lane << 3);
         const int rem = hidden - idx0;
         if (rem <= 0) continue;
-        float w8[8];
-        dq8(gate_type, grow + (size_t)gi * g_gbytes, lane, w8);
-        g += frag_dot(w8, xt + idx0, rem);
-        dq8(up_type, urow + (size_t)gi * u_gbytes, lane, w8);
-        u += frag_dot(w8, xt + idx0, rem);
+        WFrag<I8> wf;
+        wf.decode(gate_type, grow + (size_t)gi * g_gbytes, lane);
+        g += wf.dot(xt, idx0, rem);
+        wf.decode(up_type, urow + (size_t)gi * u_gbytes, lane);
+        u += wf.dot(xt, idx0, rem);
     }
     g = warp_reduce_sum(g);
     u = warp_reduce_sum(u);
@@ -703,33 +1033,49 @@ __global__ void moe_gate_up_splitk_reduce_kernel(const float* __restrict__ gu_pa
     h_act[i] = silu(g) * u;
 }
 
-void moe_expert_ffn_q(uint32_t gate_type, uint32_t up_type, uint32_t down_type,
-                      const float* x, const int* topk_ids, const float* topk_w,
-                      const uint8_t* gate_q, const uint8_t* up_q, const uint8_t* down_q,
-                      int n, int topk, int hidden, int moe_inter, int E,
-                      int64_t gate_row_bytes, int64_t up_row_bytes, int64_t down_row_bytes,
-                      float* h_act, float* out, int* dispatch, float* gu_part,
-                      cudaStream_t s) {
+template <bool I8>
+static void moe_expert_ffn_q_launch(uint32_t gate_type, uint32_t up_type, uint32_t down_type,
+                                    const float* x, const int8_t* xq, const float* xs,
+                                    const int* topk_ids, const float* topk_w,
+                                    const uint8_t* gate_q, const uint8_t* up_q,
+                                    const uint8_t* down_q, int n, int topk, int hidden,
+                                    int moe_inter, int E, int64_t gate_row_bytes,
+                                    int64_t up_row_bytes, int64_t down_row_bytes,
+                                    float* h_act, int8_t* hq, float* hs, float* dpart,
+                                    float* out, int* dispatch, float* gu_part,
+                                    cudaStream_t s) {
     seed_tables();
-    cudaMemsetAsync(out, 0, (size_t)n * hidden * sizeof(float), s);
     const int threads = kWarpsPerBlock * 32;
     const int nts = n * topk;
+    // The i8 down kernels read h_act re-quantized to int8 (per-32 blocks).
+    auto quantize_h = [&] {
+        if (I8) quantize_act_q8(h_act, nts, moe_inter, hq, hs, s);
+    };
+    // Fixed-slot-order weighted reduce of the down partials (deterministic —
+    // an atomicAdd accumulation was grid-shape-dependent).
+    auto reduce_down = [&] {
+        const int64_t total = (int64_t)n * hidden;
+        moe_down_reduce_kernel<<<(unsigned)((total + 255) / 256), 256, 0, s>>>(
+            dpart, topk_w, n, topk, hidden, out);
+    };
     if (gu_part && nts < kMoeSplitKMaxTs) {
         // Split-K gate/up + reduce epilogue, then the token-major down (its
         // grid spans `hidden` rows — no occupancy problem at n=1).
         dim3 gs((unsigned)((moe_inter + kWarpsPerBlock - 1) / kWarpsPerBlock),
                 (unsigned)nts, (unsigned)kMoeSplitK);
-        moe_gate_up_q_splitk_kernel<<<gs, threads, 0, s>>>(
-            x, topk_ids, gate_q, up_q, nts, topk, hidden, moe_inter,
+        moe_gate_up_q_splitk_kernel<I8><<<gs, threads, 0, s>>>(
+            x, xq, xs, topk_ids, gate_q, up_q, nts, topk, hidden, moe_inter,
             gate_row_bytes, up_row_bytes, gate_type, up_type, gu_part);
         const int hcount = nts * moe_inter;
         moe_gate_up_splitk_reduce_kernel<<<(unsigned)((hcount + 255) / 256), 256, 0, s>>>(
             gu_part, nts, moe_inter, h_act);
+        quantize_h();
         dim3 dn0((unsigned)((hidden + kWarpsPerBlock - 1) / kWarpsPerBlock),
                  (unsigned)nts);
-        moe_down_q_kernel<<<dn0, threads, 0, s>>>(
-            topk_ids, topk_w, down_q, h_act, topk, hidden, moe_inter,
-            down_row_bytes, down_type, out);
+        moe_down_q_kernel<I8><<<dn0, threads, 0, s>>>(
+            topk_ids, down_q, h_act, hq, hs, topk, hidden, moe_inter,
+            down_row_bytes, down_type, dpart);
+        reduce_down();
         return;
     }
     if (dispatch && nts >= 64) {
@@ -746,25 +1092,60 @@ void moe_expert_ffn_q(uint32_t gate_type, uint32_t up_type, uint32_t down_type,
         moe_dispatch_scatter_kernel<<<db, 256, 0, s>>>(topk_ids, nts, offsets, cursor,
                                                        ts_sorted);
         dim3 gu((unsigned)((moe_inter + kWarpsPerBlock - 1) / kWarpsPerBlock), (unsigned)E);
-        moe_gate_up_q_emajor_kernel<8><<<gu, threads, 0, s>>>(
-            x, ts_sorted, offsets, gate_q, up_q, topk, hidden, moe_inter,
+        moe_gate_up_q_emajor_kernel<8, I8><<<gu, threads, 0, s>>>(
+            x, xq, xs, ts_sorted, offsets, gate_q, up_q, topk, hidden, moe_inter,
             gate_row_bytes, up_row_bytes, gate_type, up_type, h_act);
+        quantize_h();
         dim3 dn((unsigned)((hidden + kWarpsPerBlock - 1) / kWarpsPerBlock), (unsigned)E);
-        moe_down_q_emajor_kernel<8><<<dn, threads, 0, s>>>(
-            ts_sorted, offsets, topk_w, down_q, h_act, hidden, moe_inter,
-            down_row_bytes, down_type, out, topk);
+        moe_down_q_emajor_kernel<8, I8><<<dn, threads, 0, s>>>(
+            ts_sorted, offsets, down_q, h_act, hq, hs, hidden, moe_inter,
+            down_row_bytes, down_type, dpart);
+        reduce_down();
         return;
     }
     dim3 gu((unsigned)((moe_inter + kWarpsPerBlock - 1) / kWarpsPerBlock),
             (unsigned)(n * topk));
-    moe_gate_up_q_kernel<<<gu, threads, 0, s>>>(
-        x, topk_ids, gate_q, up_q, topk, hidden, moe_inter,
+    moe_gate_up_q_kernel<I8><<<gu, threads, 0, s>>>(
+        x, xq, xs, topk_ids, gate_q, up_q, topk, hidden, moe_inter,
         gate_row_bytes, up_row_bytes, gate_type, up_type, h_act);
+    quantize_h();
     dim3 dn((unsigned)((hidden + kWarpsPerBlock - 1) / kWarpsPerBlock),
             (unsigned)(n * topk));
-    moe_down_q_kernel<<<dn, threads, 0, s>>>(
-        topk_ids, topk_w, down_q, h_act, topk, hidden, moe_inter,
-        down_row_bytes, down_type, out);
+    moe_down_q_kernel<I8><<<dn, threads, 0, s>>>(
+        topk_ids, down_q, h_act, hq, hs, topk, hidden, moe_inter,
+        down_row_bytes, down_type, dpart);
+    reduce_down();
+}
+
+void moe_expert_ffn_q(uint32_t gate_type, uint32_t up_type, uint32_t down_type,
+                      const float* x, const int* topk_ids, const float* topk_w,
+                      const uint8_t* gate_q, const uint8_t* up_q, const uint8_t* down_q,
+                      int n, int topk, int hidden, int moe_inter, int E,
+                      int64_t gate_row_bytes, int64_t up_row_bytes, int64_t down_row_bytes,
+                      float* h_act, float* dpart, float* out, int* dispatch, float* gu_part,
+                      cudaStream_t s) {
+    moe_expert_ffn_q_launch<false>(gate_type, up_type, down_type, x, nullptr, nullptr,
+                                   topk_ids, topk_w, gate_q, up_q, down_q, n, topk, hidden,
+                                   moe_inter, E, gate_row_bytes, up_row_bytes, down_row_bytes,
+                                   h_act, nullptr, nullptr, dpart, out, dispatch, gu_part, s);
+}
+
+// int8-activation MoE FFN: caller pre-quantizes x (shared with the other
+// consumers of the same normed activations); h_act is re-quantized into
+// (hq, hs) between the two phases. All three types must be qtype_has_i8 and
+// hidden/moe_inter multiples of 32.
+void moe_expert_ffn_q_i8(uint32_t gate_type, uint32_t up_type, uint32_t down_type,
+                         const int8_t* xq, const float* xs,
+                         const int* topk_ids, const float* topk_w,
+                         const uint8_t* gate_q, const uint8_t* up_q, const uint8_t* down_q,
+                         int n, int topk, int hidden, int moe_inter, int E,
+                         int64_t gate_row_bytes, int64_t up_row_bytes, int64_t down_row_bytes,
+                         float* h_act, int8_t* hq, float* hs, float* dpart, float* out,
+                         int* dispatch, float* gu_part, cudaStream_t s) {
+    moe_expert_ffn_q_launch<true>(gate_type, up_type, down_type, nullptr, xq, xs,
+                                  topk_ids, topk_w, gate_q, up_q, down_q, n, topk, hidden,
+                                  moe_inter, E, gate_row_bytes, up_row_bytes, down_row_bytes,
+                                  h_act, hq, hs, dpart, out, dispatch, gu_part, s);
 }
 
 }  // namespace cuda
