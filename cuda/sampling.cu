@@ -75,6 +75,45 @@ void argmax_rows(const float* y, int nrows, int ncols, int64_t ld, float2* out_p
     argmax_rows_kernel<<<nrows, threads, shmem, s>>>(y, ncols, ld, out_pairs);
 }
 
+// Per-row logsumexp over y[nrows, ld] (ncols valid): out[row] = m + log(sum
+// exp(x - m)) with the row max m computed internally so exp() never overflows.
+// Together with argmax_rows this yields the draft head's top-1 probability
+// p = exp(max - lse); under a column-parallel lm_head each rank emits its
+// shard's lse and the host combines them stably. One block per row.
+__global__ void row_logsumexp_kernel(const float* __restrict__ y, int ncols, int64_t ld,
+                                     float* __restrict__ out) {
+    extern __shared__ float smem[];
+    const float* row = y + (int64_t)blockIdx.x * ld;
+    float m = -1e30f;
+    for (int i = threadIdx.x; i < ncols; i += blockDim.x) m = fmaxf(m, row[i]);
+    smem[threadIdx.x] = m;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride)
+            smem[threadIdx.x] = fmaxf(smem[threadIdx.x], smem[threadIdx.x + stride]);
+        __syncthreads();
+    }
+    const float gmax = smem[0];
+    __syncthreads();
+    float local = 0.0f;
+    for (int i = threadIdx.x; i < ncols; i += blockDim.x)
+        local += __expf(row[i] - gmax);
+    smem[threadIdx.x] = local;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) smem[threadIdx.x] += smem[threadIdx.x + stride];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) out[blockIdx.x] = gmax + logf(smem[0]);
+}
+
+void row_logsumexp(const float* y, int nrows, int ncols, int64_t ld, float* out_lse,
+                   cudaStream_t s) {
+    const int threads = 256;
+    const size_t shmem = threads * sizeof(float);
+    row_logsumexp_kernel<<<nrows, threads, shmem, s>>>(y, ncols, ld, out_lse);
+}
+
 __global__ void softmax_kernel(float* __restrict__ logits, int vocab, float inv_t) {
     extern __shared__ float smem[];
     float m = -1e30f;

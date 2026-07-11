@@ -81,6 +81,19 @@ static bool gpu_spec_should_fallback(int groups, int accepted) {
     return static_cast<double>(accepted) / groups < min_accept;
 }
 
+// Draft-confidence gate (GLMSERVE_SPEC_CONF, 0 disables): the MTP chain is
+// truncated at the first draft token whose top-1 probability falls below tau,
+// so a hard position pays a plain 1-row step instead of a full verify group.
+// With the gate active the all-or-nothing adaptive fallback is disabled — the
+// per-position gate subsumes it (and low-confidence positions would otherwise
+// drag the group average below the fallback threshold by design).
+// Default 0.4 = the peak of the measured diverse-prose sweep (job 145670:
+// tau 0.3/0.4/0.5/0.6 -> 29.6/34.0/33.7/32.0 tok/s vs 24.7 ungated).
+static float gpu_spec_conf_tau() {
+    static const float tau = static_cast<float>(env_double("GLMSERVE_SPEC_CONF", 0.4));
+    return tau;
+}
+
 // N-gram lookup drafter (llama.cpp lookup-decoding style): the trailing
 // (m-1)-gram of the context plus the committed seed token is searched backward
 // through the context; on a hit the tokens that followed the previous
@@ -90,6 +103,12 @@ static bool gpu_spec_should_fallback(int groups, int accepted) {
 // stream equal to plain greedy decode regardless of draft origin.
 // GLMSERVE_SPEC_NGRAM=0 disables; GLMSERVE_SPEC_NGRAM_MIN sets the minimum
 // match length m (default 3: seed + 2 committed tokens).
+// Evidence guard: a 3-gram can match by fluke in diverse prose, and a 64-row
+// verify of a fluke continuation costs ~10 plain steps for ~0 accepted tokens
+// (measured: 4 fluke groups burned 1.5 s of a 5.3 s decode). Real repetition
+// shows an extended backward agreement at the match site, so the draft is
+// only taken when seed + matched suffix + backward extension cover at least
+// GLMSERVE_SPEC_NGRAM_EVIDENCE (default 8) tokens.
 static std::vector<int> ngram_draft(const std::vector<int>& ctx, int seed, int max_k) {
     static const bool enabled = [] {
         const char* v = std::getenv("GLMSERVE_SPEC_NGRAM");
@@ -97,6 +116,7 @@ static std::vector<int> ngram_draft(const std::vector<int>& ctx, int seed, int m
     }();
     if (!enabled || max_k <= 0) return {};
     const int m_min = std::max(2, env_int("GLMSERVE_SPEC_NGRAM_MIN", 3));
+    const int min_evidence = env_int("GLMSERVE_SPEC_NGRAM_EVIDENCE", 8);
     const int64_t n = static_cast<int64_t>(ctx.size());
     for (int m = std::max(m_min, 4); m >= m_min; --m) {
         if (n < m) continue;
@@ -117,9 +137,15 @@ static std::vector<int> ngram_draft(const std::vector<int>& ctx, int seed, int m
             if (len > best_len) { best_len = len; best_j = j; }
             if (best_len >= max_k) break;
         }
-        if (best_j >= 0)
+        if (best_j >= 0) {
+            // Backward agreement at the match: ctx[best_j - t] == ctx[n - t]
+            // holds for t < m by construction; extend past the pattern.
+            int64_t agree = m;  // seed (t=0) + m-1 matched suffix tokens
+            while (best_j - agree >= 0 && ctx[best_j - agree] == ctx[n - agree]) ++agree;
+            if (agree < min_evidence) continue;
             return std::vector<int>(ctx.begin() + best_j + 1,
                                     ctx.begin() + best_j + 1 + best_len);
+        }
     }
     return {};
 }
@@ -382,20 +408,23 @@ Completion Engine::run(const std::vector<int>& prompt_in, const SamplingParams& 
                 std::vector<int> ds = ngram_draft(all_tokens, chunk[0], draft_cap);
                 const bool from_ngram =
                     !ds.empty() && static_cast<int>(ds.size()) >= group_k - 1;
+                const float tau = gpu_spec_conf_tau();
                 if (!from_ngram) {
                     ds.clear();
-                    if (group_k > 1) ds = model_->mtp_gpu_draft(chunk[0], group_k - 1);
+                    if (group_k > 1) ds = model_->mtp_gpu_draft(chunk[0], group_k - 1, tau);
                 }
                 chunk.insert(chunk.end(), ds.begin(), ds.end());
                 const int chunk_n = static_cast<int>(chunk.size());
-                ++c.mtp_groups;
+                if (chunk_n > 1) ++c.mtp_groups;
                 if (from_ngram) ++c.ngram_groups;
                 std::vector<int> am;
                 model_->forward_gpu_chunk_greedy(chunk, L, &am);
                 int a = 1;
                 while (a < chunk_n && chunk[a] == am[a - 1]) ++a;
-                c.mtp_accepted += a;
-                if (a < chunk_n) ++c.mtp_rejected;
+                if (chunk_n > 1) {
+                    c.mtp_accepted += a;
+                    if (a < chunk_n) ++c.mtp_rejected;
+                }
                 model_->gpu_rewind(L + a);
                 bool finish_generation = false;
                 for (int i = 0; i < a; ++i) {
@@ -405,7 +434,8 @@ Completion Engine::run(const std::vector<int>& prompt_in, const SamplingParams& 
                 }
                 if (finish_generation) break;
                 gpu_seed = am[a - 1];
-                if (gpu_spec_should_fallback(c.mtp_groups, c.mtp_accepted)) {
+                if (tau <= 0.0f &&
+                    gpu_spec_should_fallback(c.mtp_groups, c.mtp_accepted)) {
                     mtp_gpu_active = false;
                     continue;
                 }
@@ -582,6 +612,11 @@ Engine::BenchResult Engine::profile(int prompt_len, int gen_len, int draft_k,
             std::vector<int> all_tokens = prompt;  // n-gram drafter history
             int64_t L = prompt_len;
             int gen = 0;
+            const float tau = gpu_spec_conf_tau();
+            auto bump = [](std::vector<int>& hist, int v) {
+                if (v >= static_cast<int>(hist.size())) hist.resize(v + 1, 0);
+                ++hist[v];
+            };
             Timer td;
             while (gen < gen_len) {
                 if (r.spec_fallback) {
@@ -600,32 +635,47 @@ Engine::BenchResult Engine::profile(int prompt_len, int gen_len, int draft_k,
                 const int draft_cap = static_cast<int>(std::min<int64_t>(
                     std::min(kSpecGroupMax, gen_len - gen),
                     model_->gpu_kv_ctx() - L)) - 1;
+                Timer tdraft;
                 std::vector<int> ds = ngram_draft(all_tokens, chunk[0], draft_cap);
                 const bool from_ngram =
                     !ds.empty() && static_cast<int>(ds.size()) >= group_k - 1;
                 if (!from_ngram) {
                     ds.clear();
-                    if (group_k > 1) ds = model_->mtp_gpu_draft(chunk[0], group_k - 1);
+                    if (group_k > 1) ds = model_->mtp_gpu_draft(chunk[0], group_k - 1, tau);
                 }
                 chunk.insert(chunk.end(), ds.begin(), ds.end());
                 const int chunk_n = static_cast<int>(chunk.size());
+                r.spec_draft_ms += tdraft.ms();
                 if (from_ngram) ++r.spec_ngram_groups;
                 std::vector<int> am;
+                Timer tverify;
                 model_->forward_gpu_chunk_greedy(chunk, L, &am);
                 int a = 1;
                 while (a < chunk_n && chunk[a] == am[a - 1]) ++a;
                 model_->gpu_rewind(L + a);
+                r.spec_verify_ms += tverify.ms();
                 all_tokens.insert(all_tokens.end(), chunk.begin(), chunk.begin() + a);
                 seed = am[a - 1];
                 L += a;
                 gen += a;
-                ++r.spec_groups;
-                r.spec_accepted += a;
-                if (gpu_spec_should_fallback(r.spec_groups, r.spec_accepted)) {
+                if (chunk_n > 1) {
+                    ++r.spec_groups;
+                    r.spec_accepted += a;
+                    bump(r.spec_accept_hist, a);
+                    bump(r.spec_len_hist, chunk_n);
+                } else {
+                    // Confidence gate produced no drafts: a 1-row chunk is just a
+                    // plain decode step, not a speculative group.
+                    ++r.spec_plain_steps;
+                }
+                if (tau <= 0.0f &&
+                    gpu_spec_should_fallback(r.spec_groups, r.spec_accepted)) {
                     r.spec_fallback = true;
                     continue;
                 }
+                Timer tabsorb;
                 model_->mtp_gpu_absorb(std::vector<int>(chunk.begin() + 1, chunk.begin() + a), L - a);
+                r.spec_absorb_ms += tabsorb.ms();
             }
             r.decode_ms = td.ms();
             r.gen_len = gen;
@@ -821,7 +871,8 @@ Engine::MTPCheck Engine::check_mtp_speculative(const std::vector<int>& prompt, i
                 !ds.empty() && static_cast<int>(ds.size()) >= group_k - 1;
             if (!from_ngram) {
                 ds.clear();
-                if (group_k > 1) ds = model_->mtp_gpu_draft(chunk[0], group_k - 1);
+                if (group_k > 1)
+                    ds = model_->mtp_gpu_draft(chunk[0], group_k - 1, gpu_spec_conf_tau());
             }
             chunk.insert(chunk.end(), ds.begin(), ds.end());
             const int chunk_n = static_cast<int>(chunk.size());

@@ -97,6 +97,10 @@ public:
         int    spec_groups = 0, spec_accepted = 0;   // draft_k > 0 only
         int    spec_ngram_groups = 0;                // groups drafted by n-gram lookup
         bool   spec_fallback = false;                // adaptive GPU spec fallback
+        int    spec_plain_steps = 0;                 // 1-row chunks (confidence gate drafted nothing)
+        double spec_draft_ms = 0, spec_verify_ms = 0, spec_absorb_ms = 0;
+        std::vector<int> spec_accept_hist;           // [a] = drafted groups accepting a tokens
+        std::vector<int> spec_len_hist;              // [n] = drafted groups of chunk size n
         double prefill_tps() const { return prefill_ms > 0 ? prompt_len / (prefill_ms / 1e3) : 0; }
         double decode_tps()  const { return decode_ms  > 0 ? gen_len    / (decode_ms  / 1e3) : 0; }
         double decode_ms_per_tok() const { return gen_len ? decode_ms / gen_len : 0; }

@@ -1366,7 +1366,7 @@ void GLM52Model::forward_gpu_chunk_greedy(const std::vector<int>&, int64_t, std:
 void GLM52Model::mtp_gpu_absorb(const std::vector<int>&, int64_t) {
     GLM_CHECK(false, "mtp_gpu_absorb: built without CUDA (rebuild with GPU=1)");
 }
-std::vector<int> GLM52Model::mtp_gpu_draft(int, int) {
+std::vector<int> GLM52Model::mtp_gpu_draft(int, int, float) {
     GLM_CHECK(false, "mtp_gpu_draft: built without CUDA (rebuild with GPU=1)");
     return {};
 }

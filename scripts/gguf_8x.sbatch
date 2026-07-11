@@ -256,6 +256,24 @@ if [[ "$PHASES" == *F* ]]; then
             echo "D: $(cat "$TOKS_D")"; echo "F: $(cat "$TOKS_F")"
         fi
     fi
+    # Confidence-gated arm: truncated drafts must not change the greedy stream,
+    # and under TP this exercises the sharded top-1-prob combine (the gate
+    # decision must be identical on every rank or the all-reduces deadlock).
+    echo "=== phase F2: TP=8 spec-decode tokgen, GLMSERVE_SPEC_CONF=0.6 (must match phase D) ==="
+    TOKS_F2="/tmp/glmserve_phaseF2_${SLURM_JOB_ID}.tokens"
+    run_tp8 env GLMSERVE_SPEC_CONF=0.6 "$BIN" tokgen --model "$GGUF" --gpu --ctx 256 \
+        --tokens "$SEM_TOKENS" --max-tokens 32 --temp 0 \
+        --mtp-draft-k "${GLMSERVE_DRAFT_K:-4}" \
+        | tee "$TOKS_F2.full"
+    grep -m1 "tokens:" "$TOKS_F2.full" > "$TOKS_F2" || true
+    if [ -s "$TOKS_D" ] && [ -s "$TOKS_F2" ]; then
+        if diff -q "$TOKS_D" "$TOKS_F2" >/dev/null; then
+            echo "phase D==F2 conf-gated spec token gate: PASS"
+        else
+            echo "phase D==F2 conf-gated spec token gate: FAIL"
+            echo "D: $(cat "$TOKS_D")"; echo "F2: $(cat "$TOKS_F2")"
+        fi
+    fi
 fi
 
 if [[ "$PHASES" == *S* ]]; then
@@ -282,9 +300,18 @@ if [[ "$PHASES" == *R* ]]; then
         # operating point. GLMSERVE_DRAFT_K still overrides both cases.
         RK="${GLMSERVE_DRAFT_K:-4}"
         if [[ -z "${GLMSERVE_DRAFT_K:-}" && "$PF" == *repetitive* ]]; then RK=64; fi
-        echo "=== phase R: TP=8 real-prompt spec bench ($PF, draft_k=$RK) ==="
-        RLOG="/tmp/glmserve_phaseR_${SLURM_JOB_ID}_$(basename "$PF").log"
-        run_tp8 "$BIN" bench --model "$GGUF" --gpu --ctx "$CTX" \
+        # Diverse prose sweeps the draft-confidence gate (GLMSERVE_SPEC_CONF):
+        # conf=0 disables the adaptive fallback so every group drafts — that arm
+        # is the acceptance-histogram calibration, not a throughput claim. The
+        # repetitive gate arm stays at conf=0 (ngram lookup drafts, gate moot).
+        CONFS="0"
+        if [[ "$PF" != *repetitive* ]]; then CONFS="${GLMSERVE_SPEC_CONF_SWEEP:-0 0.4 0.6}"; fi
+        for CONF in $CONFS; do
+        CONF_ENV=(GLMSERVE_SPEC_CONF="$CONF")
+        if [[ "$CONF" == 0 && "$PF" != *repetitive* ]]; then CONF_ENV+=(GLMSERVE_SPEC_ADAPTIVE=0); fi
+        echo "=== phase R: TP=8 real-prompt spec bench ($PF, draft_k=$RK, conf=$CONF) ==="
+        RLOG="/tmp/glmserve_phaseR_${SLURM_JOB_ID}_$(basename "$PF")_conf${CONF}.log"
+        run_tp8 env "${CONF_ENV[@]}" "$BIN" bench --model "$GGUF" --gpu --ctx "$CTX" \
             --prompt-file "$PF" --gen-len "$GEN_LEN" \
             --mtp-draft-k "$RK" | tee "$RLOG"
         # The exact workload used for the llama.cpp ngram-mod comparison is a
@@ -301,6 +328,7 @@ if [[ "$PHASES" == *R* ]]; then
             fi
             echo "phase R llama.cpp gate: PASS (${TPS} > 126.22 tok/s, 2x64 accepted)"
         fi
+        done
     done
 fi
 

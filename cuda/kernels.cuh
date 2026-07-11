@@ -243,6 +243,9 @@ void argmax(const float* logits, int vocab, int* out_id, cudaStream_t s = 0);
 // Per-row first-max argmax over y[nrows, ld] (ncols valid); out float2{val, idx}.
 void argmax_rows(const float* y, int nrows, int ncols, int64_t ld, float2* out_pairs,
                  cudaStream_t s = 0);
+// Per-row logsumexp over y[nrows, ld] (ncols valid); out[row] = max + log(sumexp).
+void row_logsumexp(const float* y, int nrows, int ncols, int64_t ld, float* out_lse,
+                   cudaStream_t s = 0);
 void softmax_inplace(float* logits, int vocab, float temperature, cudaStream_t s = 0);
 
 // ---- glue (GPU forward path) ---------------------------------------------

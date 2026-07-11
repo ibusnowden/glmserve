@@ -241,8 +241,13 @@ public:
     // Greedy-draft k tokens ahead: seeded with `next_token` (the committed
     // token one past the absorbed prefix) and the stashed hidden state.
     // Extends the MTP cache by one committed position; speculative draft
-    // entries beyond it are rewound internally.
-    std::vector<int> mtp_gpu_draft(int next_token, int k);
+    // entries beyond it are rewound internally. conf_tau > 0 truncates the
+    // chain at the first draft whose top-1 probability under the MTP head
+    // falls below tau (that token is dropped too — every returned draft is
+    // confident), so a hard position degrades to a plain 1-row verify instead
+    // of paying a full-width group. The gate value comes out of the same
+    // all-reduce as the greedy winner, so TP ranks decide identically.
+    std::vector<int> mtp_gpu_draft(int next_token, int k, float conf_tau = 0.0f);
     ~GLM52Model();
 
 private:

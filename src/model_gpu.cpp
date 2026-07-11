@@ -708,6 +708,7 @@ struct GpuState {
     float* logits_d = nullptr;       // [kVerifyMax, vocab]
     float* vshard = nullptr;         // [kVerifyMax, lm_head.out] compact shard rows
     float2* am_pairs = nullptr;      // [kVerifyMax] per-row shard argmax {val, idx}
+    float* lse_d = nullptr;          // [kVerifyMax] per-row shard logsumexp
     Scratch sc;
     int64_t cur_len = 0;             // positions currently valid in the cache
     int64_t chunk_row0 = 0;          // absolute position of scratch row 0 (last pass)
@@ -1084,6 +1085,7 @@ bool GLM52Model::upload_to_gpu(int64_t max_ctx) {
         g->logits_d = dmalloc(kVerifyMax * c.vocab_size);
         g->vshard   = dmalloc(kVerifyMax * g->lm_head.out);
         cudaMalloc(&g->am_pairs, kVerifyMax * sizeof(float2));
+        g->lse_d = dmalloc(kVerifyMax);
     }
 
     // Flash-decoding partials: [kMlaParityMaxQ, n_heads, kMaxSplits, hc|kvlat]
@@ -1561,7 +1563,8 @@ std::vector<float> lm_head_rows(GpuState* g, const GLM52Config& c, const float* 
 // host argmax over the combined logits.
 std::vector<int> lm_head_greedy_rows(GpuState* g, const GLM52Config& c,
                                      const float* normed_rows, int64_t n,
-                                     Communicator* comm, const DistConfig& dist) {
+                                     Communicator* comm, const DistConfig& dist,
+                                     float* top1p = nullptr) {
     using namespace glmserve::cuda;
     GLM_CHECK(g->am_pairs && g->lm_head.out > 0,
               "lm_head_greedy_rows called on a non-final or incompletely uploaded GPU stage");
@@ -1578,36 +1581,61 @@ std::vector<int> lm_head_greedy_rows(GpuState* g, const GLM52Config& c,
         gemm_linear(normed_rows, lm, nullptr, y, n);
     }
     argmax_rows(y, static_cast<int>(n), static_cast<int>(lm.out), lm.out, g->am_pairs);
+    // Top-1 probability (draft confidence): per-shard logsumexp, combined with
+    // the winner in ONE all-reduce so ranks stay in lockstep and see identical
+    // values (the gate decision derived from them must match on every rank).
+    std::vector<float> lse;
+    if (top1p) {
+        row_logsumexp(y, static_cast<int>(n), static_cast<int>(lm.out), lm.out, g->lse_d);
+        lse.resize(static_cast<size_t>(n));
+        cudaMemcpy(lse.data(), g->lse_d, n * sizeof(float), cudaMemcpyDeviceToHost);
+    }
     std::vector<float2> pairs(static_cast<size_t>(n));
     cudaMemcpy(pairs.data(), g->am_pairs, n * sizeof(float2), cudaMemcpyDeviceToHost);
     cudaDeviceSynchronize();
 
     std::vector<int> out(static_cast<size_t>(n));
     if (!sharded) {
-        for (int64_t r = 0; r < n; ++r)
+        for (int64_t r = 0; r < n; ++r) {
             out[static_cast<size_t>(r)] = static_cast<int>(pairs[static_cast<size_t>(r)].y);
+            if (top1p)
+                top1p[r] = std::exp(pairs[static_cast<size_t>(r)].x - lse[static_cast<size_t>(r)]);
+        }
         return out;
     }
     GLM_CHECK(comm, "sharded lm_head requires a communicator");
     const int world = dist.tp_size;
     const int rank = dist.tp_rank();
-    std::vector<float> combine(static_cast<size_t>(n) * 2 * world, 0.0f);
+    const int w3 = top1p ? 3 : 2;  // {val, idx[, shard lse]} per rank
+    std::vector<float> combine(static_cast<size_t>(n) * w3 * world, 0.0f);
     for (int64_t r = 0; r < n; ++r) {
-        combine[static_cast<size_t>(r * 2 * world + 2 * rank)] = pairs[static_cast<size_t>(r)].x;
-        combine[static_cast<size_t>(r * 2 * world + 2 * rank + 1)] =
+        combine[static_cast<size_t>((r * world + rank) * w3)] = pairs[static_cast<size_t>(r)].x;
+        combine[static_cast<size_t>((r * world + rank) * w3 + 1)] =
             static_cast<float>(g->lm_head_off + static_cast<int64_t>(pairs[static_cast<size_t>(r)].y));
+        if (top1p)
+            combine[static_cast<size_t>((r * world + rank) * w3 + 2)] = lse[static_cast<size_t>(r)];
     }
     comm->all_reduce_sum(combine.data(), static_cast<int64_t>(combine.size()));
     for (int64_t r = 0; r < n; ++r) {
-        const float* p = combine.data() + r * 2 * world;
+        const float* p = combine.data() + r * world * w3;
         float best = p[0];
         int64_t best_i = static_cast<int64_t>(p[1]);
         for (int w = 1; w < world; ++w) {
-            const float v = p[2 * w];
-            const int64_t i = static_cast<int64_t>(p[2 * w + 1]);
+            const float v = p[w * w3];
+            const int64_t i = static_cast<int64_t>(p[w * w3 + 1]);
             if (v > best || (v == best && i < best_i)) { best = v; best_i = i; }
         }
         out[static_cast<size_t>(r)] = static_cast<int>(best_i);
+        if (top1p) {
+            // Stable combine of shard logsumexps: LSE = M + log Σ exp(lse_w − M).
+            float M = p[2];
+            for (int w = 1; w < world; ++w) M = std::max(M, p[w * w3 + 2]);
+            double sum = 0.0;
+            for (int w = 0; w < world; ++w)
+                sum += std::exp(static_cast<double>(p[w * w3 + 2]) - M);
+            top1p[r] = static_cast<float>(
+                std::exp(static_cast<double>(best) - (M + std::log(sum))));
+        }
     }
     return out;
 }
@@ -1999,7 +2027,7 @@ void GLM52Model::mtp_gpu_absorb(const std::vector<int>& next_tokens, int64_t pos
     cuda_check("mtp_gpu_absorb");
 }
 
-std::vector<int> GLM52Model::mtp_gpu_draft(int next_token, int k) {
+std::vector<int> GLM52Model::mtp_gpu_draft(int next_token, int k, float conf_tau) {
     GLM_CHECK(mtp_gpu_ready(), "mtp_gpu_draft: MTP block not resident");
     using namespace glmserve::cuda;
     auto* g = static_cast<GpuState*>(gpu_state_);
@@ -2023,7 +2051,22 @@ std::vector<int> GLM52Model::mtp_gpu_draft(int next_token, int k) {
         // This step's MTP hidden feeds the next step's hnorm.
         cudaMemcpy(gm.tmp, g->sc.hidden_d, H * sizeof(float), cudaMemcpyDeviceToDevice);
         rmsnorm(g->sc.hidden_d, gm.shared_head_norm, g->sc.normed, 1, H, eps);
-        const int best = lm_head_greedy_rows(g, cfg_, g->sc.normed, 1, comm_, dist_)[0];
+        // Chain extensions (i >= 1) need a much higher bar than the first
+        // draft: measured on diverse prose, draft #1 breaks even at ~11%
+        // acceptance (an n=2 verify costs ~10% over a plain step) while
+        // draft #2's conditional acceptance is ~5% against ~22 ms marginal
+        // verify cost per row. GLMSERVE_SPEC_CONF_EXT (default 0.85) gates
+        // the extensions; conf_tau <= 0 disables both gates.
+        static const float ext_tau = [] {
+            const char* v = std::getenv("GLMSERVE_SPEC_CONF_EXT");
+            return (v && *v) ? static_cast<float>(std::atof(v)) : 0.85f;
+        }();
+        const float step_tau = (conf_tau > 0.0f && i > 0) ? std::max(conf_tau, ext_tau)
+                                                          : conf_tau;
+        float p1 = 1.0f;
+        const int best = lm_head_greedy_rows(g, cfg_, g->sc.normed, 1, comm_, dist_,
+                                             step_tau > 0.0f ? &p1 : nullptr)[0];
+        if (step_tau > 0.0f && p1 < step_tau) break;
         out.push_back(best);
         tok = best;
     }
@@ -2088,6 +2131,7 @@ GLM52Model::~GLM52Model() {
     if (g->logits_d) cudaFree(g->logits_d);
     if (g->vshard) cudaFree(g->vshard);
     if (g->am_pairs) cudaFree(g->am_pairs);
+    if (g->lse_d) cudaFree(g->lse_d);
     if (g->part_acc) cudaFree(g->part_acc);
     if (g->part_m) cudaFree(g->part_m);
     if (g->part_l) cudaFree(g->part_l);

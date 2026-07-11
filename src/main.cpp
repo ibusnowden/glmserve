@@ -478,6 +478,21 @@ int cmd_bench(const Args& a) {
                         r.spec_groups, r.spec_ngram_groups,
                         (double)r.spec_accepted / r.spec_groups, draft_k,
                         r.spec_fallback ? " adaptive-fallback" : "");
+        if (r.spec_groups > 0 || r.spec_plain_steps > 0) {
+            std::printf("spec detail    : plain_steps=%d  draft=%.1f ms  verify=%.1f ms  absorb=%.1f ms\n",
+                        r.spec_plain_steps, r.spec_draft_ms, r.spec_verify_ms, r.spec_absorb_ms);
+            auto print_hist = [](const char* label, const std::vector<int>& h) {
+                bool any = false;
+                for (int v : h) if (v) { any = true; break; }
+                if (!any) return;
+                std::printf("%s:", label);
+                for (size_t i = 0; i < h.size(); ++i)
+                    if (h[i]) std::printf(" %zu:%d", i, h[i]);
+                std::printf("\n");
+            };
+            print_hist("accept hist    ", r.spec_accept_hist);   // accepted a -> groups
+            print_hist("chunk hist     ", r.spec_len_hist);      // chunk size n -> groups
+        }
         // Matched serving reference: llama.cpp ngram-mod on the same real
         // 1024-token repetitive prompt, 128-token continuation, TP=8 RTX
         // 6000 Ada node. Avoid printing a comparison for unrelated benches.
