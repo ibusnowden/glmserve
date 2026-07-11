@@ -501,6 +501,36 @@ constexpr int kWarpsPerBlock = 8;
 // the (rows x E) grid only adds launch overhead.
 constexpr int kMoeSmemMinTs = 2048;
 
+// Allow the real-dimension benchmark to find the crossover for shorter
+// speculative verify chunks.  GLM-5.2 routes 8 slots/token, so n=64 means
+// nts=512; the original prefill-only cutoff (2048) could never exercise the
+// tensor-core MoE path from a verify chunk.  Keep the measured prefill default
+// until the sparse E=256 benchmark proves a better cutoff.
+static int moe_mma_min_ts() {
+    static const int threshold = [] {
+        const char* v = std::getenv("GLMSERVE_MMA_MOE_MIN_TS");
+        if (!v || !*v) return kMoeSmemMinTs;
+        char* end = nullptr;
+        const long n = std::strtol(v, &end, 10);
+        return end != v && n >= 64 && n <= (1 << 20)
+                   ? static_cast<int>(n) : kMoeSmemMinTs;
+    }();
+    return threshold;
+}
+
+// Register-tiled expert-major fallback. Short verify chunks average only a
+// couple of routed slots/expert, where T=4 cuts register pressure and wins
+// 24.5% at real TP=8 dimensions. Larger batches retain T=8 to avoid rereading
+// weights for experts with long slot lists. GLMSERVE_MOE_TILE=4/8 overrides.
+static int moe_emajor_tile(int nts, int E) {
+    static const int mode = [] {
+        const char* v = std::getenv("GLMSERVE_MOE_TILE");
+        if (!v || !*v) return 0;
+        return std::atoi(v) == 4 ? 4 : 8;
+    }();
+    return mode ? mode : (nts <= 4 * E ? 4 : 8);
+}
+
 // GLMSERVE_SMEM=1 enables the shared-decode (non-tensor-core) tile kernels.
 // Default OFF: the mma path supersedes them for every prefill-hot case, and
 // the stub A/B showed the smem MoE variant REGRESSES vs the register-tile
@@ -1520,7 +1550,7 @@ static void moe_expert_ffn_q_launch(uint32_t gate_type, uint32_t up_type, uint32
         moe_dispatch_scan_kernel<<<1, 32, 0, s>>>(counts, E, offsets);
         moe_dispatch_scatter_kernel<<<db, 256, 0, s>>>(topk_ids, nts, offsets, cursor,
                                                        ts_sorted);
-        if (I8 && nts >= kMoeSmemMinTs && mma_kernels_enabled() &&
+        if (I8 && nts >= moe_mma_min_ts() && mma_kernels_enabled() &&
             mma_type_ok(gate_type) && mma_type_ok(up_type) && mma_type_ok(down_type) &&
             (moe_inter & 255) == 0 && (hidden & 255) == 0 && 2 * moe_inter <= hidden) {
             // Tensor-core path: gate and up land in the (otherwise still
@@ -1563,14 +1593,24 @@ static void moe_expert_ffn_q_launch(uint32_t gate_type, uint32_t up_type, uint32
             return;
         }
         dim3 gu((unsigned)((moe_inter + kWarpsPerBlock - 1) / kWarpsPerBlock), (unsigned)E);
-        moe_gate_up_q_emajor_kernel<8, I8><<<gu, threads, 0, s>>>(
-            x, xq, xs, ts_sorted, offsets, gate_q, up_q, topk, hidden, moe_inter,
-            gate_row_bytes, up_row_bytes, gate_type, up_type, h_act);
+        if (moe_emajor_tile(nts, E) == 4)
+            moe_gate_up_q_emajor_kernel<4, I8><<<gu, threads, 0, s>>>(
+                x, xq, xs, ts_sorted, offsets, gate_q, up_q, topk, hidden, moe_inter,
+                gate_row_bytes, up_row_bytes, gate_type, up_type, h_act);
+        else
+            moe_gate_up_q_emajor_kernel<8, I8><<<gu, threads, 0, s>>>(
+                x, xq, xs, ts_sorted, offsets, gate_q, up_q, topk, hidden, moe_inter,
+                gate_row_bytes, up_row_bytes, gate_type, up_type, h_act);
         quantize_h();
         dim3 dn((unsigned)((hidden + kWarpsPerBlock - 1) / kWarpsPerBlock), (unsigned)E);
-        moe_down_q_emajor_kernel<8, I8><<<dn, threads, 0, s>>>(
-            ts_sorted, offsets, down_q, h_act, hq, hs, hidden, moe_inter,
-            down_row_bytes, down_type, dpart);
+        if (moe_emajor_tile(nts, E) == 4)
+            moe_down_q_emajor_kernel<4, I8><<<dn, threads, 0, s>>>(
+                ts_sorted, offsets, down_q, h_act, hq, hs, hidden, moe_inter,
+                down_row_bytes, down_type, dpart);
+        else
+            moe_down_q_emajor_kernel<8, I8><<<dn, threads, 0, s>>>(
+                ts_sorted, offsets, down_q, h_act, hq, hs, hidden, moe_inter,
+                down_row_bytes, down_type, dpart);
         reduce_down();
         return;
     }

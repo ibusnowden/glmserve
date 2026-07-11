@@ -147,7 +147,7 @@ void mla_absorb_q(const float* q, const __half* kvb_f16, int64_t nq, int64_t n_h
 // nq == 1 launch — a verify chunk merges bit-identically to the decode steps
 // it re-checks (speculative parity). part_acc must hold
 // kMlaParityMaxQ * max_splits * n_heads * kvlat floats.
-constexpr int64_t kMlaParityMaxQ = 8;
+constexpr int64_t kMlaParityMaxQ = 64;
 void mla_attention_decode(const float* qhat, const __half* latent, const int* indices,
                           int64_t index_topk, int64_t win, int64_t qpos0, int64_t nq,
                           int64_t n_heads, int64_t kvlat, int64_t rope, float scale,

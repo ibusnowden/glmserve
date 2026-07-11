@@ -50,9 +50,11 @@ static size_t utf8_trunc(const std::string& s, size_t L) {
 
 static int64_t now_unix() { return static_cast<int64_t>(std::time(nullptr)); }
 
-// Verify-chunk cap for GPU speculative decode (matches model_gpu.cpp's
-// kVerifyMax per-row logits buffer).
-static constexpr int kSpecGroupMax = 8;
+// Verify-chunk cap for GPU speculative decode. Long lookup drafts amortize the
+// 343 GiB model's expert reads and reach the n=64 dense tensor-core GEMM path
+// (routed MoE keeps its sparse expert-major kernel at this width).
+// Keep in sync with model_gpu.cpp's kVerifyMax and kMlaParityMaxQ.
+static constexpr int kSpecGroupMax = 64;
 
 static int env_int(const char* name, int fallback) {
     const char* v = std::getenv(name);
@@ -160,7 +162,23 @@ Engine::Engine(EngineOptions opts) : opts_(std::move(opts)) {
 
     if (is_gguf) {
         // Native GGUF path: mmap the quant payloads and dequantize on the fly.
-        model_->load_gguf(opts_.model_path, opts_.max_layers, false);
+        // On NFS, eight ranks parsing the same split-GGUF tensor directories
+        // concurrently create a metadata thundering herd (all ranks block on
+        // the same folios). Let rank 0 warm the shared page cache, then admit
+        // ranks one at a time; cached followers finish quickly. Set
+        // GLMSERVE_SERIAL_GGUF_LOAD=0 only for a local-filesystem A/B.
+        const char* serial_env = std::getenv("GLMSERVE_SERIAL_GGUF_LOAD");
+        const bool serial_load = dist_.world_size > 1 &&
+                                 !(serial_env && std::atoi(serial_env) == 0);
+        if (serial_load) {
+            for (int rank = 0; rank < dist_.world_size; ++rank) {
+                if (dist_.rank == rank)
+                    model_->load_gguf(opts_.model_path, opts_.max_layers, false);
+                comm_->barrier();
+            }
+        } else {
+            model_->load_gguf(opts_.model_path, opts_.max_layers, false);
+        }
         GLM_CHECK(model_->gguf_ready(), "GGUF load did not leave model in ready state");
     } else {
         SafeTensors st;

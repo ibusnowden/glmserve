@@ -216,7 +216,7 @@ public:
     // all-reduced, so every rank takes identical accept/reject decisions.
     bool mtp_gpu_ready() const;
     // Suffix trunk pass over `tokens` at absolute start_pos. Fills all_logits
-    // with [n, vocab] (n <= kVerifyMax = 8) and leaves the chunk's pre-norm
+    // with [n, vocab] (n <= kVerifyMax = 64) and leaves the chunk's pre-norm
     // hiddens in scratch for mtp_gpu_absorb.
     void forward_gpu_chunk(const std::vector<int>& tokens, int64_t start_pos,
                            std::vector<float>* all_logits);

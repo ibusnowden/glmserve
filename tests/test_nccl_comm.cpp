@@ -142,25 +142,26 @@ int main() {
         std::printf("test_nccl_comm: rank=%d rows-parity (5x6144) exact\n", cfg.rank);
     }
 
-    // Latency probe: decode-sized all-reduce, µs/call (custom vs NCCL is
-    // selected by GLMSERVE_CUSTOM_AR; compare two runs of this test).
+    // Latency probes: decode-sized and a full 64-row verify all-reduce.
     if (cfg.tp_size > 1) {
-        const int64_t n = 6144;
+        const int64_t n = 64 * 6144;
         float* d = nullptr;
         CUDA_TEST_CHECK(cudaMalloc(&d, static_cast<size_t>(n) * sizeof(float)));
         CUDA_TEST_CHECK(cudaMemset(d, 0, static_cast<size_t>(n) * sizeof(float)));
-        for (int i = 0; i < 20; ++i) comm.all_reduce_sum(d, n);  // warmup
-        CUDA_TEST_CHECK(cudaDeviceSynchronize());
-        comm.barrier();
-        const int iters = 500;
-        const auto t0 = std::chrono::steady_clock::now();
-        for (int i = 0; i < iters; ++i) comm.all_reduce_sum(d, n);
-        CUDA_TEST_CHECK(cudaDeviceSynchronize());
-        const auto t1 = std::chrono::steady_clock::now();
-        const double us =
-            std::chrono::duration<double, std::micro>(t1 - t0).count() / iters;
-        std::printf("test_nccl_comm: rank=%d all_reduce(6144 fp32) = %.1f us/call\n",
-                    cfg.rank, us);
+        for (int64_t count : {int64_t{6144}, n}) {
+            for (int i = 0; i < 10; ++i) comm.all_reduce_sum(d, count);
+            CUDA_TEST_CHECK(cudaDeviceSynchronize());
+            comm.barrier();
+            const int iters = count == 6144 ? 200 : 50;
+            const auto t0 = std::chrono::steady_clock::now();
+            for (int i = 0; i < iters; ++i) comm.all_reduce_sum(d, count);
+            CUDA_TEST_CHECK(cudaDeviceSynchronize());
+            const auto t1 = std::chrono::steady_clock::now();
+            const double us =
+                std::chrono::duration<double, std::micro>(t1 - t0).count() / iters;
+            std::printf("test_nccl_comm: rank=%d all_reduce(%lld fp32) = %.1f us/call\n",
+                        cfg.rank, (long long)count, us);
+        }
         cudaFree(d);
     }
 

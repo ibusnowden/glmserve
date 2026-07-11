@@ -27,7 +27,7 @@ namespace cuda {
 namespace {
 
 constexpr int kArMaxWorld = 8;
-constexpr int64_t kArMaxFloats = 8 * 6144;  // widest verify chunk x hidden
+constexpr int64_t kArMaxFloats = 8 * 6144;  // widest short verify chunk x hidden
 constexpr int kArMaxBlocks = 32;
 constexpr int kArThreads = 256;
 

@@ -478,8 +478,15 @@ int cmd_bench(const Args& a) {
                         r.spec_groups, r.spec_ngram_groups,
                         (double)r.spec_accepted / r.spec_groups, draft_k,
                         r.spec_fallback ? " adaptive-fallback" : "");
-        std::printf("target         : 1300 tok/s  (prefill %.0f%%, decode %.0f%%)\n",
-                    100.0 * r.prefill_tps() / 1300.0, 100.0 * r.decode_tps() / 1.0);
+        // Matched serving reference: llama.cpp ngram-mod on the same real
+        // 1024-token repetitive prompt, 128-token continuation, TP=8 RTX
+        // 6000 Ada node. Avoid printing a comparison for unrelated benches.
+        if (draft_k == 64 && prompt_file.find("repetitive_1024.ids") != std::string::npos) {
+            constexpr double kLlamaCppNgramTps = 126.22;
+            const double speedup = r.decode_tps() / kLlamaCppNgramTps;
+            std::printf("llama.cpp ref  : %.2f tok/s  (glmserve %.3fx, %s)\n",
+                        kLlamaCppNgramTps, speedup, speedup > 1.0 ? "PASS" : "FAIL");
+        }
     }
     engine.barrier();
     return 0;

@@ -37,12 +37,12 @@ This repository is a **working V0** plus the GPU acceleration scaffold:
 | CUDA kernels (rmsnorm, rope, gemm, w4a16/fp8 gemm, dense+DSA-window attention, MoE router/dispatch/expert, sampling) | ✅ compile & link sm_89; RTX kernel tests pass |
 | GPU forward wiring (device residency, incremental decode, DSA-window sparse path) | ✅ works on RTX tiny-checkpoint gate |
 | GLM DSA indexer weights | ✅ loader/checker recognize tensors; ✅ CPU/CUDA learned top-k active on full-indexer layers; ✅ shared IndexShare mask reuse |
-| GLM MTP weights | ✅ checker recognizes `model.layers.78.*`; ✅ CPU MTP draft-logits + greedy accept/reject gates; ✅ opt-in CPU greedy generation path; 🚧 GPU/distributed MTP not wired |
+| GLM MTP weights | ✅ CPU and TP=8 CUDA MTP draft/verify paths; ✅ adaptive fallback; ✅ n-gram lookup drafts up to 64 tokens |
 | W4A16 real-weight path | ✅ converter + CPU dequant + GPU resident qweight tiny gate; ✅ shard fetch/probe helper; ✅ 16× RTX TP=8/PP=2 distributed load gate script; 🚧 needs full shard set for real-weight run |
 | NCCL distributed runtime | ✅ world + TP subgroup init/all-reduce, row-parallel linear reconstruction, PP send/recv (host buffers auto-staged) — all smoke tested on 2× RTX |
 | **PP layer-stage execution** (per-stage layer sharding + hidden-state handoff in the forward) | ✅ TP=1/PP=2 forward over the tiny checkpoint is **bit-identical** (`max_diff=0`) to single-process (2× RTX, job 125285) |
 | **TP weight-sharding in the CPU-reference forward** (head-sharded MLA, gate/up column- + down row-parallel MLP/MoE, all-reduce) | ✅ TP=2/PP=1 forward matches single-process to **1.5e-7** (2× RTX, job 125290) |
-| GPU-path TP/PP, multi-process serving driver, MTP | 🚧 roadmap |
+| GPU-path TP/PP, multi-process serving driver, MTP | ✅ TP=8 real-model inference and MTP/speculative bench; 🚧 PP serving driver |
 
 The CPU path lets the entire stack be exercised end-to-end **without a GPU and
 without the 753B weights** (a tiny same-architecture checkpoint stands in). The
@@ -138,14 +138,41 @@ make
 bash scripts/check_glm52_gguf.sh
 ```
 
-This is the required target for a native 3-bit `glmserve` loader. Today it is a
-GGUF load gate: the `glmserve` binary parses the split GGUF shards, validates the
-GLM-5.2 tensor inventory, builds the GGUF-to-glmserve module layout, mmaps the
-payload files, touches every quantized tensor range, loads stable quant tensor
-views into `GLM52Model` via `glmserve load-gguf`, and dequantizes a real block
-from each observed GGML type including `IQ3_XXS`. Generation still
-executes safetensors or glmserve W4A16 repacks while llama.cpp executes the split
-GGUF tensors.
+The native CUDA path now executes this split GGUF directly: it validates and
+mmaps the 319.4-GiB payload, uploads a TP=8 quantized shard to each GPU, and runs
+the full 78-layer model with absorbed MLA, DSA, routed MoE, shared experts, MTP,
+and n-gram speculative verification.
+
+The matched repetitive-prompt benchmark is:
+
+```bash
+source scripts/env.sh
+make GPU=1 -j8
+GLMSERVE_PHASES=R \
+GLMSERVE_PROMPT_FILES=bench/prompts/repetitive_1024.ids \
+GLMSERVE_GEN_LEN=128 GLMSERVE_SKIP_BUILD=1 \
+sbatch scripts/gguf_8x.sbatch
+```
+
+On one 8× RTX 6000 Ada node, the optimized CUDA path reaches **165.6 tok/s**
+(773.05 ms for 128 tokens, two fully accepted 64-token n-gram groups; Slurm job
+145653, weights staged on node-local NVMe via `GLMSERVE_STAGE_LOCAL=1`; an
+earlier NFS-resident run measured 140.8 tok/s, job 145584). The matched
+llama.cpp ngram-mod reference reaches **126.22 tok/s** (1014.07 ms, 100%
+acceptance), so glmserve is **1.31× faster**. On the diverse-prose prompt both
+engines decode at parity (~25 tok/s, MTP draft_k=4 with adaptive fallback). Run
+`scripts/verify64_real.sbatch` to gate the 128-token speculative stream against
+plain greedy decoding on the same full model.
+
+Load time depends on storage residency. Historical warm page-cache uploads take
+about **9.6–9.9 minutes**; a truly cold read on an NFS client capped near
+112 MiB/s takes roughly 50 minutes for 319.4 GiB. glmserve therefore retains
+GGUF cache pages by default (`GLMSERVE_EVICT_LAG=-1`). Use
+`GLMSERVE_EVICT_ALL=1` only for controlled cold-start measurements, or
+`GLMSERVE_STAGE_LOCAL=1` to create and reuse a node-local NVMe copy (shards are
+copied in parallel — on a degraded NFS client whose single-stream reads fall to
+~8 MB/s this still finishes in ~89 min, and every later restart re-uploads from
+local disk in **15–19 s** per phase; job 145653).
 
 ## Layout
 

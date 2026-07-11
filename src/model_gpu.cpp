@@ -85,39 +85,152 @@ inline uint8_t* upload_bytes(const void* host, size_t nbytes) {
     g_upload_bytes += nbytes;
     return p;
 }
-// Reusable host staging buffer for strided-row repacks. cudaMemcpy2D from
-// pageable (mmap'd) memory stages row-by-row (~136 B DMAs — hours for the
-// expert set); repacking on the CPU and issuing ONE contiguous H2D is ~1000x
-// faster. Upload is single-threaded per rank, so a static buffer is fine.
+// Reusable host staging buffer for strided-row repacks. Bulk expert uploads
+// below eliminate the costly register/copy cycle by reducing 768 transfers to
+// three. CUDA-pinned allocation itself takes ~20 s under this cluster's cgroup
+// setup, so it is opt-in (GLMSERVE_PINNED_UPLOAD=1), not the default.
+struct HostStageBuffer {
+    uint8_t* pinned = nullptr;
+    size_t capacity = 0;
+    std::vector<uint8_t> fallback;
+
+    void release() {
+        if (pinned) cudaFreeHost(pinned);
+        pinned = nullptr;
+        capacity = 0;
+        std::vector<uint8_t>().swap(fallback);
+    }
+
+    uint8_t* ensure(size_t bytes) {
+        if (bytes <= capacity) return pinned ? pinned : fallback.data();
+        if (pinned) {
+            cudaFreeHost(pinned);  // preceding H2D copies are synchronous
+            pinned = nullptr;
+        }
+        fallback.clear();
+        const size_t rounded = (bytes + (2u << 20) - 1) & ~((2u << 20) - 1);
+        const char* pin_env = std::getenv("GLMSERVE_PINNED_UPLOAD");
+        const bool use_pinned = pin_env && std::atoi(pin_env) != 0;
+        if (use_pinned) {
+            if (cudaHostAlloc(reinterpret_cast<void**>(&pinned), rounded,
+                              cudaHostAllocDefault) == cudaSuccess) {
+                capacity = rounded;
+                return pinned;
+            }
+            // Pinned allocation can be administratively capped. Preserve a
+            // correct pageable fallback instead of failing startup.
+            cudaGetLastError();
+        }
+        fallback.resize(rounded);
+        capacity = rounded;
+        return fallback.data();
+    }
+};
+
+inline HostStageBuffer& host_stage_buffer() {
+    static HostStageBuffer buffer;
+    return buffer;
+}
+
+inline int upload_pack_threads(size_t work_items);
+
 inline uint8_t* stage_rows(const void* host, size_t rows, size_t row_bytes,
                            size_t src_stride) {
     UsTimer t;
-    static std::vector<uint8_t> staging;
-    if (staging.size() < rows * row_bytes) staging.resize(rows * row_bytes);
+    uint8_t* staging = host_stage_buffer().ensure(rows * row_bytes);
     const uint8_t* src = static_cast<const uint8_t*>(host);
-    for (size_t r = 0; r < rows; ++r)
-        std::memcpy(staging.data() + r * row_bytes, src + r * src_stride, row_bytes);
+    const size_t bytes = rows * row_bytes;
+    const int nt = bytes >= (32u << 20) ? upload_pack_threads(rows) : 1;
+    auto pack = [&](int tid) {
+        const size_t begin = rows * static_cast<size_t>(tid) / nt;
+        const size_t end = rows * static_cast<size_t>(tid + 1) / nt;
+        if (src_stride == row_bytes) {
+            std::memcpy(staging + begin * row_bytes, src + begin * src_stride,
+                        (end - begin) * row_bytes);
+        } else {
+            for (size_t r = begin; r < end; ++r)
+                std::memcpy(staging + r * row_bytes, src + r * src_stride, row_bytes);
+        }
+    };
+    std::vector<std::thread> workers;
+    workers.reserve(static_cast<size_t>(nt - 1));
+    for (int tid = 1; tid < nt; ++tid) workers.emplace_back(pack, tid);
+    pack(0);
+    for (std::thread& worker : workers) worker.join();
     g_stage_us += t.us();
-    return staging.data();
+    return staging;
 }
 // Upload a strided host row view (row-parallel TP shard of a mmap'd GGUF quant
 // payload: `rows` rows of `row_bytes` useful bytes every `src_stride` bytes)
 // into a contiguous device buffer.
 inline uint8_t* upload_bytes_2d(const void* host, size_t rows, size_t row_bytes,
                                 size_t src_stride) {
-    if (src_stride == row_bytes) return upload_bytes(host, rows * row_bytes);
+    // Never let CUDA fault directly through an mmap/NFS source. cudaMemcpy
+    // from such pointers is reported as H2D time but can run at only tens of
+    // MB/s on some nodes. An explicit resident pack restores ~12 GiB/s H2D.
     return upload_bytes(stage_rows(host, rows, row_bytes, src_stride),
                         rows * row_bytes);
 }
-// Copy a (possibly strided) host quant payload into a contiguous device buffer
-// at byte offset `dst_off` (used to pack per-expert tensors [E, out, in]).
-inline void upload_bytes_2d_into(uint8_t* dst, size_t dst_off, const void* host,
-                                 size_t rows, size_t row_bytes, size_t src_stride) {
-    const void* src = host;
-    if (src_stride != row_bytes) src = stage_rows(host, rows, row_bytes, src_stride);
-    if (timed_memcpy_h2d(dst + dst_off, src, rows * row_bytes) != cudaSuccess)
-        throw std::runtime_error("expert upload failed");
-    g_upload_bytes += rows * row_bytes;
+// Pack one projection from all routed experts into its final device layout.
+// The old path did one strided repack and one synchronous pageable H2D copy
+// per expert: 3 * 256 = 768 transfers per MoE layer. This path distributes
+// the CPU repack over the cores assigned to each rank, then issues one bulk
+// transfer for the entire projection (three transfers per layer total).
+inline int upload_pack_threads(size_t experts) {
+    static const int configured = [] {
+        const char* v = std::getenv("GLMSERVE_UPLOAD_THREADS");
+        if (!v || !*v) v = std::getenv("SLURM_CPUS_PER_TASK");
+        const int n = v && *v ? std::atoi(v) : 4;
+        return std::max(1, std::min(16, n));
+    }();
+    return std::min<int>(configured, static_cast<int>(experts));
+}
+
+inline void upload_expert_matrix(uint8_t* dst, const std::vector<Expert>& experts,
+                                 Linear Expert::*member) {
+    GLM_CHECK(dst != nullptr && !experts.empty(), "invalid expert bulk upload");
+    const Linear& first = experts.front().*member;
+    const size_t rows = static_cast<size_t>(first.out_features);
+    const size_t row_bytes = static_cast<size_t>(first.row_bytes);
+    const size_t expert_bytes = rows * row_bytes;
+    const size_t total_bytes = experts.size() * expert_bytes;
+    uint8_t* stage = host_stage_buffer().ensure(total_bytes);
+
+    for (const Expert& expert : experts) {
+        const Linear& l = expert.*member;
+        GLM_CHECK(l.has_q() && l.out_features == first.out_features &&
+                  l.row_bytes == first.row_bytes,
+                  "inconsistent GGUF routed-expert projection");
+    }
+
+    UsTimer pack_timer;
+    const int nt = upload_pack_threads(experts.size());
+    auto pack = [&](int tid) {
+        const size_t begin = experts.size() * static_cast<size_t>(tid) / nt;
+        const size_t end = experts.size() * static_cast<size_t>(tid + 1) / nt;
+        for (size_t ei = begin; ei < end; ++ei) {
+            const Linear& l = experts[ei].*member;
+            const uint8_t* src = l.qbuf.empty() ? l.qdata : l.qbuf.data();
+            const size_t stride = static_cast<size_t>(l.qsrc_stride());
+            uint8_t* out = stage + ei * expert_bytes;
+            if (stride == row_bytes) {
+                std::memcpy(out, src, expert_bytes);
+            } else {
+                for (size_t r = 0; r < rows; ++r)
+                    std::memcpy(out + r * row_bytes, src + r * stride, row_bytes);
+            }
+        }
+    };
+    std::vector<std::thread> workers;
+    workers.reserve(static_cast<size_t>(nt - 1));
+    for (int tid = 1; tid < nt; ++tid) workers.emplace_back(pack, tid);
+    pack(0);
+    for (std::thread& worker : workers) worker.join();
+    g_stage_us += pack_timer.us();
+
+    if (timed_memcpy_h2d(dst, stage, total_bytes) != cudaSuccess)
+        throw std::runtime_error("bulk expert upload failed");
+    g_upload_bytes += total_bytes;
 }
 // --- Upload-source prefetch -------------------------------------------------
 // The upload's host-side reads (stage_rows + pageable cudaMemcpy) source from
@@ -335,15 +448,17 @@ inline void gemm_linear(const float* x, const DLinear& d, const float* bias,
         glmserve::cuda::gemm_fp32(x, d.w, bias, y, n, d.in, d.out, s);
     }
 }
-// Row-wise TP all-reduce in verify/absorb chunks (GLMSERVE_AR_ROWWISE=0
-// restores the wide [n, hidden] reduce, which drifts from plain decode —
-// A/B lever for the spec==greedy gate).
-inline bool ar_rowwise_enabled() {
-    static const bool on = [] {
+// Per-row reduction preserves bitwise identity with serial decode, but at the
+// maximum 64-token lookup width its 64 NCCL handshakes dominate the verified
+// token cost.  Use one wide reduction for that operating point (0.21 ms vs
+// 64*0.039 ms on TP=8) and retain exact row-wise sums for short MTP chunks.
+// GLMSERVE_AR_ROWWISE=0/1 forces either policy for correctness/perf A/Bs.
+inline bool ar_rowwise_enabled(int64_t n) {
+    static const int mode = [] {
         const char* e = std::getenv("GLMSERVE_AR_ROWWISE");
-        return !(e && std::atoi(e) == 0);
+        return e && *e ? (std::atoi(e) == 0 ? 0 : 1) : -1;
     }();
-    return on;
+    return mode >= 0 ? mode != 0 : n < 64;
 }
 // int8 MMQ activation path (GLMSERVE_MMQ=0 restores fp32 activations).
 inline bool mmq_enabled() {
@@ -411,8 +526,12 @@ struct DLayer {
 // Widest suffix chunk the absorbed-MQA path accepts (MTP verify chunks are a
 // handful of tokens; MTP catch-up absorbs longer histories in these chunks).
 static constexpr int64_t kAbsorbMax = 64;
-// Widest verify chunk (bounds the per-row logits buffer: kVerifyMax * vocab).
-static constexpr int64_t kVerifyMax = 8;
+// Widest verify chunk. This matches the absorbed-attention parity budget so a
+// long n-gram draft retains the same per-query reduction geometry as serial
+// decode while reusing expert weights among tokens routed to the same expert.
+static constexpr int64_t kVerifyMax = 64;
+static_assert(kVerifyMax == glmserve::cuda::kMlaParityMaxQ,
+              "verify width must match the absorbed-MLA parity budget");
 
 // Per-forward activation buffers, allocated once and grown on demand. Decode
 // (n=1) reuses the same arena every token, so there is no per-token cudaMalloc.
@@ -560,11 +679,10 @@ struct GpuState {
     int64_t lm_head_off = 0;         // first vocab row of this rank's TP shard
     std::vector<DLayer> layers;
     GpuMTP mtp;
-    // Verify/absorb chunks set this so TP all-reduces run row-by-row: a ring
-    // all-reduce's per-element summation order depends on the total message
-    // size, so reducing [n, hidden] in one call drifts (last-bit) from the n
-    // single-row reduces plain decode issues — enough to flip a near-tie
-    // argmax and break the spec==greedy gate. Prefill keeps the wide reduce.
+    // Short verify chunks set this so TP all-reduces run row-by-row: a ring
+    // all-reduce's per-element summation order depends on message size. The
+    // 64-token lookup fast path deliberately uses one wide reduction to avoid
+    // 64 collective handshakes; its real-weight argmax parity is gated.
     bool ar_rowwise = false;
     int64_t local_heads = 0;
     int64_t max_dense_inter = 0;
@@ -631,17 +749,23 @@ bool GLM52Model::upload_to_gpu(int64_t max_ctx) {
     g->local_heads = tp_heads_;
     GLM_CHECK(g->local_heads > 0, "GPU upload requires at least one local attention head");
 
-    // Consumed-source eviction (see evict_ranges above).
-    // GLMSERVE_EVICT_LAG = layers behind the upload (default 8, negative disables).
-    int evict_lag = 8;
+    // Consumed-source eviction (see evict_ranges above). Retaining the shared
+    // page cache is the safe serving default: on slow NFS nodes, dropping each
+    // completed layer turns a warm restart into a multi-hour fault stream.
+    // GLMSERVE_EVICT_LAG >= 0 enables a bounded sliding window; -1 disables
+    // per-layer eviction. GLMSERVE_EVICT_ALL=1 requests only an initial cold
+    // drop while retaining pages loaded by the current upload.
+    int evict_lag = -1;
     if (const char* e = std::getenv("GLMSERVE_EVICT_LAG")) evict_lag = std::atoi(e);
+    const char* cold_env = std::getenv("GLMSERVE_EVICT_ALL");
+    const bool evict_initial = evict_lag >= 0 || (cold_env && std::atoi(cold_env) != 0);
     const GGUFModel* evict_gg =
-        (evict_lag >= 0 && gguf_weights_) ? &gguf_weights_->gguf() : nullptr;
+        (evict_initial && gguf_weights_) ? &gguf_weights_->gguf() : nullptr;
     // Deterministic cold start: drop any stale GGUF page cache (ours or a dead
     // job's) so the sequential upload faults into free RAM instead of paying
     // direct-reclaim latency per page (job 143981 crawled at 1 MB/s from layer
     // 1 on a node whose cache was saturated by a killed predecessor).
-    if (evict_gg) evict_gg->evict_all();
+    if (evict_initial && evict_gg) evict_gg->evict_all();
 
     if (dist_.is_first_stage()) {
         if (embed_lin_.has_q() &&
@@ -722,6 +846,12 @@ bool GLM52Model::upload_to_gpu(int64_t max_ctx) {
     // GLMSERVE_UPLOAD_PREFETCH = layers ahead (default 4, 0 disables).
     int pf_ahead = 4;
     if (const char* e = std::getenv("GLMSERVE_UPLOAD_PREFETCH")) pf_ahead = std::atoi(e);
+    if (dist_.rank == 0) {
+        const char* pin = std::getenv("GLMSERVE_PINNED_UPLOAD");
+        GLM_INFO("gpu upload policy: expert bulk-pack, threads=%d pinned=%s prefetch=%d evict_lag=%d",
+                 upload_pack_threads(256), pin && std::atoi(pin) != 0 ? "on" : "off",
+                 pf_ahead, evict_lag);
+    }
     if (evict_gg && dist_.is_last_stage()) {
         // lm_head was uploaded above and is never read from the mmap again.
         std::vector<PfRange> rs;
@@ -801,8 +931,8 @@ bool GLM52Model::upload_to_gpu(int64_t max_ctx) {
                 d.qexp_down_rb = L.moe.experts[0].down_proj.row_bytes;
                 d.qexp_out_l = d.expert_inter;
                 d.qexp_in_l  = d.expert_inter;
-                // Allocate packed device buffers up front; each expert is
-                // 2D-copied straight from the mmap'd payload (no host merge).
+                // Allocate final packed device buffers up front. The host
+                // views are parallel-packed and bulk-copied below.
                 if (timed_malloc(reinterpret_cast<void**>(&d.qexp_gate_q), static_cast<size_t>(E * d.expert_inter * d.qexp_gate_rb)) != cudaSuccess ||
                     timed_malloc(reinterpret_cast<void**>(&d.qexp_up_q), static_cast<size_t>(E * d.expert_inter * d.qexp_up_rb)) != cudaSuccess ||
                     timed_malloc(reinterpret_cast<void**>(&d.qexp_down_q), static_cast<size_t>(E * hidden * d.qexp_down_rb)) != cudaSuccess)
@@ -824,7 +954,6 @@ bool GLM52Model::upload_to_gpu(int64_t max_ctx) {
                 pu.reserve(E * d.expert_inter * hidden);
                 pd.reserve(E * hidden * d.expert_inter);
             }
-            int64_t ei = 0;
             for (const Expert& e : L.moe.experts) {
                 GLM_CHECK(e.gate_proj.out_features == d.expert_inter &&
                           e.up_proj.out_features == d.expert_inter &&
@@ -833,21 +962,6 @@ bool GLM52Model::upload_to_gpu(int64_t max_ctx) {
                 if (d.quant_experts_gguf) {
                     GLM_CHECK(e.gate_proj.has_q() && e.up_proj.has_q() && e.down_proj.has_q(),
                               "GGUF-quant expert missing quant weight");
-                    const uint8_t* gp = e.gate_proj.qbuf.empty() ? e.gate_proj.qdata : e.gate_proj.qbuf.data();
-                    const uint8_t* up = e.up_proj.qbuf.empty() ? e.up_proj.qdata : e.up_proj.qbuf.data();
-                    const uint8_t* dp = e.down_proj.qbuf.empty() ? e.down_proj.qdata : e.down_proj.qbuf.data();
-                    upload_bytes_2d_into(d.qexp_gate_q,
-                        static_cast<size_t>(ei * d.expert_inter * d.qexp_gate_rb), gp,
-                        static_cast<size_t>(d.expert_inter), static_cast<size_t>(d.qexp_gate_rb),
-                        static_cast<size_t>(e.gate_proj.qsrc_stride()));
-                    upload_bytes_2d_into(d.qexp_up_q,
-                        static_cast<size_t>(ei * d.expert_inter * d.qexp_up_rb), up,
-                        static_cast<size_t>(d.expert_inter), static_cast<size_t>(d.qexp_up_rb),
-                        static_cast<size_t>(e.up_proj.qsrc_stride()));
-                    upload_bytes_2d_into(d.qexp_down_q,
-                        static_cast<size_t>(ei * hidden * d.qexp_down_rb), dp,
-                        static_cast<size_t>(hidden), static_cast<size_t>(d.qexp_down_rb),
-                        static_cast<size_t>(e.down_proj.qsrc_stride()));
                 } else if (d.quantized_experts) {
                     GLM_CHECK(e.gate_proj.quantized_int4 && e.up_proj.quantized_int4 &&
                               e.down_proj.quantized_int4 &&
@@ -868,10 +982,11 @@ bool GLM52Model::upload_to_gpu(int64_t max_ctx) {
                     pu.insert(pu.end(), e.up_proj.w.begin(), e.up_proj.w.end());
                     pd.insert(pd.end(), e.down_proj.w.begin(), e.down_proj.w.end());
                 }
-                ++ei;
             }
             if (d.quant_experts_gguf) {
-                // experts already packed on device via upload_bytes_2d_into
+                upload_expert_matrix(d.qexp_gate_q, L.moe.experts, &Expert::gate_proj);
+                upload_expert_matrix(d.qexp_up_q,   L.moe.experts, &Expert::up_proj);
+                upload_expert_matrix(d.qexp_down_q, L.moe.experts, &Expert::down_proj);
             } else if (d.quantized_experts) {
                 d.qexp_gate = upload_u8(qg); d.qexp_up = upload_u8(qu); d.qexp_down = upload_u8(qd);
                 d.sexp_gate = upload(sg); d.sexp_up = upload(su); d.sexp_down = upload(sd);
@@ -1029,25 +1144,9 @@ bool GLM52Model::upload_to_gpu(int64_t max_ctx) {
                     cudaMalloc(&d.qexp_up_q, static_cast<size_t>(E * d.expert_inter * d.qexp_up_rb)) != cudaSuccess ||
                     cudaMalloc(&d.qexp_down_q, static_cast<size_t>(E * hidden * d.qexp_down_rb)) != cudaSuccess)
                     throw std::runtime_error("cudaMalloc for MTP GGUF expert buffers failed");
-                int64_t ei = 0;
-                for (const Expert& e : L.moe.experts) {
-                    const uint8_t* gp = e.gate_proj.qbuf.empty() ? e.gate_proj.qdata : e.gate_proj.qbuf.data();
-                    const uint8_t* up = e.up_proj.qbuf.empty() ? e.up_proj.qdata : e.up_proj.qbuf.data();
-                    const uint8_t* dp = e.down_proj.qbuf.empty() ? e.down_proj.qdata : e.down_proj.qbuf.data();
-                    upload_bytes_2d_into(d.qexp_gate_q,
-                        static_cast<size_t>(ei * d.expert_inter * d.qexp_gate_rb), gp,
-                        static_cast<size_t>(d.expert_inter), static_cast<size_t>(d.qexp_gate_rb),
-                        static_cast<size_t>(e.gate_proj.qsrc_stride()));
-                    upload_bytes_2d_into(d.qexp_up_q,
-                        static_cast<size_t>(ei * d.expert_inter * d.qexp_up_rb), up,
-                        static_cast<size_t>(d.expert_inter), static_cast<size_t>(d.qexp_up_rb),
-                        static_cast<size_t>(e.up_proj.qsrc_stride()));
-                    upload_bytes_2d_into(d.qexp_down_q,
-                        static_cast<size_t>(ei * hidden * d.qexp_down_rb), dp,
-                        static_cast<size_t>(hidden), static_cast<size_t>(d.qexp_down_rb),
-                        static_cast<size_t>(e.down_proj.qsrc_stride()));
-                    ++ei;
-                }
+                upload_expert_matrix(d.qexp_gate_q, L.moe.experts, &Expert::gate_proj);
+                upload_expert_matrix(d.qexp_up_q,   L.moe.experts, &Expert::up_proj);
+                upload_expert_matrix(d.qexp_down_q, L.moe.experts, &Expert::down_proj);
             } else {
                 std::vector<float> pg, pu, pd;
                 pg.reserve(E * d.expert_inter * hidden);
@@ -1112,6 +1211,9 @@ bool GLM52Model::upload_to_gpu(int64_t max_ctx) {
         gm.ready = true;
     }
 
+    // No host repack is needed after weight residency. Return the temporary
+    // (hundreds of MiB per rank) staging arena before serving requests.
+    host_stage_buffer().release();
     gpu_state_ = g;
     size_t freeb = 0, total = 0; cudaMemGetInfo(&freeb, &total);
     GLM_INFO("uploaded weights to GPU in %.1f s; KV cache ctx=%lld (%.2f GiB free / %.2f GiB total)",
@@ -1812,7 +1914,7 @@ void GLM52Model::forward_gpu_chunk(const std::vector<int>& tokens, int64_t start
     g_prof.mark("fwd.start");
     gather_embeds(g, cfg_, embed_lin_, tokens.data(), n, g->sc.hidden_d);
     g_prof.mark("embed");
-    g->ar_rowwise = ar_rowwise_enabled();
+    g->ar_rowwise = ar_rowwise_enabled(n);
     run_block_stack(g, cfg_, comm_, dist_, n, start_pos, false);
     g->ar_rowwise = false;
     g->cur_len = start_pos + n;
@@ -1846,7 +1948,7 @@ void GLM52Model::forward_gpu_chunk_greedy(const std::vector<int>& tokens, int64_
     g_prof.mark("fwd.start");
     gather_embeds(g, cfg_, embed_lin_, tokens.data(), n, g->sc.hidden_d);
     g_prof.mark("embed");
-    g->ar_rowwise = ar_rowwise_enabled();
+    g->ar_rowwise = ar_rowwise_enabled(n);
     run_block_stack(g, cfg_, comm_, dist_, n, start_pos, false);
     g->ar_rowwise = false;
     g->cur_len = start_pos + n;
