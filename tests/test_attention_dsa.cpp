@@ -277,6 +277,74 @@ int main() {
         idx_gemm_match = idx_gemm_match && idx_cublas_match;
     }
 
+    // cub::DeviceRadixSort top-k path (decode, nc==1): the multi-block sort
+    // must select the same top-k as the single-block radix path. n_query=1,
+    // start_pos=n-1 so count=n > topk (the cub path only activates when
+    // count > index_topk; at count <= topk both paths select all keys).
+    {
+        glmserve::cuda::DsaCubScratch cub;
+        cub.temp_bytes = glmserve::cuda::dsa_cub_temp_bytes(n);
+        CUDA_TEST_CHECK(cudaMalloc(&cub.temp, cub.temp_bytes));
+        CUDA_TEST_CHECK(cudaMalloc(reinterpret_cast<void**>(&cub.keys_in), n * sizeof(uint64_t)));
+        CUDA_TEST_CHECK(cudaMalloc(reinterpret_cast<void**>(&cub.idx_in), n * sizeof(int)));
+        CUDA_TEST_CHECK(cudaMalloc(reinterpret_cast<void**>(&cub.keys_out), n * sizeof(uint64_t)));
+        CUDA_TEST_CHECK(cudaMalloc(reinterpret_cast<void**>(&cub.idx_out), n * sizeof(int)));
+        // cub path: score query 0 over keys [0, n), select top topk.
+        CUDA_TEST_CHECK(cudaMemset(didx, 0, ref_idx.size() * sizeof(int)));
+        dsa_select_topk(diq, dik, diw, /*n_query=*/1, /*start_pos=*/n - 1,
+                        iH, iD, topk, iscale, 1.0f, dscratch, didx, dscore,
+                        ddbuf, dkf32, &cub);
+        CUDA_TEST_CHECK(cudaGetLastError());
+        CUDA_TEST_CHECK(cudaDeviceSynchronize());
+        std::vector<int> got_idx_cub(ref_idx.size());
+        CUDA_TEST_CHECK(cudaMemcpy(got_idx_cub.data(), didx, got_idx_cub.size() * sizeof(int),
+                                   cudaMemcpyDeviceToHost));
+        // radix path (cub_scratch=null): same scores, same select.
+        CUDA_TEST_CHECK(cudaMemset(didx, 0, ref_idx.size() * sizeof(int)));
+        dsa_select_topk(diq, dik, diw, /*n_query=*/1, /*start_pos=*/n - 1,
+                        iH, iD, topk, iscale, 1.0f, dscratch, didx, dscore,
+                        ddbuf, dkf32, nullptr);
+        CUDA_TEST_CHECK(cudaGetLastError());
+        CUDA_TEST_CHECK(cudaDeviceSynchronize());
+        std::vector<int> got_idx_radix(ref_idx.size());
+        CUDA_TEST_CHECK(cudaMemcpy(got_idx_radix.data(), didx, got_idx_radix.size() * sizeof(int),
+                                   cudaMemcpyDeviceToHost));
+        // The CPU reference for query 0 with start_pos=n-1 selects top topk
+        // from keys [0, n) — the same as the t=0 row but with count=n (all
+        // keys). Build it here for a direct cub-vs-CPU check.
+        std::vector<int> ref_idx_cub(ref_idx.size());
+        {
+            int count = std::min(topk, n);
+            std::vector<float> sc(n);
+            for (int j = 0; j < n; ++j) {
+                float total = 0.0f;
+                for (int ih = 0; ih < iH; ++ih) {
+                    float dot = 0.0f;
+                    for (int d = 0; d < iD; ++d)
+                        dot += iq[(0 * iH + ih) * iD + d] * ik[j * iD + d];
+                    total += iw[0 * iH + ih] * std::max(0.0f, dot * iscale);
+                }
+                sc[j] = total;
+            }
+            std::vector<int> ids(n);
+            for (int j = 0; j < n; ++j) ids[j] = j;
+            std::partial_sort(ids.begin(), ids.begin() + count, ids.end(),
+                              [&](int a, int b) { return sc[a] > sc[b]; });
+            ids.resize(count);
+            std::sort(ids.begin(), ids.end());
+            for (int k = 0; k < count; ++k) ref_idx_cub[k] = ids[k];
+            for (int k = count; k < (int)ref_idx.size(); ++k) ref_idx_cub[k] = 0;
+        }
+        const bool idx_cub_match = got_idx_cub == got_idx_radix;
+        const bool idx_cub_vs_cpu = got_idx_cub == ref_idx_cub;
+        std::printf("  dsa_select_topk cub path [n=%d topk=%d]: cub-vs-radix %s  cub-vs-cpu %s\n",
+                    n, topk, idx_cub_match ? "MATCH" : "MISMATCH",
+                    idx_cub_vs_cpu ? "MATCH" : "MISMATCH");
+        cudaFree(cub.temp); cudaFree(cub.keys_in); cudaFree(cub.idx_in);
+        cudaFree(cub.keys_out); cudaFree(cub.idx_out);
+        idx_gemm_match = idx_gemm_match && idx_cub_match && idx_cub_vs_cpu;
+    }
+
     cudaFree(diq); cudaFree(dikf); cudaFree(dik); cudaFree(diw); cudaFree(didx);
     cudaFree(dscore); cudaFree(dscratch); cudaFree(dout_idx);
 

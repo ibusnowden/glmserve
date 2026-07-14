@@ -701,6 +701,9 @@ struct GpuState {
     float* dsa_scorebuf = nullptr;   // [kDsaScoreChunk, max_ctx] selector scratch
     float* dsa_dbuf = nullptr;       // [kDsaScoreChunk * index_heads, kDsaKeyTile] GEMM dots
     float* dsa_kf32 = nullptr;       // [kDsaKeyTile, index_dim] fp32 key tile
+    // cub::DeviceRadixSort scratch for the decode top-k path (multi-block
+    // GPU-wide sort replaces the single-SM radix select at nc==1).
+    glmserve::cuda::DsaCubScratch dsa_cub;
     // Absorbed-MLA latent cache (GLMSERVE_LATENT_KV, default on): one fp16 row
     // [kvlat + rope] per token per layer, shared by all local heads — replaces
     // Kc/Vc for the trunk. Prefill materializes its own per-head K/V into
@@ -1063,6 +1066,21 @@ bool GLM52Model::upload_to_gpu(int64_t max_ctx) {
         g->dsa_dbuf = dmalloc(glmserve::cuda::kDsaScoreChunk * c.index_n_heads *
                               glmserve::cuda::kDsaKeyTile);
         g->dsa_kf32 = dmalloc(glmserve::cuda::kDsaKeyTile * c.index_head_dim);
+        // cub::DeviceRadixSort scratch for the decode top-k path: multi-block
+        // GPU-wide sort replaces the single-SM 8-pass radix select (24% of
+        // decode at 8K). Sized for max_ctx keys; the sort is per-query at
+        // decode (nc==1, count = start_pos+1 <= max_ctx).
+        g->dsa_cub.temp_bytes = glmserve::cuda::dsa_cub_temp_bytes(g->max_ctx);
+        if (timed_malloc(&g->dsa_cub.temp, g->dsa_cub.temp_bytes) != cudaSuccess)
+            throw std::runtime_error("cudaMalloc for DSA cub sort temp failed");
+        if (timed_malloc(reinterpret_cast<void**>(&g->dsa_cub.keys_in), g->max_ctx * sizeof(uint64_t)) != cudaSuccess)
+            throw std::runtime_error("cudaMalloc for DSA cub keys_in failed");
+        if (timed_malloc(reinterpret_cast<void**>(&g->dsa_cub.idx_in), g->max_ctx * sizeof(int)) != cudaSuccess)
+            throw std::runtime_error("cudaMalloc for DSA cub idx_in failed");
+        if (timed_malloc(reinterpret_cast<void**>(&g->dsa_cub.keys_out), g->max_ctx * sizeof(uint64_t)) != cudaSuccess)
+            throw std::runtime_error("cudaMalloc for DSA cub keys_out failed");
+        if (timed_malloc(reinterpret_cast<void**>(&g->dsa_cub.idx_out), g->max_ctx * sizeof(int)) != cudaSuccess)
+            throw std::runtime_error("cudaMalloc for DSA cub idx_out failed");
     }
     if (g->latent) {
         // fp16 kv_b residency for the absorbed q/o projections.
@@ -1360,7 +1378,7 @@ bool run_layer_step(GpuState* g, const GLM52Config& c, Communicator* comm,
                         1.0f / std::sqrt(static_cast<float>(c.index_head_dim)),
                         1.0f / std::sqrt(static_cast<float>(c.index_n_heads)),
                         g->dsa_scorebuf, s.dsa_indices, s.dsa_scores,
-                        g->dsa_dbuf, g->dsa_kf32);
+                        g->dsa_dbuf, g->dsa_kf32, &g->dsa_cub);
         have_shared_dsa_indices = true;
         g_prof.mark("dsa.index");
         if (absorbed)
@@ -2234,6 +2252,11 @@ GLM52Model::~GLM52Model() {
     if (g->dsa_scorebuf) cudaFree(g->dsa_scorebuf);
     if (g->dsa_dbuf) cudaFree(g->dsa_dbuf);
     if (g->dsa_kf32) cudaFree(g->dsa_kf32);
+    if (g->dsa_cub.temp) cudaFree(g->dsa_cub.temp);
+    if (g->dsa_cub.keys_in) cudaFree(g->dsa_cub.keys_in);
+    if (g->dsa_cub.idx_in) cudaFree(g->dsa_cub.idx_in);
+    if (g->dsa_cub.keys_out) cudaFree(g->dsa_cub.keys_out);
+    if (g->dsa_cub.idx_out) cudaFree(g->dsa_cub.idx_out);
     if (g->block_table) cudaFree(g->block_table);
     if (g->logits_d) cudaFree(g->logits_d);
     if (g->vshard) cudaFree(g->vshard);

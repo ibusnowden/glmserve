@@ -207,13 +207,29 @@ constexpr int64_t kDsaScoreChunk = 64;
 // gemm_kf32 [kDsaKeyTile, index_dim], then a ReLU-weighted head-sum epilogue.
 // Null gemm buffers (or GLMSERVE_DSA_GEMM=0) fall back to the scalar kernel.
 constexpr int64_t kDsaKeyTile = 4096;
+// cub::DeviceRadixSort scratch for the decode top-k path (nc == 1): multi-block
+// GPU-wide sort replaces the single-SM radix select. Allocated once at
+// upload_to_gpu and sized for max_ctx. Null (or GLMSERVE_DSA_CUB=0) falls back
+// to the single-block radix select.
+struct DsaCubScratch {
+    void* temp = nullptr;
+    size_t temp_bytes = 0;
+    uint64_t* keys_in = nullptr;
+    int* idx_in = nullptr;
+    uint64_t* keys_out = nullptr;
+    int* idx_out = nullptr;
+};
+// Query the cub temp-storage bytes needed for sorting `max_ctx` uint64 keys.
+// Call once at allocation; the result is stable for any count <= max_ctx.
+// Defined in attention_dsa.cu (uses cub::DeviceRadixSort, CUDA-only).
+size_t dsa_cub_temp_bytes(int64_t max_ctx);
 void dsa_select_topk(const float* index_q, const __half* index_k_cache,
                      const float* index_w, int64_t n_query, int64_t start_pos,
                      int64_t index_heads, int64_t index_dim, int64_t index_topk,
                      float score_scale, float weight_scale, float* score_scratch,
                      int* topk_indices, float* topk_scores,
                      float* gemm_dbuf = nullptr, float* gemm_kf32 = nullptr,
-                     cudaStream_t s = 0);
+                     DsaCubScratch* cub_scratch = nullptr, cudaStream_t s = 0);
 void attention_dsa_indexed_paged(const float* q, const float* k_cache, const float* v_cache,
                                  const int* block_table, const int* topk_indices,
                                  int64_t n_query, int64_t start_pos, int64_t n_heads,

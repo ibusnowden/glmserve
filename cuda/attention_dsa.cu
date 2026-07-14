@@ -40,6 +40,7 @@
 #include "common.cuh"
 #include "kernels.cuh"
 
+#include <cub/device/device_radix_sort.cuh>
 #include <algorithm>
 #include <cstdlib>
 
@@ -183,6 +184,16 @@ static bool dsa_gemm_enabled() {
     return on;
 }
 
+// cub::DeviceRadixSort temp-storage sizing for the decode top-k path.
+size_t dsa_cub_temp_bytes(int64_t max_ctx) {
+    size_t bytes = 0;
+    cub::DeviceRadixSort::SortPairs(nullptr, bytes,
+                                    (const uint64_t*)nullptr, (uint64_t*)nullptr,
+                                    (const int*)nullptr, (int*)nullptr,
+                                    (int)max_ctx, 0, 64, 0);
+    return bytes;
+}
+
 // Unique ordering key: flipped score bits (ascending uint == ascending float)
 // over ~index — descending key == (score desc, index asc), no duplicates.
 __device__ __forceinline__ uint64_t dsa_key(float s, uint32_t j) {
@@ -278,12 +289,80 @@ __global__ void dsa_radix_select_kernel(const float* __restrict__ scores, int64_
     }
 }
 
+// ---- cub::DeviceRadixSort top-k path (decode, nc == 1) -------------------
+// At decode the radix select launches a single block (nc == 1): 8 sequential
+// byte-level passes over the whole ctx on one SM, which is the dominant
+// decode cost (24% at 8K, 27% at 16K). cub::DeviceRadixSort is a multi-block
+// GPU-wide radix sort — for count up to 16K it finishes in a few us vs the
+// single-block select's ~100 us. The 64-bit ordering key (score asc, ~index)
+// makes the ascending sort's last index_topk entries exactly the top-k by
+// (score desc, index asc); a final single-block bitonic pass re-sorts those
+// index_topk by index ascending (deterministic attention accumulation order,
+// matching the radix path). GLMSERVE_DSA_CUB=0 restores the single-block path.
+__global__ void dsa_build_keys_kernel(const float* __restrict__ scores, int64_t count,
+                                      int64_t tq, int64_t row_stride,
+                                      uint64_t* __restrict__ keys, int* __restrict__ indices) {
+    int64_t j = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= count) return;
+    keys[j] = dsa_key(scores[tq * row_stride + j], (uint32_t)j);
+    indices[j] = (int)j;
+}
+
+// Extract the top index_topk from the cub-sorted indices (ascending key =
+// ascending score; the tail is score desc, index asc) and bitonic-sort them
+// by index ascending to match the radix path's output order.
+__global__ void dsa_extract_topk_cub_kernel(const int* __restrict__ sorted_idx,
+                                            int64_t count, int64_t tq, int64_t index_topk,
+                                            int64_t row_stride,
+                                            const float* __restrict__ scores,
+                                            int* __restrict__ topk_indices,
+                                            float* __restrict__ topk_scores) {
+    extern __shared__ int sel[];   // [next_pow2(index_topk)]
+    const int tid = threadIdx.x;
+    const float* sc = scores + tq * row_stride;
+    int* ids = topk_indices + tq * index_topk;
+    float* out_s = topk_scores + tq * index_topk;
+    // The last index_topk of the ascending sort are the top-k.
+    for (int i = tid; i < (int)index_topk; i += blockDim.x)
+        sel[i] = sorted_idx[count - index_topk + i];
+    int P = 1;
+    while (P < (int)index_topk) P <<= 1;
+    for (int i = (int)index_topk + tid; i < P; i += blockDim.x) sel[i] = 0x7FFFFFFF;
+    __syncthreads();
+    for (int size = 2; size <= P; size <<= 1) {
+        for (int stride = size >> 1; stride > 0; stride >>= 1) {
+            for (int i = tid; i < P; i += blockDim.x) {
+                const int ixj = i ^ stride;
+                if (ixj > i) {
+                    const bool up = (i & size) == 0;
+                    const int a = sel[i], b = sel[ixj];
+                    if ((a > b) == up) { sel[i] = b; sel[ixj] = a; }
+                }
+            }
+            __syncthreads();
+        }
+    }
+    for (int i = tid; i < (int)index_topk; i += blockDim.x) {
+        ids[i] = sel[i];
+        out_s[i] = sc[sel[i]];
+    }
+}
+
+static bool dsa_cub_enabled() {
+    static const bool on = [] {
+        const char* e = getenv("GLMSERVE_DSA_CUB");
+        return !e || atoi(e) != 0;
+    }();
+    return on;
+}
+
 void dsa_select_topk(const float* index_q, const __half* index_k_cache,
                      const float* index_w, int64_t n_query, int64_t start_pos,
                      int64_t index_heads, int64_t index_dim, int64_t index_topk,
                      float score_scale, float weight_scale, float* score_scratch,
                      int* topk_indices, float* topk_scores,
-                     float* gemm_dbuf, float* gemm_kf32, cudaStream_t s) {
+                     float* gemm_dbuf, float* gemm_kf32,
+                     DsaCubScratch* cub_scratch, cudaStream_t s) {
     int64_t P = 1;
     while (P < index_topk) P <<= 1;
     const size_t shmem = (size_t)P * sizeof(int);
@@ -310,12 +389,35 @@ void dsa_select_topk(const float* index_q, const __half* index_k_cache,
                                                 index_heads, index_dim, score_scale, weight_scale,
                                                 n_keys, score_scratch);
         }
-        // 1024 threads: at decode (nc == 1) this kernel is a single block and
-        // was the dominant selector cost (8 radix passes over the whole ctx on
-        // one SM). Histogram adds are order-free and the compaction scatter is
-        // re-sorted by the bitonic pass, so the output is width-invariant.
-        dsa_radix_select_kernel<<<(unsigned)nc, 1024, shmem, s>>>(
-            score_scratch, n_keys, t0, start_pos, index_topk, topk_indices, topk_scores);
+        // At decode (nc == 1) the single-block radix select is the dominant
+        // selector cost (8 passes over the whole ctx on one SM). cub's
+        // multi-block radix sort is GPU-wide and finishes in a fraction of the
+        // time for count up to 16K; the final bitonic re-sort of index_topk
+        // is one block (same as the radix path's tail). At prefill (nc > 1)
+        // the radix select already launches nc blocks, so keep it.
+        const int64_t tq = t0;  // nc == 1 in the cub path, so one query
+        const int64_t count = start_pos + tq + 1;
+        DsaCubScratch* cub = cub_scratch;
+        const bool use_cub = cub && cub->keys_in && cub->temp && dsa_cub_enabled() &&
+                             nc == 1 && count > index_topk;
+        if (use_cub) {
+            // Build 64-bit ordering keys + index values for [0, count).
+            const int n = (int)count;
+            dsa_build_keys_kernel<<<(unsigned)((n + 255) / 256), 256, 0, s>>>(
+                score_scratch, n, tq, n_keys, cub->keys_in, cub->idx_in);
+            // Ascending sort: last index_topk = top-k by (score desc, index asc).
+            cub::DeviceRadixSort::SortPairs(
+                cub->temp, cub->temp_bytes,
+                cub->keys_in, cub->keys_out,
+                cub->idx_in, cub->idx_out,
+                n, 0, 64, s);
+            dsa_extract_topk_cub_kernel<<<1, 1024, shmem, s>>>(
+                cub->idx_out, n, tq, index_topk, n_keys,
+                score_scratch, topk_indices, topk_scores);
+        } else {
+            dsa_radix_select_kernel<<<(unsigned)nc, 1024, shmem, s>>>(
+                score_scratch, n_keys, t0, start_pos, index_topk, topk_indices, topk_scores);
+        }
     }
 }
 
