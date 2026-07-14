@@ -1,24 +1,34 @@
 // glmserve — GGUF quant GEMM: dequantize-on-the-fly weight @ activation.
 //
-// The real GLM-5.2 3-bit GGUF (UD-Q3_K_XL) keeps its weights in GGML block
-// formats (Q8_0, Q3_K, Q4_K, Q5_K, Q6_K, IQ3_XXS, IQ4_XS, F16) in VRAM and
-// dequantizes inside the GEMM, exactly like llama.cpp's MMVQ/MMAQ kernels.
-// Weight layout is [out, in] row-major with `in` contiguous (the GGUF linear
-// view): row o lives at qW + o * row_bytes and holds `in` quantized elements.
+// ARCHITECTURE:
+//   - Real GLM-5.2 3-bit GGUF (UD-Q3_K_XL) keeps weights in GGML block formats
+//     (Q8_0, Q3_K, Q4_K, Q5_K, Q6_K, IQ3_XXS, IQ4_XS, F16) in VRAM
+//   - Dequantizes inside GEMM, exactly like llama.cpp's MMVQ/MMAQ kernels
+//   - Weight layout: [out, in] row-major with `in` contiguous
+//   - Row o lives at qW + o * row_bytes, holds `in` quantized elements
 //
-// Work partition (MMVQ-style): ONE WARP per output row. The row is walked in
-// 256-element groups; lane l dequantizes only its own 8-element fragment
-// [l*8, l*8+8) of the group directly into registers (dq8), multiplies by the
-// activation fragment, and the warp shuffle-reduces the partial sums. No
-// shared-memory staging, no redundant decode work, coalesced quant reads.
-// Prefill additionally tiles tokens (T=8) so each decoded weight fragment is
-// reused across 8 tokens before being re-read.
+// WORK PARTITION (MMVQ-style):
+//   - ONE WARP per output row
+//   - Row walked in 256-element groups
+//   - Lane l dequantizes only its own 8-element fragment [l*8, l*8+8)
+//   - Direct to registers (dq8), multiply by activation, warp shuffle-reduce
+//   - No shared-memory staging, no redundant decode work, coalesced quant reads
+//   - Prefill: token tiling (T=8) for weight fragment reuse across 8 tokens
 //
-// The MoE expert FFN only reads the ACTIVE top-k experts (not all 256): a
-// two-kernel fused path (gate_up -> h_act -> down) that is the key advantage
-// over a dense all-experts GEMM. Fragment dequantizers mirror
-// src/gguf_quant.cpp exactly; the IQ3_XXS/IQ4_XS tables are seeded from the
-// validated host tables so the GPU path matches the CPU reference.
+// INT8 MMQ PATH:
+//   - Activations quantized to int8 per 32-element block (llama.cpp Q8_1-style)
+//   - Weight fragments as integers + affine scale: w[j] = ds * wq[j] - dm
+//   - 8-element dot = 2 dp4a instructions (vs 8 fp32 FMAs)
+//   - ~3x faster than fp32 for compute-bound kernels (MoE experts)
+//   - All GGUF types in real checkpoint have integer fragment form
+//   - F16/F32 tensors fall back to fp32 kernels (qtype_has_i8 == false)
+//
+// MoE EXPERT FFN:
+//   - Only reads ACTIVE top-k experts (not all 256)
+//   - Two-kernel fused path: gate_up -> h_act -> down
+//   - Key advantage over dense all-experts GEMM
+//   - Fragment dequantizers mirror src/gguf_quant.cpp exactly
+//   - IQ3_XXS/IQ4_XS tables seeded from validated host tables
 #include "common.cuh"
 #include "kernels.cuh"
 #include "gguf_quant.hpp"

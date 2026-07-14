@@ -84,6 +84,27 @@ make bench
 `make` works on a login node with no GPU. `make GPU=1` needs the toolkit on
 `PATH` (provided by `scripts/env.sh`).
 
+## Testing
+
+### Regular Test Suite
+```bash
+make tests && make run-tests
+```
+Runs all unit tests and correctness gates (CPU path + Python integration tests).
+
+### CPU/GPU Integration Test
+Verifies that CPU and GPU forward paths produce identical outputs:
+```bash
+# Build with GPU support
+make GPU=1 tests
+
+# Run with a tiny checkpoint
+./build/gpu/tests/integration_test_cpu_gpu --model /tmp/glm52_tiny
+```
+
+This test catches any divergence between the CPU reference and GPU kernels,
+ensuring numerical correctness across both execution paths.
+
 ## Quickstart (no real weights required)
 
 ```bash

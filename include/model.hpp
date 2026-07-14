@@ -6,8 +6,19 @@
 //   DSA-sparse) -> O proj -> residual -> post-attn RMSNorm ->
 //   {dense MLP | MoE (sigmoid top-k + shared expert)} -> residual.
 //
+// ARCHITECTURAL DECISIONS:
+//   - Dual execution paths: CPU reference (float32) + GPU CUDA (device-resident)
+//   - Paged KV cache: fixed-size blocks, logical->physical mapping
+//   - Tensor parallelism: Megatron-style column/row parallelism with all-reduce
+//   - Pipeline parallelism: contiguous layer stages with hidden state pipelining
+//   - MoE: 256 routed experts + 1 shared, 8 per token (sigmoid top-k)
+//   - DSA: lightning indexer for sparse attention (top-2048 keys per query)
+//   - MTP: Multi-Token Prediction for speculative decoding
+//
 // KV is stored in a paged KV cache (see kv_cache.hpp). The forward appends the
 // given tokens at start_pos and returns logits for the final position.
+//
+// See docs/architecture.md for complete architectural overview.
 #pragma once
 
 #include "config.hpp"

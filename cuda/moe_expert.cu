@@ -2,8 +2,20 @@
 // down(silu(gate(x)) * up(x)) and accumulate weight * result into the token's
 // output. One block per (token, slot); threads split the moe_inter dim.
 //
-// Weight layout (contiguous per expert):
+// ARCHITECTURE:
+//   - Token-major path: one block per (token, slot)
+//   - Threads split moe_inter dimension (gate+up) and hidden dimension (down)
+//   - Shared memory: h_act[moe_inter] for silu(gate)*up activations
+//   - Output accumulation: atomicAdd (non-deterministic order)
+//   - Speculative decode requires fixed-slot-order reduce (see moe_expert_ffn_q)
+//
+// WEIGHT LAYOUT (contiguous per expert):
 //   gate_w[E, moe_inter, hidden], up_w[E, moe_inter, hidden], down_w[E, hidden, moe_inter]
+//
+// W4A16 PATH:
+//   - Packed int4 weights: two nibbles per byte, symmetric, group scales
+//   - q4_weight(): decode 4-bit value, apply scale: (q - 8) * scale
+//   - Same parallelism strategy as fp32 path
 #include "common.cuh"
 #include "kernels.cuh"
 
@@ -55,6 +67,10 @@ void moe_expert_ffn(const float* x, const int* topk_ids, const float* topk_weigh
     size_t shmem = (size_t)moe_inter * sizeof(float);
     moe_expert_kernel<<<grid, threads, shmem, s>>>(x, topk_ids, topk_weights, gate_w,
                                                    up_w, down_w, topk, hidden, moe_inter, out);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "moe_expert_ffn kernel launch failed: %s\n", cudaGetErrorString(err));
+    }
 }
 
 __device__ inline float q4_weight(const uint8_t* qbase, const float* sbase,
@@ -129,6 +145,10 @@ void moe_expert_ffn_w4a16(const float* x, const int* topk_ids, const float* topk
                                                       gate_q, gate_sc, up_q, up_sc,
                                                       down_q, down_sc, topk, hidden,
                                                       moe_inter, group_size, out);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "moe_expert_ffn_w4a16 kernel launch failed: %s\n", cudaGetErrorString(err));
+    }
 }
 
 }  // namespace cuda

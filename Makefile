@@ -99,6 +99,9 @@ dirs:
 # ---- tests ------------------------------------------------------------------
 TEST_SRCS := $(wildcard tests/*.cpp)
 TEST_BINS := $(patsubst tests/%.cpp,$(OBJDIR)/tests/%,$(TEST_SRCS))
+# Exclude integration test from regular test suite (requires GPU)
+TEST_BINS_EXCLUDE := $(OBJDIR)/tests/integration_test_cpu_gpu
+TEST_BINS_RUN := $(filter-out $(TEST_BINS_EXCLUDE), $(TEST_BINS))
 
 tests: dirs $(ALL_OBJS) $(TEST_BINS)
 	@echo "[glmserve] built tests: $(TEST_BINS)"
@@ -110,7 +113,7 @@ $(OBJDIR)/tests/%: tests/%.cpp $(ALL_OBJS)
 
 # Run every built test/Python gate; nonzero exit if any fails.
 run-tests: tests
-	@rc=0; for t in $(TEST_BINS); do echo "--- $$t"; $$t || rc=1; done; \
+	@rc=0; for t in $(TEST_BINS_RUN); do echo "--- $$t"; $$t || rc=1; done; \
 	echo "--- tests/test_logits_match.py"; \
 	python3 tests/test_logits_match.py --bin $(BUILD)/glmserve || rc=1; \
 	echo "--- tests/test_mtp_logits.py"; \
@@ -122,6 +125,11 @@ run-tests: tests
 	echo "--- tests/test_w4_quantized.py"; \
 	python3 tests/test_w4_quantized.py --bin $(BUILD)/glmserve || rc=1; \
 	exit $$rc
+
+# Run the CPU/GPU integration test (requires GPU=1 build + CUDA device)
+run-integration-test: tests
+	@echo "--- $(OBJDIR)/tests/integration_test_cpu_gpu ---"
+	$(OBJDIR)/tests/integration_test_cpu_gpu --model $(GLMSERVE_MODEL)
 
 # ---- benches ----------------------------------------------------------------
 BENCH_SRCS := $(wildcard bench/*.cpp)

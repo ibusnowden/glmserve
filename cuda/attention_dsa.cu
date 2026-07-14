@@ -8,6 +8,35 @@
 //   * learned top-k indices -> sparse attention over the selected keys
 //   * recent-window fallback -> a deterministic sparse baseline for layers whose
 //     learned / shared IndexShare indices are not wired yet.
+//
+// ARCHITECTURE:
+//   - Indexer: 64 heads, 128-dim index vectors per key
+//   - For ctx > 2048: learned top-k selector scores all keys, attends to top-2048
+//   - Fallback: recent window of last 2048 keys (deterministic)
+//   - Shared indexer: some layers share the same top-k indices
+//
+// SELECTOR IMPLEMENTATION:
+//   - Two-stage per query chunk:
+//     1. dsa_score_kernel: one WARP per (key, query), lane h owns head h's dot
+//     2. dsa_radix_select_kernel: exact top-k by radix descent
+//   - Radix select: 64-bit ordering key = (score bits | ~index)
+//     -> ties resolve to smallest index (CPU reference parity)
+//   - Smem bitonic sort emits selected indices ascending
+//     -> deterministic attention accumulation order
+//
+// GEMM SCORING PATH (GLMSERVE_DSA_GEMM=1):
+//   - Per-head dots = plain GEMM: D[(tq,h), j] = index_q[t,h,:] . index_k[j,:]
+//   - cuBLAS SGEMM on fp32-converted key tile
+//   - ReLU-weighted head sum in cheap epilogue kernel
+//   - Requires CUBLAS_PEDANTIC_MATH (true fp32 products, not TF32)
+//     -> TF32 rotates scores enough to flip top-k selections
+//   - Only summation order differs (ULP-level), absorbed by radix tiebreak
+//
+// PERFORMANCE:
+//   - Scalar kernel: ~1.1 TFLOPS (instruction-issue-bound)
+//   - Top prefill cost at long context: 49% at 8K, 65% at 16K
+//   - 19 ms/tok of decode at 8K depth
+//   - GEMM path: ~2-3x faster for scoring stage
 #include "common.cuh"
 #include "kernels.cuh"
 
@@ -346,6 +375,11 @@ void attention_dsa_indexed_paged(const float* q, const float* k_cache, const flo
     attn_dsa_indexed_kernel<<<grid, threads, shmem, s>>>(
         q, k_cache, v_cache, block_table, topk_indices, start_pos, n_heads, n_kv_heads,
         head_dim, block_size, index_topk, scale, out);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "attention_dsa_indexed_paged kernel launch failed: %s\n",
+                cudaGetErrorString(err));
+    }
 }
 
 // Decode specialization for the recent-window baseline: split the sparse key

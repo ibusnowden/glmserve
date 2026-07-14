@@ -1,167 +1,286 @@
-# glmserve architecture
+# glmserve Architecture Overview
 
-A GLM-5.2-specialized serving engine. Generic abstractions are deliberately
-absent: the model, quantization formats, attention layout, and cluster topology
-are all assumed to be GLM-5.2 on 2×8 RTX 6000 Ada.
+## System Design
 
-## Data flow
+glmserve is a C++/CUDA inference engine specialized for GLM-5.2 (753B parameter MoE model).
+It supports both CPU reference execution and GPU acceleration with tensor/pipeline parallelism.
+
+### Key Components
 
 ```
-HTTP (src/http_server.cpp)  ──►  Engine (src/server.cpp)
-                                   ├─ Tokenizer (src/tokenizer.cpp): chat template -> ids
-                                   ├─ Scheduler (src/scheduler.cpp): admission, cancel
-                                   ├─ GLM52Model (src/model_glm52.cpp): forward
-                                   │     └─ KVCache (src/kv_cache.cpp): paged K/V
-                                   └─ Sampler (src/sampler.cpp): greedy/temp/top-k/top-p
+┌─────────────────────────────────────────────────────────────┐
+│                     HTTP Server (OpenAI API)               │
+│  POST /v1/chat/completions, /v1/completions, /v1/models     │
+└───────────────────────────────┬─────────────────────────────┘
+                                │
+┌───────────────────────────────▼─────────────────────────────┐
+│                        Engine                               │
+│  - Model (GLM52Model): weights + forward                    │
+│  - Tokenizer: BPE + fallback                                │
+│  - KVCache: paged key-value cache                           │
+│  - Sampler: greedy/top-k/top-p/penalties                    │
+│  - Scheduler: request management (V0: serialized)           │
+│  - Communicator: NCCL for TP/PP                            │
+└───────────────────────────────┬─────────────────────────────┘
+                                │
+                ┌───────────────┴───────────────┐
+                │                               │
+┌───────────────▼───────────────┐   ┌───────────▼───────────────┐
+│    CPU Reference Path         │   │     CUDA Kernel Path      │
+│  - Full float32 implementation│   │  - Device-resident weights│
+│  - Correctness validation     │   │  - sm_89 kernels          │
+│  - No GPU required            │   │  - cuBLASLt GEMM          │
+└───────────────────────────────┘   └───────────────────────────┘
 ```
 
-## The GLM-5.2 block (`src/model_glm52.cpp`)
+## GLM-5.2 Model Architecture
 
-Each of the 78 layers, applied to a `[n_tokens, hidden=6144]` activation buffer:
+### Transformer Block Structure
 
-1. `input_layernorm` (RMSNorm)
-2. **Attention**: Q/K/V projections → optional per-head qk-RMSNorm → partial RoPE
-   (first `rotary_dim = head_dim·partial_rotary_factor` dims) → causal attention
-   (GQA-aware) reading/writing the paged KV cache → output projection. Residual add.
-3. `post_attention_layernorm` (RMSNorm)
-4. **MLP**:
-   - layers `< first_k_dense_replace` (3): dense `down(silu(gate(x))·up(x))`
-   - layers `≥ 3`: **MoE** — `sigmoid(router·x)` scores, add aux-loss-free
-     `e_score_correction_bias` for *selection only*, top-8, normalize selected
-     gates, scale by `routed_scaling_factor=2.5`, sum experts + always-on shared
-     expert. Residual add.
-5. Final `model.norm` (RMSNorm) → `lm_head` → logits.
+Each of the 78 layers follows this pattern:
 
-### Numerical conventions (committed to, mirrored in numpy)
+```
+Input → RMSNorm → MLA Attention → Residual → RMSNorm → {Dense MLP | MoE} → Residual
+```
 
-- Linear: `y = x @ W^T (+b)`, weights stored row-major `[out, in]` (HF).
-- RMSNorm: `x · rsqrt(mean(x²) + eps) · w`, sum-of-squares accumulated in double.
-- RoPE: NeoX rotate-half on the first `rotary_dim` dims; `theta = rope_theta`.
-- MoE gate weight = the *original* sigmoid score (not bias-corrected); bias only
-  reorders the top-k selection (DeepSeek-V3 / GLM aux-loss-free routing).
+#### MLA Attention (DeepSeek-style Latent Projections)
 
-`tools/make_tiny_checkpoint.py` reimplements exactly this in numpy;
-`tests/test_logits_match.py` asserts the C++ forward matches to ~1e-6.
+```
+Q: hidden → q_a (q_lora_rank) → RMSNorm → q_b → [H, qk_head_dim]
+KV: hidden → [c_kv (kv_lora_rank) | k_pe (qk_rope_head_dim)]
+     c_kv → RMSNorm → kv_b → [H, qk_nope_head_dim + v_head_dim]
+```
 
-## Two backends
+- Q latent rank: 2048
+- KV latent rank: 512
+- Query/key head dim: 256 (192 nope + 64 rope)
+- Value head dim: 256
 
-- **CPU reference** (always built): float32, thread-parallel matmul. The source
-  of truth for correctness and the path that runs without a GPU.
-- **CUDA** (`GLMSERVE_CUDA`, `cuda/*.cu`): launch-ready kernels for sm_89 —
-  rmsnorm, per-head rmsnorm, partial RoPE, cuBLAS GEMM, W4A16 + FP8 dequant GEMM,
-  flash-style dense + split-K decode + DSA-windowed paged attention, MoE
-  router/dispatch/expert, argmax + softmax. The kernel API is `cuda/kernels.cuh`.
-  These are wired into a device-resident forward (`src/model_gpu.cpp`):
-  `upload_to_gpu()` makes the weights + a persistent per-layer KV cache resident,
-  `forward_gpu_prefill()` runs a one-shot prompt prefill, and
-  `forward_gpu_decode()` is the **incremental** single-token step — it appends
-  one position's K/V to the cache and attends over the whole sequence (O(ctx) per
-  token, *not* a re-prefill). Both share one block-stack runner and a persistent
-  scratch arena, so decode does no per-token `cudaMalloc`.
+#### DSA Sparse Attention
 
-### Decode attention (flash-decoding / split-K)
+For contexts > 2048 tokens, a "lightning indexer" selects top-2048 keys per query:
+- 64 index heads, 128-dim index vectors
+- Learned top-k selection with ReLU-weighted head sum
+- Fallback: recent window of last 2048 keys
 
-At decode `n_query==1`, the dense kernel would launch only `n_heads` blocks and
-walk every key serially — starving the GPU and making latency grow linearly with
-context. `attention_decode_paged` instead splits the key range into `S` chunks
-processed by `n_heads·S` blocks (pass 1: partial online softmax per chunk; pass
-2: merge the `S` partials per head). Decode latency then stays ~flat with
-context. On an RTX 6000 Ada (tiny-checkpoint benchmark, `glmserve bench`) decode
-holds ~1.9–2.4K tok/s from ctx 192 → 8K (vs. 1740 → 231 before the split), and
-prefill runs 85K–330K tok/s. `glmserve gencheck` asserts the incremental path is
-token-identical to the re-prefill reference (max logit diff ~1e-7).
+#### MoE (Mixture of Experts)
 
-### DSA status
+- 256 routed experts + 1 shared expert
+- 8 experts per token (top-k by sigmoid score)
+- Sigmoid scoring with optional score-correction bias
+- Routed scaling factor: 2.5
+- First 3 layers: dense MLP (intermediate_size=12288)
+- Remaining 75 layers: MoE (moe_intermediate_size=2048 per expert)
 
-The GPU forward now routes contexts larger than `index_topk` through
-`attention_dsa_paged`. That kernel is a correctness-defined V1 sparse baseline:
-it attends to the most recent `index_topk` keys and degrades to exact dense
-attention when `ctx <= index_topk`.
+## Distributed Execution
 
-The model loader now recognizes optional GLM lightning-indexer weights
-(`self_attn.indexer.{wq_b,wk,weights_proj,k_norm.*}`) and stores them in each
-layer when present. The CPU reference path and CUDA path now use those weights
-on full-indexer layers when `ctx > index_topk`: they compute the HF-style
-learned top-k mask, store per-position indexer keys in a sidecar cache, and
-restrict attention to the selected positions. Shared IndexShare layers reuse the
-most recent full-indexer mask against their own K/V cache. The remaining DSA
-work is optimization and real-weight validation rather than mask semantics.
+### Tensor Parallelism (TP)
 
-The loader also recognizes the optional MTP predictor block after the base stack
-(`model.layers.<num_hidden_layers>.*`). The CPU `glmserve mtp` command runs a
-draft-logits verification path over the tiny checkpoint, and `glmserve mtpcheck`
-exercises a greedy speculative accept/reject correctness path. The generation
-loop can opt into CPU greedy MTP with `mtp_draft_k` / `--mtp-draft-k`; GPU and
-distributed MTP integration is still pending.
+Megatron-style column/row parallelism:
+- **Column-parallel**: q_b_proj, kv_b_proj, gate_proj, up_proj
+  - Each rank owns a contiguous slice of output rows
+- **Row-parallel**: o_proj, down_proj
+  - Each rank owns a contiguous slice of input columns
+  - Requires all-reduce to sum partial outputs
+- Heads are contiguous: rank r owns heads [r*(H/TP), (r+1)*(H/TP))
 
-## Memory: the paged KV cache (`src/kv_cache.cpp`)
+### Pipeline Parallelism (PP)
 
-Fixed-size blocks (`block_size` tokens); each sequence owns a block table
-(logical→physical). Per (layer, physical block): `K,V = [block_size, kv_heads,
-head_dim]`. This lets long, variable-length prompts coexist without
-fragmentation. Reference stores float32 host buffers; the GPU path mirrors the
-same block-table logic with device buffers and an optional FP8 KV dtype.
+- Layers partitioned into contiguous stages
+- First stage: embedding lookup
+- Last stage: final norm + lm_head → logits
+- Hidden states pipelined between stages via NCCL
 
-## Distributed (`src/nccl_comm.cpp`)
+### Typical Deployment
 
-Target: TP=8 within a node, PP=2 across nodes (node 0 = layers 0–38, node 1 =
-39–77). `partition_layers()` computes each stage's range.
+- TP=8, PP=2 over 16 RTX 6000 Ada GPUs
+- Each rank: 1/8 weight shard, replicated embed/lm_head
+- Rank 0: HTTP server + sampling
+- All ranks: lockstep forward execution
 
-The CUDA build now has a real NCCL communicator:
+## Memory Layout
 
-- launcher/env rank discovery (`GLMSERVE_*`, `RANK/WORLD_SIZE`, Slurm)
-- filesystem or direct-hex NCCL unique-id rendezvous
-- world communicator initialization
-- TP subgroup creation via `ncclCommSplit`
-- TP all-reduce and world barrier
-- PP send/recv entry points for hidden-state handoff (host buffers are staged
-  through a persistent device bounce buffer, so the CPU reference forward can
-  drive the handoff directly; device-pointer callers stay zero-copy)
+### KV Cache (Paged)
 
-**Both TP and PP are wired into the CPU-reference forward.** `GLM52Model::set_distributed`
-attaches the communicator; `load()` then shards weights for this rank.
+```
+K: [num_layers, num_blocks, block_size, num_kv_heads, head_dim]
+V: [num_layers, num_blocks, block_size, num_kv_heads, head_dim]
+I: [num_layers, num_blocks, block_size, index_head_dim]  (DSA indexer keys)
+```
 
-*Pipeline parallel:* `load()` keeps only this stage's contiguous layer range
-(`partition_layers()`) — embedding only on the first stage, `model.norm`+`lm_head`
-only on the last — and `forward()` embeds-or-`pipeline_recv_prev()` → runs the
-owned layers → `pipeline_send_next()` to the next stage (a non-final stage
-produces no logits; the last stage runs final norm + lm_head). The per-stage KV
-cache is sized to the local layer count, so layers and KV share one local index.
+- Block size: typically 16 tokens
+- Single-block paged: block_table maps logical→physical, value always 0
+- Latent KV mode (default): fp16 latent cache [max_ctx, kvlat+rope] per layer
+  - 14x smaller than per-head K/V
+  - Absorbed MQA during decode
 
-*Tensor parallel:* `load()` slices each block (Megatron layout) — attention is
-split across heads (`q_b`/`kv_b` column-parallel, `o_proj` row-parallel), MLP/MoE
-FFNs across the intermediate dim (`gate`/`up` column-parallel, `down`
-row-parallel); `q_a`/`kv_a`, the router, norms, embeddings and `lm_head` stay
-replicated. `forward()` attends only this rank's head slice, and `run_layer()`
-`all_reduce_sum`s the row-parallel `o_proj` and MLP/MoE outputs to rebuild the
-replicated residual stream. The KV cache holds only the rank's local heads
-(`local_kv_heads()`). PP send/recv and TP all-reduce both auto-stage **host**
-buffers (the CPU forward's activations) through a device bounce buffer.
+### Weight Residency
 
-`scripts/nccl_tp_smoke.sbatch` validates the 2-rank TP all-reduce + row-parallel
-linear primitive; `scripts/nccl_pp_smoke.sbatch` the PP device-buffer send/recv.
-The full-forward gates run the model itself over the tiny checkpoint on 2× RTX
-6000 Ada and compare to a single-process forward:
-- `tests/test_pp_forward.cpp` (`pp_forward_smoke.sbatch`): TP=1/PP=2, logits
-  **bit-identical** (`max_diff=0`, job 125285).
-- `tests/test_tp_forward.cpp` (`tp_forward_smoke.sbatch`): TP=2/PP=1, logits
-  match to **1.5e-7** (job 125290; all-reduce reorders the float sums, so this
-  is ~rounding rather than bit-exact).
+#### CPU Path
+- Safetensors: dequantized to float32 in memory
+- GGUF: mmap'd quantized payloads, dequantized on access
 
-The device-resident GPU path is also checked with numerical tolerances rather
-than bit-exact promises. In particular, the MoE expert CUDA kernel accumulates
-top-k expert outputs with `atomicAdd`, so selected expert contributions can land
-in a different floating-point order than the CPU reference loop. That is fine
-for inference quality and expected for GPU throughput, but any GPU MoE gate
-should compare with tolerances.
+#### GPU Path
+- All weights uploaded to device VRAM
+- Persistent KV cache: O(max_ctx) per token (not O(ctx²))
+- Persistent scratch arena: no per-token cudaMalloc
+- GGUF quant: dequantized on-the-fly in kernels
 
-What remains is carrying the same TP/PP sharding onto the device-resident GPU
-forward path (`model_gpu.cpp`), and the multi-process serving driver that
-launches the ranks and routes tokens/logits through the HTTP front-end.
+## CUDA Kernel Organization
 
-## Why specialized beats generic here
+### GEMM Kernels (cuda/qgemm.cu)
 
-Fixed model ⇒ no plugin/registry indirection. Fixed topology ⇒ layer partition
-and expert placement are compile-time. Low concurrency (coding agents, batch
-1–4) ⇒ scheduler stays simple and latency-first. Known quant format ⇒ the GEMM
-dequant is inlined, not dispatched.
+**MMVQ-style**: One warp per output row
+- Row walked in 256-element groups
+- Each lane decodes 8-element fragment directly into registers
+- Warp shuffle-reduce for partial sums
+- Prefill: token tiling (T=8) for weight reuse
+
+**Int8 MMQ path**: For compute-bound kernels
+- Activations quantized to int8 per 32-element block
+- Weight fragments as integers + affine scale
+- 8-element dot = 2 dp4a instructions
+- ~3x faster than fp32 for MoE experts
+
+### Attention Kernels
+
+**Dense attention** (cuda/attention_dense.cu):
+- Paged KV cache access
+- Causal masking
+
+**DSA sparse attention** (cuda/attention_dsa.cu):
+- Two-stage: scoring kernel + radix select
+- GEMM scoring path with cuBLAS (CUBLAS_PEDANTIC_MATH for correctness)
+- Radix select: exact top-k with index tiebreak for CPU parity
+
+**Absorbed MLA** (cuda/mla_absorb.cu):
+- Decode: attend over latent cache directly
+- Pass 2 merges + expands through W_UV in one fused kernel
+- Flash-decoding: split-K for parallelism at n_query==1
+
+### MoE Kernels (cuda/moe_expert.cu)
+
+**Token-major path**:
+- One block per (token, slot)
+- Threads split moe_inter dimension
+- Uses atomicAdd for output accumulation
+
+**Expert-major path** (prefill with dispatch):
+- Tokens grouped by expert for weight reuse
+- 8-token weight-fragment reuse
+- ~8x fewer quant decodes at prefill
+
+## Performance Optimizations
+
+### 1. Absorbed MLA + Latent KV
+- fp16 latent cache: [max_ctx, kvlat+rope] per layer
+- Decode attention: no per-head K/V materialization
+- 14x memory savings, ~2x faster decode
+
+### 2. Int8 MMQ
+- Quantize activations to int8, keep weight fragments as integers
+- dp4a instructions instead of fp32 FMAs
+- ~60 GB/s effective → ~800 GB/s peak utilization
+
+### 3. Bulk Expert Upload
+- Pack all experts contiguously: [E, moe_inter, hidden]
+- Parallel CPU repack + single bulk H2D transfer
+- 768 transfers → 3 transfers per MoE layer
+
+### 4. Upload Source Management
+- Prefetch thread: touch-ahead of mmap'd payloads
+- Eviction with lag: drop source pages after upload
+- Bounded resident window: prevents kernel eviction
+
+### 5. Stage Profiling
+- cudaEvent marks at each forward stage
+- Per-stage GPU timeline measurement
+- Identify bottlenecks (e.g., DSA scoring at long context)
+
+## Numerical Correctness
+
+### FP32 vs TF32
+- cuBLAS default: TF32 (10-bit mantissa) for fp32 products
+- DSA scoring: TF32 rotates scores enough to flip top-k selections
+- Solution: CUBLAS_PEDANTIC_MATH for DSA GEMM kernels
+- Only summation order differs (ULP-level), absorbed by radix tiebreak
+
+### MoE Accumulation
+- CPU: deterministic order (top-k by score, then expert index)
+- GPU: atomicAdd accumulation (non-deterministic order)
+- Speculative decode: requires exact parity
+- Solution: fixed-slot-order reduce for GPU MoE (moe_dpart buffer)
+
+## Configuration
+
+### Environment Variables
+
+| Variable | Purpose | Default |
+|----------|---------|---------|
+| GLMSERVE_CUDA | Enable CUDA build | - |
+| GLMSERVE_PROF | Enable stage profiling | off |
+| GLMSERVE_LATENT_KV | Use latent KV cache | on |
+| GLMSERVE_EVICT_LAG | Source eviction lag (layers) | -1 (off) |
+| GLMSERVE_EVICT_ALL | Evict all source pages on start | off |
+| GLMSERVE_UPLOAD_PREFETCH | Prefetch layers ahead | 4 |
+| GLMSERVE_PINNED_UPLOAD | Use pinned host memory | off |
+| GLMSERVE_DSA_GEMM | Use GEMM for DSA scoring | on |
+| GLMSERVE_WIDE_SUFFIX | Full-width suffix chunks | on |
+| GLMSERVE_PREFIX_REUSE | Multi-turn prefix reuse | on |
+| GLMSERVE_HOST_EMBED | Keep embed table host-resident (TP) | off |
+| GLMSERVE_MMQ | Enable int8 MMQ activations | on |
+| GLMSERVE_AR_ROWWISE | Row-wise all-reduce for <64 rows | auto |
+
+### Runtime Flags
+
+| Flag | Purpose |
+|------|---------|
+| --gpu | Run forward on CUDA path |
+| --ctx N | Max context length |
+| --block-size N | KV block size |
+| --max-layers N | Truncate layer stack (testing) |
+| --max-seqs N | Max concurrent sequences (V0: 1) |
+
+## Testing Strategy
+
+### CPU Reference
+- Full forward pass in float32
+- Matches numpy reference to 6e-7
+- Used as correctness oracle
+
+### GPU Validation
+- `check_decode`: incremental vs re-prefill parity
+- `check_chunk_parity`: speculative vs serial decode
+- `check_mtp_speculative`: MTP draft vs target
+- `check_turn_reuse`: multi-turn prefix reuse
+
+### Distributed Validation
+- TP=2/PP=1: matches single-process to 1.5e-7
+- TP=1/PP=2: bit-identical to single-process
+- All-reduce order matches CPU reference
+
+## Limitations
+
+1. **V0 Server**: Serialized generation, no true batching
+2. **MTP + PP**: MTP requires PP=1 (embed + lm_head co-resident)
+3. **DSA GEMM**: Requires CUBLAS_PEDANTIC_MATH (slower)
+4. **Quantized Experts**: Only GGUF or int4, not both
+5. **Block Table**: Single-entry (no true paging fragmentation handling)
+
+## File Organization
+
+```
+include/    - Headers: config, model, kv_cache, sampler, server, etc.
+src/        - C++ control plane + CPU reference forward
+  model_glm52.cpp  - CPU forward, weight loading, MoE, attention
+  model_gpu.cpp    - GPU forward, weight upload, MTP (2252 lines)
+cuda/       - CUDA kernels
+  qgemm.cu         - GGUF quant GEMM (1663 lines, largest)
+  attention_dsa.cu - DSA sparse attention
+  mla_absorb.cu    - Absorbed MLA for decode
+  moe_expert.cu    - MoE expert FFN kernels
+tests/      - Unit tests + correctness gates
+bench/      - Micro-benchmarks (prefill, decode, MoE, KV cache)
+tools/      - HF→GGUF conversion, checkpoint generation
+scripts/    - Build, profiling, distributed launch
+```
