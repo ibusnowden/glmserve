@@ -12,6 +12,7 @@
 #include "kernels.cuh"
 
 #include <algorithm>
+#include <cstdlib>
 
 namespace glmserve {
 namespace cuda {
@@ -102,6 +103,55 @@ __global__ void dsa_score_kernel(const float* __restrict__ index_q,
     }
     total = warp_reduce_sum(total);
     if (lane == 0) scores[tq * n_keys + j] = total;
+}
+
+// ---- GEMM scoring path ------------------------------------------------------
+// dsa_score_kernel is instruction-issue-bound (~1.1 TFLOPS: scalar fp32 FMA
+// with a per-element half->float convert), which makes the selector the top
+// prefill cost at long context (49% at 8K, 65% at 16K) and 19 ms/tok of
+// decode at 8K depth. The per-head dots are a plain GEMM: D[(tq,h), j] =
+// index_q[t,h,:] . index_k[j,:], so run cuBLAS SGEMM on an fp32-converted key
+// tile and fold the ReLU-weighted head sum in a cheap epilogue.
+//
+// The GEMM runs in CUBLAS_PEDANTIC_MATH (gemm_fp32_pedantic): the default
+// math mode rounds each fp32 product to TF32's 10-bit mantissa, which rotates
+// the per-head dots enough to flip top-k selections and diverge the greedy
+// stream from token 1 (phase Y gate). PEDANTIC keeps true fp32 products, so
+// only the (ULP-level) cuBLAS summation order differs from the scalar kernel
+// — a rounding-level residual the radix select's index tiebreak absorbs.
+// GLMSERVE_DSA_GEMM=0 restores the scalar kernel.
+
+__global__ void dsa_convert_k_kernel(const __half* __restrict__ src, int64_t n,
+                                     float* __restrict__ dst) {
+    for (int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += (int64_t)gridDim.x * blockDim.x)
+        dst[i] = __half2float(src[i]);
+}
+
+// scores[tq, j0+j] = sum_h w[t,h]*wscale * relu(D[(tq*H+h), j] * sscale).
+// Rows past a query's causal limit stay untouched semantically: the radix
+// select only reads [0, qpos+1), so writing them is harmless.
+__global__ void dsa_reduce_kernel(const float* __restrict__ D, const float* __restrict__ index_w,
+                                  int64_t t0, int64_t index_heads, int64_t tile_n, int64_t j0,
+                                  float score_scale, float weight_scale, int64_t row_stride,
+                                  float* __restrict__ scores) {
+    const int64_t j = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const int64_t tq = blockIdx.y;
+    if (j >= tile_n) return;
+    const float* w = index_w + (t0 + tq) * index_heads;
+    const float* Dq = D + tq * index_heads * tile_n;
+    float total = 0.0f;
+    for (int64_t h = 0; h < index_heads; ++h)
+        total += w[h] * weight_scale * fmaxf(0.0f, Dq[h * tile_n + j] * score_scale);
+    scores[tq * row_stride + j0 + j] = total;
+}
+
+static bool dsa_gemm_enabled() {
+    static const bool on = [] {
+        const char* e = getenv("GLMSERVE_DSA_GEMM");
+        return !e || atoi(e) != 0;
+    }();
+    return on;
 }
 
 // Unique ordering key: flipped score bits (ascending uint == ascending float)
@@ -203,18 +253,39 @@ void dsa_select_topk(const float* index_q, const __half* index_k_cache,
                      const float* index_w, int64_t n_query, int64_t start_pos,
                      int64_t index_heads, int64_t index_dim, int64_t index_topk,
                      float score_scale, float weight_scale, float* score_scratch,
-                     int* topk_indices, float* topk_scores, cudaStream_t s) {
+                     int* topk_indices, float* topk_scores,
+                     float* gemm_dbuf, float* gemm_kf32, cudaStream_t s) {
     int64_t P = 1;
     while (P < index_topk) P <<= 1;
     const size_t shmem = (size_t)P * sizeof(int);
+    const bool use_gemm = gemm_dbuf && gemm_kf32 && dsa_gemm_enabled();
     for (int64_t t0 = 0; t0 < n_query; t0 += kDsaScoreChunk) {
         const int64_t nc = std::min<int64_t>(kDsaScoreChunk, n_query - t0);
         const int64_t n_keys = start_pos + t0 + nc;   // longest prefix in the chunk
-        dim3 sg((unsigned)((n_keys + 3) / 4), (unsigned)nc);
-        dsa_score_kernel<<<sg, 128, 0, s>>>(index_q, index_k_cache, index_w, t0, start_pos,
-                                            index_heads, index_dim, score_scale, weight_scale,
-                                            n_keys, score_scratch);
-        dsa_radix_select_kernel<<<(unsigned)nc, 256, shmem, s>>>(
+        if (use_gemm) {
+            for (int64_t j0 = 0; j0 < n_keys; j0 += kDsaKeyTile) {
+                const int64_t tn = std::min<int64_t>(kDsaKeyTile, n_keys - j0);
+                const int64_t cvt = tn * index_dim;
+                dsa_convert_k_kernel<<<(unsigned)((cvt + 255) / 256), 256, 0, s>>>(
+                    index_k_cache + j0 * index_dim, cvt, gemm_kf32);
+                gemm_fp32_pedantic(index_q + t0 * index_heads * index_dim, gemm_kf32, nullptr,
+                                    gemm_dbuf, nc * index_heads, index_dim, tn, s);
+                dim3 rg((unsigned)((tn + 255) / 256), (unsigned)nc);
+                dsa_reduce_kernel<<<rg, 256, 0, s>>>(gemm_dbuf, index_w, t0, index_heads,
+                                                     tn, j0, score_scale, weight_scale,
+                                                     n_keys, score_scratch);
+            }
+        } else {
+            dim3 sg((unsigned)((n_keys + 3) / 4), (unsigned)nc);
+            dsa_score_kernel<<<sg, 128, 0, s>>>(index_q, index_k_cache, index_w, t0, start_pos,
+                                                index_heads, index_dim, score_scale, weight_scale,
+                                                n_keys, score_scratch);
+        }
+        // 1024 threads: at decode (nc == 1) this kernel is a single block and
+        // was the dominant selector cost (8 radix passes over the whole ctx on
+        // one SM). Histogram adds are order-free and the compaction scatter is
+        // re-sorted by the bitonic pass, so the output is width-invariant.
+        dsa_radix_select_kernel<<<(unsigned)nc, 1024, shmem, s>>>(
             score_scratch, n_keys, t0, start_pos, index_topk, topk_indices, topk_scores);
     }
 }

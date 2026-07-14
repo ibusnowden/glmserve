@@ -157,6 +157,28 @@ public:
     };
     MTPCheck check_mtp_speculative(const std::vector<int>& prompt, int steps, int draft_k);
 
+    // Multi-turn prefix-reuse parity probe (GPU): greedily run turn 1, then a
+    // turn-2 prompt that extends turn 1's committed stream — once reusing the
+    // resident prefix (suffix prefill only) and once as a full re-prefill of
+    // the same prompt — and compare the greedy token streams.
+    struct TurnCheck {
+        bool gpu = false;
+        int64_t reused = 0;            // prefix rows the reuse arm skipped
+        bool tokens_match = true;
+        std::vector<int> reuse_tokens, full_tokens;
+    };
+    TurnCheck check_turn_reuse(const std::vector<int>& prompt, int turn1_gen,
+                               int turn2_extra, int turn2_gen);
+
+    // Forget the committed GPU token stream: the next request re-prefills from
+    // scratch (used by correctness probes and after direct model_ access).
+    // Also drops the interleaved-MTP-absorb flag a previous spec request may
+    // have left on the model — direct prefills must not mutate the MTP cache.
+    void reset_prefix_cache() {
+        gpu_committed_.clear();
+        if (model_) model_->set_mtp_prefill_absorb(false);
+    }
+
     Tokenizer& tokenizer() { return *tokenizer_; }
 
     void register_routes(HttpServer& server);
@@ -176,6 +198,13 @@ private:
     std::unique_ptr<KVCache> kv_;
     std::unique_ptr<Scheduler> sched_;
     std::mutex gen_mu_;   // V0: serialize forward passes over the shared model
+
+    // Token stream whose rows currently sit in the device KV cache (position i
+    // holds gpu_committed_[i]); a new request reuses the longest common prefix
+    // and runs only the suffix. Cleared whenever the cache state is unknown.
+    // GLMSERVE_PREFIX_REUSE=0 disables reuse (every request re-prefills).
+    std::vector<int> gpu_committed_;
+    bool prefix_reuse_ = true;
 
     // Distributed (TP/PP) runtime. When world_size > 1 the Engine creates an
     // NCCL Communicator (which also pins this rank's GPU via cudaSetDevice) and

@@ -363,13 +363,77 @@ if [[ "$PHASES" == *M* ]]; then
 fi
 
 if [[ "$PHASES" == *E* ]]; then
-    # Long-context decode-at-depth probe: the fp16 latent cache + fp16 indexer
-    # cache keep 16K ctx at ~1.7 GiB/rank; decode beyond index_topk=2048 runs
-    # the learned DSA selector (parallel score + radix top-k) every token.
-    ELEN="${GLMSERVE_LONGCTX_PROMPT:-16000}"
-    echo "=== phase E: TP=8 long-ctx probe (prompt=$ELEN gen=128) ==="
-    run_tp8 "$BIN" bench --model "$GGUF" --gpu --ctx 16384 \
-        --prompt-len "$ELEN" --gen-len 128
+    # Long-context decode-at-depth bench on real prose: the fp16 latent cache +
+    # fp16 indexer cache keep 16K ctx at ~1.7 GiB/rank; decode beyond
+    # index_topk=2048 runs the learned DSA selector (parallel score + radix
+    # top-k) every token. Plain arm is stage-profiled (where does the depth
+    # cost land); spec arm is the serving configuration (conf-gated MTP).
+    # llama.cpp ngram-mod reference on the same prompts, itiger06 prod,
+    # cache_prompt=false, cold ngram cache (2026-07-11): prefill 363 / 320
+    # tok/s at 8K/16K, decode ~25.0 / ~25.5 tok/s.
+    # VRAM at 16K ctx is tight: weights + latent/indexer KV leave ~0.95 GiB
+    # free (job 145677 OOM'd with the default 2048-token scratch arena), so
+    # long-ctx arms run a 1024-token prefill chunk (mma still engages: 1024x8
+    # dispatch rows) and each arm sizes --ctx to its own prompt. The 16K spec
+    # arm additionally carries the resident MTP block (~0.65 GiB/rank) and a
+    # 512-token arena, and is guarded: an OOM there must not kill the job.
+    ECHUNK="${GLMSERVE_LONGCTX_CHUNK:-1024}"
+    for PF in ${GLMSERVE_LONGCTX_FILES:-bench/prompts/diverse_8192.ids bench/prompts/diverse_16384.ids}; do
+        NTOK=$(wc -w < "$PF")
+        ECTX=$((NTOK + 192))
+        echo "=== phase E: TP=8 long-ctx bench ($PF, ctx=$ECTX, plain, profiled) ==="
+        run_tp8 env GLMSERVE_PROF=1 GLMSERVE_PREFILL_CHUNK="$ECHUNK" \
+            "$BIN" bench --model "$GGUF" --gpu --ctx "$ECTX" \
+            --prompt-file "$PF" --gen-len 128
+        if [[ "$NTOK" -le 8192 ]]; then
+            # Same-binary suffix-width A/B: old 64-wide absorbed suffix chunks.
+            echo "=== phase E: TP=8 long-ctx bench ($PF, WIDE_SUFFIX=0 control) ==="
+            run_tp8 env GLMSERVE_WIDE_SUFFIX=0 GLMSERVE_PREFILL_CHUNK="$ECHUNK" \
+                "$BIN" bench --model "$GGUF" --gpu --ctx "$ECTX" \
+                --prompt-file "$PF" --gen-len 128
+        fi
+        EK="${GLMSERVE_DRAFT_K:-4}"
+        SCHUNK="$ECHUNK"
+        if [[ "$NTOK" -gt 8192 ]]; then SCHUNK=512; fi
+        echo "=== phase E: TP=8 long-ctx bench ($PF, draft_k=$EK, chunk=$SCHUNK) ==="
+        run_tp8 env GLMSERVE_PREFILL_CHUNK="$SCHUNK" \
+            "$BIN" bench --model "$GGUF" --gpu --ctx "$ECTX" \
+            --prompt-file "$PF" --gen-len 128 --mtp-draft-k "$EK" \
+            || echo "phase E spec arm ($PF): FAILED (VRAM-tight arm, non-fatal)"
+    done
+fi
+
+if [[ "$PHASES" == *Y* ]]; then
+    # DSA selector GEMM-vs-scalar real-model token gate at 4K depth (the only
+    # phases that run with the selector active are long-ctx ones: D/F/M all
+    # sit below index_topk=2048). The GEMM path runs in CUBLAS_PEDANTIC_MATH
+    # (true fp32, no TF32); greedy continuation must survive the SGEMM
+    # summation-order change. A token-1 divergence means a real selection bug
+    # (pre-fix: cuBLAS TF32's 10-bit mantissa rotated the per-head dots enough
+    # to flip top-k from token 1); a late-token flip is rounding-level noise.
+    PF_Y="/tmp/glmserve_phaseY_${SLURM_JOB_ID}.ids"
+    awk '{for(i=1;i<=4096;i++) printf "%s ", $i; print ""}' \
+        bench/prompts/diverse_8192.ids > "$PF_Y"
+    TOKS_Y0="/tmp/glmserve_phaseY0_${SLURM_JOB_ID}.tokens"
+    TOKS_Y1="/tmp/glmserve_phaseY1_${SLURM_JOB_ID}.tokens"
+    echo "=== phase Y: TP=8 DSA gemm-vs-scalar token gate (4K prompt) ==="
+    run_tp8 env GLMSERVE_DSA_GEMM=0 GLMSERVE_PREFILL_CHUNK=1024 \
+        "$BIN" tokgen --model "$GGUF" --gpu --ctx 4352 \
+        --tokens-file "$PF_Y" --max-tokens 32 --temp 0 | tee "$TOKS_Y0.full"
+    grep -m1 "tokens:" "$TOKS_Y0.full" > "$TOKS_Y0" || true
+    run_tp8 env GLMSERVE_DSA_GEMM=1 GLMSERVE_PREFILL_CHUNK=1024 \
+        "$BIN" tokgen --model "$GGUF" --gpu --ctx 4352 \
+        --tokens-file "$PF_Y" --max-tokens 32 --temp 0 | tee "$TOKS_Y1.full"
+    grep -m1 "tokens:" "$TOKS_Y1.full" > "$TOKS_Y1" || true
+    if [ -s "$TOKS_Y0" ] && [ -s "$TOKS_Y1" ]; then
+        if diff -q "$TOKS_Y0" "$TOKS_Y1" >/dev/null; then
+            echo "phase Y DSA gemm token gate: PASS"
+        else
+            echo "phase Y DSA gemm token gate: DIVERGED (inspect: rounding-level"
+            echo "selector flips move greedy paths; a mismatch from token 1 = bug)"
+            echo "Y0: $(cat "$TOKS_Y0")"; echo "Y1: $(cat "$TOKS_Y1")"
+        fi
+    fi
 fi
 
 echo "=== gguf_8x done $(date -Iseconds) ==="

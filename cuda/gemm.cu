@@ -76,6 +76,36 @@ void gemm_fp32(const float* x, const float* W, const float* bias, float* y,
     maybe_bias(y, bias, n, out, s);
 }
 
+// Pedantic fp32 GEMM: identical to gemm_fp32 but forces CUBLAS_PEDANTIC_MATH
+// on the cuBLAS path, so cublasSgemm uses true fp32 (no TF32 tensor cores).
+// On Ada/Ampere the default math mode rounds each fp32 product to TF32's
+// 10-bit mantissa before accumulating — a systematic error large enough to
+// flip DSA top-k selections (a 128-dim dot accumulates ~1e-3 of relative
+// TF32 error vs ~1e-6 for fp32 summation-order noise). The DSA selector must
+// match the scalar kernel's fp32 domain so the greedy stream agrees with the
+// scalar path; only the (ULP-level) summation order then differs. The n <=
+// kMlaParityMaxQ gemv branch is already true fp32 (no cuBLAS), so it is
+// unaffected and just delegates.
+void gemm_fp32_pedantic(const float* x, const float* W, const float* bias, float* y,
+                        int64_t n, int64_t in, int64_t out, cudaStream_t s) {
+    if (n <= kMlaParityMaxQ) {
+        gemm_fp32(x, W, bias, y, n, in, out, s);
+        return;
+    }
+    cublasHandle_t h = handle();
+    cublasMath_t saved;
+    cublasGetMathMode(h, &saved);
+    cublasSetMathMode(h, CUBLAS_PEDANTIC_MATH);
+    cublasSetStream(h, s);
+    const float alpha = 1.0f, beta = 0.0f;
+    // C(out x n) = W^T(out x in) * X(in x n)
+    cublasSgemm(h, CUBLAS_OP_T, CUBLAS_OP_N,
+                (int)out, (int)n, (int)in,
+                &alpha, W, (int)in, x, (int)in, &beta, y, (int)out);
+    cublasSetMathMode(h, saved);
+    maybe_bias(y, bias, n, out, s);
+}
+
 void gemm_fp16(const half* x, const half* W, const float* bias, half* y,
                int64_t n, int64_t in, int64_t out, cudaStream_t s) {
     cublasSetStream(handle(), s);

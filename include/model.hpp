@@ -196,6 +196,15 @@ public:
     // sequence length at n so forward_gpu_decode() can continue from there.
     // Mirrors the CPU forward() exactly (used to validate the kernels on hardware).
     std::vector<float> forward_gpu_prefill(const std::vector<int>& tokens);
+    // Suffix continuation of a resident sequence (multi-turn prefix reuse):
+    // positions [0, start_pos) are already in the device cache from a previous
+    // prefill/decode of the same token stream; only tokens[start_pos..) run,
+    // as suffix chunks, and the last position's logits come back. start_pos
+    // == 0 or a PP deployment falls back to the full one-shot prefill.
+    std::vector<float> forward_gpu_prefill_from(const std::vector<int>& tokens,
+                                                int64_t start_pos);
+    // Positions currently valid in the device KV cache (0 when inactive).
+    int64_t gpu_cur_len() const;
     // Incremental single-token decode at absolute position `pos`: appends this
     // token's K/V to the device cache and attends over [0, pos], reusing the
     // persistent scratch (no per-token allocation). Returns logits [vocab].
@@ -237,7 +246,16 @@ public:
     // the committed token at p+1 (= next_tokens[p - pos0]). Also stashes the
     // hidden at row next_tokens.size() as the draft seed state. Must run
     // directly after the trunk pass whose rows it reads.
-    void mtp_gpu_absorb(const std::vector<int>& next_tokens, int64_t pos0);
+    // set_seed=false skips refreshing the draft seed (gm.prev) — used by the
+    // interleaved per-chunk absorbs during a long prefill, where "one past the
+    // chunk" is not a valid scratch row; the final absorb sets the real seed.
+    void mtp_gpu_absorb(const std::vector<int>& next_tokens, int64_t pos0,
+                        bool set_seed = true);
+    // Interleave MTP absorbs into chunked prefill: after each non-final chunk
+    // the trunk hiddens are still in scratch, so the MTP cache can cover the
+    // WHOLE prompt instead of just the last chunk (empty early rows starve the
+    // NextN drafts at long context: 1.08 tok/group accepted at 8K depth).
+    void set_mtp_prefill_absorb(bool on) { mtp_prefill_absorb_ = on; }
     // Greedy-draft k tokens ahead: seeded with `next_token` (the committed
     // token one past the absorbed prefix) and the stashed hidden state.
     // Extends the MTP cache by one committed position; speculative draft
@@ -265,6 +283,7 @@ private:
     void moe_mlp(const MoEMLP& m, const float* x, float* out, int64_t n_tokens) const;
 
     GLM52Config cfg_;
+    bool mtp_prefill_absorb_ = false;   // see set_mtp_prefill_absorb()
     RMSNormW final_norm_;
     std::vector<float> embed_tokens_;   // [vocab, hidden]
     Linear embed_lin_;                  // GGUF quant embedding [vocab, hidden] (has_q)

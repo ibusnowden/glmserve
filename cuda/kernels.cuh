@@ -36,6 +36,12 @@ void rope(float* x, const int64_t* pos, int64_t n, int64_t n_heads,
 // y[n,out] = x[n,in] @ W[out,in]^T (+ bias). cuBLASLt under the hood.
 void gemm_fp32(const float* x, const float* W, const float* bias, float* y,
                int64_t n, int64_t in, int64_t out, cudaStream_t s = 0);
+// Same GEMM with TF32 disabled (CUBLAS_PEDANTIC_MATH): true fp32 products, so
+// the result matches the scalar fp32 kernel's domain (only summation order
+// differs). Used by the DSA selector, whose top-k must agree with the scalar
+// reference; TF32's 10-bit mantissa rotates scores enough to flip selections.
+void gemm_fp32_pedantic(const float* x, const float* W, const float* bias, float* y,
+                        int64_t n, int64_t in, int64_t out, cudaStream_t s = 0);
 void gemm_fp16(const half* x, const half* W, const float* bias, half* y,
                int64_t n, int64_t in, int64_t out, cudaStream_t s = 0);
 
@@ -196,11 +202,18 @@ void attention_dsa_paged(const float* q, const float* k_cache, const float* v_ca
 // Queries are processed in chunks of kDsaScoreChunk; score_scratch must hold
 // kDsaScoreChunk * (start_pos + n_query) floats.
 constexpr int64_t kDsaScoreChunk = 64;
+// Key-tile width of the SGEMM scoring path: per-head dot GEMM into gemm_dbuf
+// [kDsaScoreChunk * index_heads, kDsaKeyTile] over an fp32-converted key tile
+// gemm_kf32 [kDsaKeyTile, index_dim], then a ReLU-weighted head-sum epilogue.
+// Null gemm buffers (or GLMSERVE_DSA_GEMM=0) fall back to the scalar kernel.
+constexpr int64_t kDsaKeyTile = 4096;
 void dsa_select_topk(const float* index_q, const __half* index_k_cache,
                      const float* index_w, int64_t n_query, int64_t start_pos,
                      int64_t index_heads, int64_t index_dim, int64_t index_topk,
                      float score_scale, float weight_scale, float* score_scratch,
-                     int* topk_indices, float* topk_scores, cudaStream_t s = 0);
+                     int* topk_indices, float* topk_scores,
+                     float* gemm_dbuf = nullptr, float* gemm_kf32 = nullptr,
+                     cudaStream_t s = 0);
 void attention_dsa_indexed_paged(const float* q, const float* k_cache, const float* v_cache,
                                  const int* block_table, const int* topk_indices,
                                  int64_t n_query, int64_t start_pos, int64_t n_heads,

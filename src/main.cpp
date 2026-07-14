@@ -386,8 +386,13 @@ std::vector<int> parse_int_list(const std::string& s) {
     std::vector<int> out;
     std::string cur;
     for (char ch : s) {
-        if (ch == ' ' || ch == ',') { if (!cur.empty()) { out.push_back(std::stoi(cur)); cur.clear(); } }
-        else cur += ch;
+        // Any whitespace separates (token files end in a newline; a bare "\n"
+        // tail token must not reach stoi).
+        if (ch == ' ' || ch == ',' || ch == '\n' || ch == '\r' || ch == '\t') {
+            if (!cur.empty()) { out.push_back(std::stoi(cur)); cur.clear(); }
+        } else {
+            cur += ch;
+        }
     }
     if (!cur.empty()) out.push_back(std::stoi(cur));
     return out;
@@ -616,6 +621,33 @@ int cmd_chunkcheck(const Args& a) {
     return c.argmax_match ? 0 : 1;
 }
 
+int cmd_turncheck(const Args& a) {
+    EngineOptions o = engine_opts(a);
+    std::vector<int> prompt = parse_int_list(a.get("tokens", "3 1 4 1 5 9 2 6"));
+    int gen1  = static_cast<int>(a.get_int("gen1", 24));
+    int extra = static_cast<int>(a.get_int("extra", 8));
+    int gen2  = static_cast<int>(a.get_int("gen2", 24));
+    GLM_CHECK(!prompt.empty(), "turncheck requires --tokens \"id id id\"");
+    GLM_CHECK(gen1 > 0 && gen2 > 0, "turncheck requires positive --gen1 and --gen2");
+    const int64_t need = static_cast<int64_t>(prompt.size()) + gen1 + extra + gen2 + 1;
+    if (o.max_model_len < need) o.max_model_len = need;
+
+    Engine engine(o);
+    Engine::TurnCheck t = engine.check_turn_reuse(prompt, gen1, extra, gen2);
+    if (!t.gpu) {
+        std::printf("turncheck: GPU inactive (CPU build or no device / no --gpu) — skipped\n");
+        return 0;
+    }
+    std::printf("turncheck: backend=CUDA reused=%lld gen1=%d extra=%d gen2=%d\n",
+                (long long)t.reused, gen1, extra, gen2);
+    std::printf("  reuse : ");
+    for (int tok : t.reuse_tokens) std::printf("%d ", tok);
+    std::printf("\n  full  : ");
+    for (int tok : t.full_tokens) std::printf("%d ", tok);
+    std::printf("\n  RESULT: %s\n", t.tokens_match ? "PASS" : "FAIL");
+    return t.tokens_match ? 0 : 1;
+}
+
 int cmd_mtpcheck(const Args& a) {
     EngineOptions o = engine_opts(a);
     std::vector<int> prompt = parse_int_list(a.get("tokens", "3 1 4 1 5 9 2 6"));
@@ -657,6 +689,7 @@ void usage() {
         "  glmserve bench    --model DIR [--prompt-len 512] [--gen-len 128] [--gpu]\n"
         "  glmserve mtp      --model DIR --tokens \"...\" --draft \"...\" [--out JSON]\n"
         "  glmserve mtpcheck --model DIR --tokens \"...\" [--gen N] [--draft-k K]\n"
+        "  glmserve turncheck --model DIR --tokens \"...\" [--gen1 N] [--extra N] [--gen2 N]\n"
         "  glmserve inspect  --model DIR\n"
         "  glmserve load-gguf --model GGUF_FILE_OR_DIR [--touch-payloads] [--dequant-smoke]\n"
         "                    [--require-dequant-checksums] [--linear-smoke]\n"
@@ -683,6 +716,7 @@ int main(int argc, char** argv) {
         if (cmd == "mtp")      return cmd_mtp(a);
         if (cmd == "mtpcheck") return cmd_mtpcheck(a);
         if (cmd == "chunkcheck") return cmd_chunkcheck(a);
+        if (cmd == "turncheck") return cmd_turncheck(a);
         usage();
         return 1;
     } catch (const std::exception& e) {

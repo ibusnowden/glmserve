@@ -160,6 +160,8 @@ static std::string gen_id(const char* prefix) {
 // Engine construction
 // ---------------------------------------------------------------------------
 Engine::Engine(EngineOptions opts) : opts_(std::move(opts)) {
+    if (const char* e = std::getenv("GLMSERVE_PREFIX_REUSE"))
+        prefix_reuse_ = std::atoi(e) != 0;
     const bool is_gguf = gguf_path_like(opts_.model_path);
     if (is_gguf) {
         // GGUF checkpoints carry the full architecture under glm-dsa.* metadata;
@@ -285,13 +287,31 @@ Completion Engine::run(const std::vector<int>& prompt_in, const SamplingParams& 
     for (auto& s : p.stop) max_stop = std::max(max_stop, s.size());
 
     try {
-        // GPU prefill is a one-shot over the whole sequence (it manages its own
-        // single KV block); the CPU path uses the persistent paged KV cache and
-        // appends incrementally. Decode on the GPU re-prefills the growing
-        // sequence each step (correct; incremental device KV is a later phase).
+        // GPU prefill: reuse the longest committed prefix already resident in
+        // the device cache (multi-turn conversations re-send the whole chat;
+        // only the new suffix runs), falling back to the one-shot prefill when
+        // nothing matches. The CPU path uses the persistent paged KV cache and
+        // appends incrementally.
         std::vector<int> all_tokens = prompt;
-        std::vector<float> logits = gpu_active_ ? model_->forward_gpu_prefill(all_tokens)
-                                                : model_->forward(prompt, 0, kv);
+        // Interleave MTP absorbs into the (possibly chunked) prefill so the
+        // draft cache covers the whole prompt, not just the last chunk.
+        model_->set_mtp_prefill_absorb(gpu_active_ && p.mtp_draft_k > 0 &&
+                                       model_->mtp_gpu_ready());
+        int64_t reuse = 0;
+        if (gpu_active_ && prefix_reuse_) {
+            const int64_t lim = std::min<int64_t>(
+                static_cast<int64_t>(gpu_committed_.size()),
+                static_cast<int64_t>(all_tokens.size()) - 1);
+            while (reuse < lim && gpu_committed_[reuse] == all_tokens[reuse]) ++reuse;
+        }
+        gpu_committed_.clear();   // unknown until this request completes
+        std::vector<float> logits = gpu_active_
+            ? model_->forward_gpu_prefill_from(all_tokens, reuse)
+            : model_->forward(prompt, 0, kv);
+        if (gpu_active_ && reuse > 0)
+            GLM_INFO("prefix reuse: %lld of %zu prompt tokens resident, prefilled %lld",
+                     (long long)reuse, all_tokens.size(),
+                     (long long)(static_cast<int64_t>(all_tokens.size()) - reuse));
         Sampler sampler(p.seed);
         const bool mtp_enabled = p.mtp_draft_k > 0;
         const bool mtp_gpu = mtp_enabled && gpu_active_;
@@ -308,9 +328,9 @@ Completion Engine::run(const std::vector<int>& prompt_in, const SamplingParams& 
                       "MTP speculative generation currently does not support sampling penalties");
             c.mtp_used = true;
         }
-        // GPU spec decode: seed the MTP cache from the prompt's trunk hiddens
-        // (a chunked long prefill leaves only its last chunk in scratch, so
-        // absorb from there; earlier MTP cache rows stay zero).
+        // GPU spec decode: absorb the final chunk and set the draft seed (the
+        // interleaved prefill absorbs covered every earlier chunk; a reused
+        // prefix keeps its MTP rows from the request that produced them).
         if (mtp_gpu) {
             const int64_t row0 = model_->gpu_chunk_row0();
             model_->mtp_gpu_absorb(
@@ -503,6 +523,14 @@ Completion Engine::run(const std::vector<int>& prompt_in, const SamplingParams& 
                                  : model_->forward({next}, kv.length, kv);
         }
         flush(true);
+        // Remember which token stream the device cache now holds (rows [0,
+        // cur_len) correspond 1:1 to all_tokens[0:cur_len]) so the next
+        // request can reuse the common prefix.
+        if (gpu_active_) {
+            const int64_t rows = std::min<int64_t>(
+                model_->gpu_cur_len(), static_cast<int64_t>(all_tokens.size()));
+            gpu_committed_.assign(all_tokens.begin(), all_tokens.begin() + rows);
+        }
     } catch (...) {
         kv.release();
         sched_->complete(id);
@@ -530,6 +558,7 @@ Completion Engine::generate_tokens(const std::vector<int>& prompt_ids, const Sam
 
 std::vector<float> Engine::prefill_logits(const std::vector<int>& prompt_ids,
                                           std::vector<float>* all_logits) {
+    reset_prefix_cache();   // drives the device cache directly
     std::lock_guard<std::mutex> guard(gen_mu_);
     ensure_gpu();
     // The GPU one-shot prefill returns last-position logits only. If a caller
@@ -570,6 +599,7 @@ static int host_argmax_row(const float* v, int64_t n) {
 
 Engine::BenchResult Engine::profile(int prompt_len, int gen_len, int draft_k,
                                     const std::vector<int>* prompt_ids) {
+    reset_prefix_cache();   // drives the device cache directly
     std::lock_guard<std::mutex> guard(gen_mu_);
     ensure_gpu();
 
@@ -592,6 +622,9 @@ Engine::BenchResult Engine::profile(int prompt_len, int gen_len, int draft_k,
     }
 
     if (gpu_active_) {
+        // Interleaved MTP absorbs make the timed prefill match serving (the
+        // draft cache must cover the whole prompt for spec decode at depth).
+        model_->set_mtp_prefill_absorb(draft_k > 0 && model_->mtp_gpu_ready());
         // Warm-up prefill (primes cuBLAS, allocates scratch/KV) — not timed.
         model_->forward_gpu_prefill(prompt);
         gpu_prof_report("warmup", false);  // reset GLMSERVE_PROF accumulator
@@ -722,6 +755,7 @@ Engine::BenchResult Engine::profile(int prompt_len, int gen_len, int draft_k,
 }
 
 Engine::DecodeCheck Engine::check_decode(const std::vector<int>& prompt, int steps) {
+    reset_prefix_cache();   // drives the device cache directly
     std::lock_guard<std::mutex> guard(gen_mu_);
     ensure_gpu();
 
@@ -774,6 +808,7 @@ Engine::DecodeCheck Engine::check_decode(const std::vector<int>& prompt, int ste
 }
 
 Engine::ChunkCheck Engine::check_chunk_parity(const std::vector<int>& prompt, int k) {
+    reset_prefix_cache();   // drives the device cache directly
     std::lock_guard<std::mutex> guard(gen_mu_);
     ensure_gpu();
 
@@ -826,6 +861,7 @@ Engine::ChunkCheck Engine::check_chunk_parity(const std::vector<int>& prompt, in
 
 Engine::MTPCheck Engine::check_mtp_speculative(const std::vector<int>& prompt, int steps,
                                                int draft_k) {
+    reset_prefix_cache();   // drives the device cache directly
     std::lock_guard<std::mutex> guard(gen_mu_);
     ensure_gpu();
     GLM_CHECK(!prompt.empty(), "check_mtp_speculative: empty prompt");
@@ -848,8 +884,11 @@ Engine::MTPCheck Engine::check_mtp_speculative(const std::vector<int>& prompt, i
             r.ref_tokens.push_back(t);
             if (s + 1 < steps) logits = model_->forward_gpu_decode(t, pos++);
         }
-        // Speculative run (re-prefill resets the trunk cache).
+        // Speculative run (re-prefill resets the trunk cache), with the
+        // serving path's interleaved per-chunk MTP absorbs.
+        model_->set_mtp_prefill_absorb(true);
         logits = model_->forward_gpu_prefill(prompt);
+        model_->set_mtp_prefill_absorb(false);
         {
             const int64_t row0 = model_->gpu_chunk_row0();
             model_->mtp_gpu_absorb(
@@ -1093,6 +1132,37 @@ void Engine::handle_completions(const HttpRequest& req, HttpResponder& res) {
           << (c.prompt_tokens + c.completion_tokens) << "}}";
         res.send_json(200, o.str());
     }
+}
+
+Engine::TurnCheck Engine::check_turn_reuse(const std::vector<int>& prompt, int turn1_gen,
+                                           int turn2_extra, int turn2_gen) {
+    TurnCheck t;
+    SamplingParams p;
+    p.temperature = 0.0f;       // greedy: streams must match exactly
+    p.ignore_eos = true;
+    p.max_tokens = turn1_gen;
+
+    // Turn 1 commits prompt + its greedy continuation to the device cache.
+    Completion c1 = generate_tokens(prompt, p, nullptr);
+    t.gpu = gpu_active_;
+    if (!t.gpu) return t;       // CPU path has no device cache to reuse
+
+    // Turn 2 extends the committed stream the way a chat client re-sends the
+    // conversation: turn-1 prompt + turn-1 reply + a few new "user" tokens.
+    std::vector<int> p2 = prompt;
+    p2.insert(p2.end(), c1.tokens.begin(), c1.tokens.end());
+    for (int i = 0; i < turn2_extra; ++i)
+        p2.push_back(prompt[static_cast<size_t>(i) % prompt.size()]);
+
+    p.max_tokens = turn2_gen;
+    t.reused = prefix_reuse_ ? static_cast<int64_t>(gpu_committed_.size()) : 0;
+    Completion c2 = generate_tokens(p2, p, nullptr);   // suffix-only prefill
+    reset_prefix_cache();
+    Completion c3 = generate_tokens(p2, p, nullptr);   // full re-prefill
+    t.reuse_tokens = c2.tokens;
+    t.full_tokens = c3.tokens;
+    t.tokens_match = c2.tokens == c3.tokens;
+    return t;
 }
 
 void Engine::handle_models(const HttpRequest&, HttpResponder& res) {

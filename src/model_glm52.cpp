@@ -822,6 +822,18 @@ void GLM52Model::load_gguf(const std::string& gguf_path, int64_t max_layers,
                                       gguf_weights_->role(p + "self_attn.kv_b_proj.weight[v]"),
                                       heads, nope, vd, kv_lora);
         L.o_proj = gguf_lin(gguf_weights_->linear(p + "self_attn.o_proj.weight"));
+        // NextN carries its own DSA indexer (blk.78.indexer.*). Without it the
+        // draft layer silently degrades to the recent-window fallback past
+        // index_topk and MTP acceptance at depth collapses (~1.0 tok/group at
+        // 8K vs 1.66 on the same text at 1K).
+        if (gguf_weights_->role(p + "self_attn.indexer.wq_b.weight")) {
+            L.indexer.wq_b = gguf_lin(gguf_weights_->linear(p + "self_attn.indexer.wq_b.weight"));
+            L.indexer.wk = gguf_lin(gguf_weights_->linear(p + "self_attn.indexer.wk.weight"));
+            L.indexer.weights_proj = gguf_lin(gguf_weights_->linear(p + "self_attn.indexer.weights_proj.weight"));
+            L.indexer.k_norm = gguf_norm_w(gguf_weights_->role(p + "self_attn.indexer.k_norm.weight"));
+            const GGUFWeightView* kb = gguf_weights_->role(p + "self_attn.indexer.k_norm.bias");
+            if (kb) L.indexer.k_norm_bias = gguf_bias(kb);
+        }
         if (L.is_dense) {
             L.dense_mlp.gate_proj = gguf_lin(gguf_weights_->linear(p + "mlp.gate_proj.weight"));
             L.dense_mlp.up_proj = gguf_lin(gguf_weights_->linear(p + "mlp.up_proj.weight"));
@@ -1343,6 +1355,11 @@ std::vector<float> GLM52Model::forward_gpu_prefill(const std::vector<int>&) {
     GLM_CHECK(false, "forward_gpu_prefill: built without CUDA (rebuild with GPU=1)");
     return {};
 }
+std::vector<float> GLM52Model::forward_gpu_prefill_from(const std::vector<int>&, int64_t) {
+    GLM_CHECK(false, "forward_gpu_prefill_from: built without CUDA (rebuild with GPU=1)");
+    return {};
+}
+int64_t GLM52Model::gpu_cur_len() const { return 0; }
 std::vector<float> GLM52Model::forward_gpu_decode(int, int64_t) {
     GLM_CHECK(false, "forward_gpu_decode: built without CUDA (rebuild with GPU=1)");
     return {};
@@ -1363,7 +1380,7 @@ void GLM52Model::forward_gpu_chunk(const std::vector<int>&, int64_t, std::vector
 void GLM52Model::forward_gpu_chunk_greedy(const std::vector<int>&, int64_t, std::vector<int>*) {
     GLM_CHECK(false, "forward_gpu_chunk_greedy: built without CUDA (rebuild with GPU=1)");
 }
-void GLM52Model::mtp_gpu_absorb(const std::vector<int>&, int64_t) {
+void GLM52Model::mtp_gpu_absorb(const std::vector<int>&, int64_t, bool) {
     GLM_CHECK(false, "mtp_gpu_absorb: built without CUDA (rebuild with GPU=1)");
 }
 std::vector<int> GLM52Model::mtp_gpu_draft(int, int, float) {

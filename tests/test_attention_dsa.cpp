@@ -199,6 +199,84 @@ int main() {
     CUDA_TEST_CHECK(cudaMemcpy(got_idx.data(), didx, got_idx.size() * sizeof(int), cudaMemcpyDeviceToHost));
     CUDA_TEST_CHECK(cudaMemcpy(got_idx_attn.data(), dout_idx, got_idx_attn.size() * sizeof(float),
                                cudaMemcpyDeviceToHost));
+
+    // SGEMM scoring path: same fp32 operands as the scalar kernel, so the
+    // selected indices must match the CPU reference exactly (only the dot's
+    // summation order differs; ties resolve by index in both).
+    float *ddbuf = nullptr, *dkf32 = nullptr;
+    CUDA_TEST_CHECK(cudaMalloc(&ddbuf, (size_t)kDsaScoreChunk * iH * kDsaKeyTile * sizeof(float)));
+    CUDA_TEST_CHECK(cudaMalloc(&dkf32, (size_t)kDsaKeyTile * iD * sizeof(float)));
+    CUDA_TEST_CHECK(cudaMemset(didx, 0, ref_idx.size() * sizeof(int)));
+    dsa_select_topk(diq, dik, diw, n, 0, iH, iD, topk, iscale, 1.0f, dscratch, didx, dscore,
+                    ddbuf, dkf32);
+    CUDA_TEST_CHECK(cudaGetLastError());
+    CUDA_TEST_CHECK(cudaDeviceSynchronize());
+    std::vector<int> got_idx_gemm(ref_idx.size());
+    CUDA_TEST_CHECK(cudaMemcpy(got_idx_gemm.data(), didx, got_idx_gemm.size() * sizeof(int),
+                               cudaMemcpyDeviceToHost));
+    bool idx_gemm_match = got_idx_gemm == ref_idx;
+    std::printf("  dsa_select_topk gemm path [n=%d topk=%d]: indices %s\n",
+                n, topk, idx_gemm_match ? "MATCH" : "MISMATCH");
+    cudaFree(ddbuf); cudaFree(dkf32);
+
+    // cuBLAS branch of the GEMM path: nc*iH > kMlaParityMaxQ forces gemm_fp32
+    // onto the cublasSgemm path (the n<=64 gemv branch is true fp32 already).
+    // cublasSgemm defaults to TF32 (10-bit mantissa) on Ada, which rotates the
+    // per-head dots enough to flip top-k; PEDANTIC math must keep true fp32 so
+    // the indices still match the CPU reference. iH=32 mirrors the real
+    // GLM-5.2 indexer (index_n_heads=32); nc=9 -> n=288 > 64 -> cuBLAS path.
+    {
+        const int iH2 = 32;
+        std::vector<float> iq2(n * iH2 * iD), iw2(n * iH2);
+        for (int t = 0; t < n; ++t) {
+            for (int ih = 0; ih < iH2; ++ih)
+                for (int d = 0; d < iD; ++d)
+                    iq2[(t * iH2 + ih) * iD + d] = 0.01f * (1 + t + ih + d);
+            for (int ih = 0; ih < iH2; ++ih) iw2[t * iH2 + ih] = ih == 0 ? 1.0f : 0.5f;
+        }
+        std::vector<int> ref2(n * topk);
+        for (int t = 0; t < n; ++t) {
+            int count = std::min(topk, t + 1);
+            std::vector<float> sc(t + 1);
+            for (int j = 0; j <= t; ++j) {
+                float total = 0.0f;
+                for (int ih = 0; ih < iH2; ++ih) {
+                    float dot = 0.0f;
+                    for (int d = 0; d < iD; ++d)
+                        dot += iq2[(t * iH2 + ih) * iD + d] * ik[j * iD + d];
+                    total += iw2[t * iH2 + ih] * std::max(0.0f, dot * iscale);
+                }
+                sc[j] = total;
+            }
+            std::vector<int> ids(t + 1);
+            for (int j = 0; j <= t; ++j) ids[j] = j;
+            std::partial_sort(ids.begin(), ids.begin() + count, ids.end(),
+                              [&](int a, int b) { return sc[a] > sc[b]; });
+            ids.resize(count);
+            std::sort(ids.begin(), ids.end());
+            for (int k = 0; k < count; ++k) ref2[t * topk + k] = ids[k];
+        }
+        float *diq2 = nullptr, *diw2 = nullptr, *ddbuf2 = nullptr, *dkf32_2 = nullptr;
+        CUDA_TEST_CHECK(cudaMalloc(&diq2, iq2.size() * sizeof(float)));
+        CUDA_TEST_CHECK(cudaMalloc(&diw2, iw2.size() * sizeof(float)));
+        CUDA_TEST_CHECK(cudaMalloc(&ddbuf2, (size_t)kDsaScoreChunk * iH2 * kDsaKeyTile * sizeof(float)));
+        CUDA_TEST_CHECK(cudaMalloc(&dkf32_2, (size_t)kDsaKeyTile * iD * sizeof(float)));
+        CUDA_TEST_CHECK(cudaMemcpy(diq2, iq2.data(), iq2.size() * sizeof(float), cudaMemcpyHostToDevice));
+        CUDA_TEST_CHECK(cudaMemcpy(diw2, iw2.data(), iw2.size() * sizeof(float), cudaMemcpyHostToDevice));
+        CUDA_TEST_CHECK(cudaMemset(didx, 0, ref2.size() * sizeof(int)));
+        dsa_select_topk(diq2, dik, diw2, n, 0, iH2, iD, topk, iscale, 1.0f, dscratch, didx, dscore,
+                        ddbuf2, dkf32_2);
+        CUDA_TEST_CHECK(cudaGetLastError());
+        CUDA_TEST_CHECK(cudaDeviceSynchronize());
+        std::vector<int> got2(ref2.size());
+        CUDA_TEST_CHECK(cudaMemcpy(got2.data(), didx, got2.size() * sizeof(int), cudaMemcpyDeviceToHost));
+        const bool idx_cublas_match = got2 == ref2;
+        std::printf("  dsa_select_topk gemm cuBLAS path [n=%d iH=%d topk=%d]: indices %s\n",
+                    n, iH2, topk, idx_cublas_match ? "MATCH" : "MISMATCH");
+        cudaFree(diq2); cudaFree(diw2); cudaFree(ddbuf2); cudaFree(dkf32_2);
+        idx_gemm_match = idx_gemm_match && idx_cublas_match;
+    }
+
     cudaFree(diq); cudaFree(dikf); cudaFree(dik); cudaFree(diw); cudaFree(didx);
     cudaFree(dscore); cudaFree(dscratch); cudaFree(dout_idx);
 
@@ -219,7 +297,8 @@ int main() {
         md_indexed = std::max(md_indexed, std::fabs(got_idx_attn[i] - ref_idx_attn[i]));
     std::printf("  max abs diff = %.3e  decode split-K diff = %.3e  learned-indexed diff = %.3e  idx-match=%s\n",
                 md, md_decode, md_indexed, idx_match ? "yes" : "no");
-    int rc = (md <= 1e-4f && md_decode <= 1e-4f && md_indexed <= 1e-4f && idx_match) ? 0 : 1;
+    int rc = (md <= 1e-4f && md_decode <= 1e-4f && md_indexed <= 1e-4f && idx_match &&
+              idx_gemm_match) ? 0 : 1;
     std::printf("test_attention_dsa: %s\n", rc ? "FAIL" : "PASS");
     return rc;
 #else

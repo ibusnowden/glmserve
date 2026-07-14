@@ -624,7 +624,9 @@ struct Scratch {
         const int64_t hc = c.kv_cache_head_dim();
         kscr = dmalloc(n * nheads * hc);
         vscr = dmalloc(n * nheads * hc);
-        qhat = dmalloc(kAbsorbMax * nheads * (kvlat + rope));
+        // Wide suffix chunks run the absorbed path at full chunk width, so the
+        // qhat staging must cover the arena's n, not just the verify cap.
+        qhat = dmalloc(std::max(kAbsorbMax, n) * nheads * (kvlat + rope));
         // int8 MMQ activation buffers, sized for the widest quant-gemm input.
         const int64_t qin = std::max({2 * hidden, ffmax, qlat, nheads * vd, kvlat});
         auto i8malloc = [](int64_t bytes) {
@@ -697,6 +699,8 @@ struct GpuState {
     // fp32 was the per-token memory hog once the trunk cache went latent).
     std::vector<__half*> Ic;
     float* dsa_scorebuf = nullptr;   // [kDsaScoreChunk, max_ctx] selector scratch
+    float* dsa_dbuf = nullptr;       // [kDsaScoreChunk * index_heads, kDsaKeyTile] GEMM dots
+    float* dsa_kf32 = nullptr;       // [kDsaKeyTile, index_dim] fp32 key tile
     // Absorbed-MLA latent cache (GLMSERVE_LATENT_KV, default on): one fp16 row
     // [kvlat + rope] per token per layer, shared by all local heads — replaces
     // Kc/Vc for the trunk. Prefill materializes its own per-head K/V into
@@ -1052,8 +1056,14 @@ bool GLM52Model::upload_to_gpu(int64_t max_ctx) {
                        c.index_head_dim * sizeof(__half)) != cudaSuccess)
             throw std::runtime_error("cudaMalloc for indexer cache failed");
     }
-    if (c.use_dsa)
+    if (c.use_dsa) {
         g->dsa_scorebuf = dmalloc(glmserve::cuda::kDsaScoreChunk * g->max_ctx);
+        // SGEMM selector scoring scratch (see dsa_select_topk): per-head dot
+        // tile + fp32-converted key tile. ~34 MB at real dims.
+        g->dsa_dbuf = dmalloc(glmserve::cuda::kDsaScoreChunk * c.index_n_heads *
+                              glmserve::cuda::kDsaKeyTile);
+        g->dsa_kf32 = dmalloc(glmserve::cuda::kDsaKeyTile * c.index_head_dim);
+    }
     if (g->latent) {
         // fp16 kv_b residency for the absorbed q/o projections.
         for (size_t i = 0; i < layers_.size(); ++i) {
@@ -1256,12 +1266,16 @@ bool run_layer_step(GpuState* g, const GLM52Config& c, Communicator* comm,
     const float scale = 1.0f / std::sqrt(static_cast<float>(qk));
     const bool il = c.rope_interleave;
     const bool tp = dist.tp_size > 1;
-    // Absorbed MQA covers decode (n == 1) AND suffix chunks (start_pos > 0,
-    // n <= kAbsorbMax): MTP verify/absorb passes and multi-turn suffix prefill.
+    // Absorbed MQA covers decode (n == 1) AND suffix chunks (start_pos > 0):
+    // MTP verify/absorb passes and wide suffix prefill (long prompts past the
+    // first chunk, multi-turn continuations). The attention kernel divides its
+    // per-query split budget by nq, so the width bound is the partial-buffer
+    // capacity, not kAbsorbMax.
     const bool absorbed = Lc != nullptr && !(n > 1 && start_pos == 0);
-    GLM_CHECK(!absorbed || n <= kAbsorbMax,
-              "latent KV: suffix chunk of %lld tokens exceeds the absorbed-MQA cap %lld",
-              (long long)n, (long long)kAbsorbMax);
+    GLM_CHECK(!absorbed || n <= glmserve::cuda::kMlaParityMaxQ * kMaxSplits,
+              "latent KV: suffix chunk of %lld tokens exceeds the absorbed-MQA "
+              "partial-buffer budget %lld",
+              (long long)n, (long long)(glmserve::cuda::kMlaParityMaxQ * kMaxSplits));
 
     // attention sub-block
     g_prof.mark("gap");
@@ -1321,22 +1335,32 @@ bool run_layer_step(GpuState* g, const GLM52Config& c, Communicator* comm,
                              kvlat, rope, scale, d.mla_kvb, nope, vd, s.attn,
                              g->part_acc, g->part_m, g->part_l, kMaxSplits);
     };
-    if (learned_dsa) {
-        gemm_linear_q8(s.qa, d.index_wq_b, nullptr, s.index_q, n, s.xq8b, s.xs8b);
+    // Index keys are cached for EVERY position with an fp16 row in Ic — the
+    // selector reads the whole prefix once ctx grows past index_topk (suffix
+    // chunks, decode-at-depth), so the rows written while attention is still
+    // dense must be real. (Before this hoist, rows [0, index_topk) were
+    // whatever cudaMalloc handed back.)
+    const bool has_indexer = c.use_dsa && d.index_wq_b.out > 0 && Ic != nullptr;
+    if (has_indexer) {
         gemm_linear_q8_pre(s.normed, nq8, s.xs8a, d.index_wk, nullptr, s.index_k, n);
         layernorm(s.index_k, d.index_k_norm, d.index_k_bias, s.index_k, n,
                   c.index_head_dim, 1e-6f);
-        rope_index_q(s.index_q, n, c.index_n_heads, c.index_head_dim, rope,
-                     rope_pos0, c.rope_theta, false);
         rope_index_q(s.index_k, n, 1, c.index_head_dim, rope,
                      rope_pos0, c.rope_theta, false);
         convert_f32_f16(s.index_k, n * c.index_head_dim, Ic + start_pos * c.index_head_dim);
+        g_prof.mark("dsa.keys");
+    }
+    if (learned_dsa) {
+        gemm_linear_q8(s.qa, d.index_wq_b, nullptr, s.index_q, n, s.xq8b, s.xs8b);
+        rope_index_q(s.index_q, n, c.index_n_heads, c.index_head_dim, rope,
+                     rope_pos0, c.rope_theta, false);
         gemm_linear_q8_pre(s.normed, nq8, s.xs8a, d.index_weights, nullptr, s.index_w, n);
         dsa_select_topk(s.index_q, Ic, s.index_w, n, start_pos,
                         c.index_n_heads, c.index_head_dim, c.index_topk,
                         1.0f / std::sqrt(static_cast<float>(c.index_head_dim)),
                         1.0f / std::sqrt(static_cast<float>(c.index_n_heads)),
-                        g->dsa_scorebuf, s.dsa_indices, s.dsa_scores);
+                        g->dsa_scorebuf, s.dsa_indices, s.dsa_scores,
+                        g->dsa_dbuf, g->dsa_kf32);
         have_shared_dsa_indices = true;
         g_prof.mark("dsa.index");
         if (absorbed)
@@ -1674,6 +1698,18 @@ int64_t prefill_chunk_cap() {
     }();
     return cap;
 }
+
+// Wide suffix chunks (default): latent-mode suffix passes run at the full
+// prefill chunk width through the absorbed-MQA kernels, so MoE/GEMM stages
+// keep their throughput geometry (mma engages, launches amortize).
+// GLMSERVE_WIDE_SUFFIX=0 restores the old kAbsorbMax-wide suffix chunks.
+bool wide_suffix_enabled() {
+    static const bool on = [] {
+        const char* e = std::getenv("GLMSERVE_WIDE_SUFFIX");
+        return !e || std::atoi(e) != 0;
+    }();
+    return on;
+}
 }  // namespace
 
 std::vector<float> GLM52Model::forward_gpu_prefill(const std::vector<int>& tokens) {
@@ -1687,21 +1723,37 @@ std::vector<float> GLM52Model::forward_gpu_prefill(const std::vector<int>& token
 
     // Long prompts run chunked so the scratch arena stays bounded: the first
     // chunk takes the one-shot path below, later chunks are suffix passes
-    // (absorbed MQA under the latent cache, so they are kAbsorbMax wide).
+    // (absorbed MQA under the latent cache, full chunk width by default —
+    // GLMSERVE_WIDE_SUFFIX=0 falls back to kAbsorbMax-wide passes).
     const int64_t chunk0 = prefill_chunk_cap();
     if (n > chunk0 && dist_.pp_size == 1) {
         g->sc.ensure(chunk0, cfg_, g->local_heads, g->max_dense_inter, g->max_moe_inter);
+        // Interleaved MTP absorb (spec decode over long prompts): a non-final
+        // chunk's trunk hiddens are only alive in scratch until the next
+        // gather_embeds, so cover its (h_p, token_{p+1}) pairs now. The final
+        // chunk stays with the caller, which also sets the draft seed.
+        auto absorb_chunk = [&](int64_t p0, int64_t nc) {
+            if (mtp_prefill_absorb_ && mtp_gpu_ready() && p0 + nc < n)
+                mtp_gpu_absorb(std::vector<int>(tokens.begin() + p0 + 1,
+                                                tokens.begin() + p0 + nc + 1),
+                               p0, /*set_seed=*/false);
+        };
         g_prof.mark("fwd.start");
         gather_embeds(g, cfg_, embed_lin_, tokens.data(), chunk0, g->sc.hidden_d);
         g_prof.mark("embed");
         run_block_stack(g, cfg_, comm_, dist_, chunk0, /*start_pos=*/0, false);
+        absorb_chunk(0, chunk0);
         int64_t pos = chunk0;
         int64_t last = chunk0;
-        const int64_t step = g->latent ? std::min(kAbsorbMax, chunk0) : chunk0;
+        const int64_t step =
+            g->latent && !wide_suffix_enabled() ? std::min(kAbsorbMax, chunk0)
+            : g->latent ? std::min(chunk0, glmserve::cuda::kMlaParityMaxQ * kMaxSplits)
+                        : chunk0;
         while (pos < n) {
             const int64_t nc = std::min(step, n - pos);
             gather_embeds(g, cfg_, embed_lin_, tokens.data() + pos, nc, g->sc.hidden_d);
             run_block_stack(g, cfg_, comm_, dist_, nc, pos, false);
+            absorb_chunk(pos, nc);
             last = nc;
             pos += nc;
         }
@@ -1776,6 +1828,55 @@ std::vector<float> GLM52Model::forward_gpu_prefill(const std::vector<int>& token
     cuda_check("forward_gpu_prefill");
     g_prof.flush();
     return logits;
+}
+
+std::vector<float> GLM52Model::forward_gpu_prefill_from(const std::vector<int>& tokens,
+                                                        int64_t start_pos) {
+    GLM_CHECK(gpu_state_ != nullptr, "forward_gpu_prefill_from: call upload_to_gpu() first");
+    using namespace glmserve::cuda;
+    auto* g = static_cast<GpuState*>(gpu_state_);
+    const int64_t n = static_cast<int64_t>(tokens.size());
+    if (start_pos <= 0 || dist_.pp_size != 1)
+        return forward_gpu_prefill(tokens);
+    GLM_CHECK(start_pos < n, "forward_gpu_prefill_from: start_pos %lld leaves no tokens "
+              "to run (n=%lld)", (long long)start_pos, (long long)n);
+    GLM_CHECK(n <= g->max_ctx, "forward_gpu_prefill_from: sequence %lld > GPU KV ctx %lld",
+              (long long)n, (long long)g->max_ctx);
+    GLM_CHECK(start_pos <= g->cur_len,
+              "forward_gpu_prefill_from: prefix rows [0,%lld) not resident (cur_len %lld)",
+              (long long)start_pos, (long long)g->cur_len);
+
+    const int64_t chunk0 = prefill_chunk_cap();
+    const int64_t step =
+        g->latent && !wide_suffix_enabled() ? std::min(kAbsorbMax, chunk0)
+        : g->latent ? std::min(chunk0, glmserve::cuda::kMlaParityMaxQ * kMaxSplits)
+                    : chunk0;
+    g->sc.ensure(std::min(step, n - start_pos), cfg_, g->local_heads,
+                 g->max_dense_inter, g->max_moe_inter);
+    g_prof.mark("fwd.start");
+    int64_t pos = start_pos, last = 0;
+    while (pos < n) {
+        const int64_t nc = std::min(step, n - pos);
+        gather_embeds(g, cfg_, embed_lin_, tokens.data() + pos, nc, g->sc.hidden_d);
+        run_block_stack(g, cfg_, comm_, dist_, nc, pos, false);
+        if (mtp_prefill_absorb_ && mtp_gpu_ready() && pos + nc < n)
+            mtp_gpu_absorb(std::vector<int>(tokens.begin() + pos + 1,
+                                            tokens.begin() + pos + nc + 1),
+                           pos, /*set_seed=*/false);
+        last = nc;
+        pos += nc;
+    }
+    g->cur_len = n;
+    g->chunk_row0 = n - last;
+    std::vector<float> logits = finish_logits(g, cfg_, last, comm_);
+    g_prof.mark("lm_head");
+    cuda_check("forward_gpu_prefill_from");
+    g_prof.flush();
+    return logits;
+}
+
+int64_t GLM52Model::gpu_cur_len() const {
+    return gpu_state_ ? static_cast<GpuState*>(gpu_state_)->cur_len : 0;
 }
 
 std::vector<float> GLM52Model::forward_gpu_decode(int token, int64_t pos) {
@@ -1989,7 +2090,8 @@ void GLM52Model::forward_gpu_chunk_greedy(const std::vector<int>& tokens, int64_
     g_prof.flush();
 }
 
-void GLM52Model::mtp_gpu_absorb(const std::vector<int>& next_tokens, int64_t pos0) {
+void GLM52Model::mtp_gpu_absorb(const std::vector<int>& next_tokens, int64_t pos0,
+                                bool set_seed) {
     GLM_CHECK(mtp_gpu_ready(), "mtp_gpu_absorb: MTP block not resident");
     using namespace glmserve::cuda;
     auto* g = static_cast<GpuState*>(gpu_state_);
@@ -2001,8 +2103,11 @@ void GLM52Model::mtp_gpu_absorb(const std::vector<int>& next_tokens, int64_t pos
 
     // Draft seed: the trunk hidden one past the absorbed prefix (still in the
     // last chunk's scratch rows — this call must directly follow that pass).
-    cudaMemcpy(gm.prev, g->sc.hidden_d + count * H, H * sizeof(float),
-               cudaMemcpyDeviceToDevice);
+    // Interleaved mid-prefill absorbs pass set_seed=false: row `count` there
+    // would be one past the chunk's scratch rows.
+    if (set_seed)
+        cudaMemcpy(gm.prev, g->sc.hidden_d + count * H, H * sizeof(float),
+                   cudaMemcpyDeviceToDevice);
     for (int64_t c0 = 0; c0 < count; c0 += kAbsorbMax) {
         const int64_t nc = std::min(kAbsorbMax, count - c0);
         // Stage this chunk's trunk hiddens: the MTP layer pass below reuses
@@ -2127,6 +2232,8 @@ GLM52Model::~GLM52Model() {
     for (__half* p : g->Ic) if (p) cudaFree(p);
     for (__half* p : g->Lc) if (p) cudaFree(p);
     if (g->dsa_scorebuf) cudaFree(g->dsa_scorebuf);
+    if (g->dsa_dbuf) cudaFree(g->dsa_dbuf);
+    if (g->dsa_kf32) cudaFree(g->dsa_kf32);
     if (g->block_table) cudaFree(g->block_table);
     if (g->logits_d) cudaFree(g->logits_d);
     if (g->vshard) cudaFree(g->vshard);
