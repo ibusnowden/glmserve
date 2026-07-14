@@ -349,9 +349,15 @@ __global__ void dsa_extract_topk_cub_kernel(const int* __restrict__ sorted_idx,
 }
 
 static bool dsa_cub_enabled() {
+    // Default OFF: the multi-block cub::DeviceRadixSort does a FULL sort of
+    // all count keys (3 kernel launches + full sort), which is ~50% slower
+    // than the single-block radix partial-select at 8-16K keys (the single-SM
+    // radix does 8 passes over count keys but only finds top-2048, and the
+    // scores fit in L2). The cub path wins only at much larger count (>32K);
+    // GLMSERVE_DSA_CUB=1 enables it for experimentation.
     static const bool on = [] {
         const char* e = getenv("GLMSERVE_DSA_CUB");
-        return !e || atoi(e) != 0;
+        return e && atoi(e) != 0;
     }();
     return on;
 }
